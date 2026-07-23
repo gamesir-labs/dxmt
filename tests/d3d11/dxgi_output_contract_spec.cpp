@@ -71,6 +71,19 @@ constexpr std::array kOverlayColorSpaceCases = {
                           "Hdr10P2020"},
 };
 
+struct ModeEnumerationCase {
+  UINT flags;
+  const char *name;
+};
+
+constexpr std::array kModeEnumerationCases = {
+    ModeEnumerationCase{0, "Default"},
+    ModeEnumerationCase{DXGI_ENUM_MODES_INTERLACED, "Interlaced"},
+    ModeEnumerationCase{DXGI_ENUM_MODES_SCALING, "Scaling"},
+    ModeEnumerationCase{DXGI_ENUM_MODES_INTERLACED | DXGI_ENUM_MODES_SCALING,
+                        "InterlacedScaling"},
+};
+
 const dxmt::test::LogicalCaseFamilyRegistration kOutputInterfaceRegistration(
     "D3D11DxgiOutputContractSpec.QueriesEveryPublicOutputInterface",
     "D3D11.DXGI.Output.Interface.", kOutputInterfaceCases.size(), 1,
@@ -122,6 +135,24 @@ const dxmt::test::LogicalCaseFamilyRegistration kOverlayColorRegistration(
      "logical ID, color space, HRESULT, support flags, output availability, "
      "and exact replay argument"});
 
+const dxmt::test::LogicalCaseFamilyRegistration kModeEnumerationRegistration(
+    "D3D11DxgiOutputContractSpec.EnumeratesVersionedDisplayModes",
+    "D3D11.DXGI.Output.DisplayMode.", kModeEnumerationCases.size(), 1,
+    {dxmt::test::TestClass::Conformance,
+     dxmt::test::ExecutionPath::Auto,
+     {"11_0", "None", "Device",
+      "IDXGIOutput1,GetDisplayModeList1,DXGI_MODE_DESC1,"
+      "DXGI_ENUM_MODES_INTERLACED,DXGI_ENUM_MODES_SCALING"},
+     dxmt::test::kResourceTestCost,
+     "one read-only output and a test-local display-mode vector per selected "
+     "logical case",
+     "perform the documented count-then-data display-mode query for every "
+     "combination of interlaced and scaling enumeration flags",
+     "both query phases succeed and every returned mode has valid dimensions, "
+     "refresh rate, requested format, and canonical stereo value",
+     "logical ID, flags, phase HRESULTs, requested and returned counts, mode "
+     "fields, output availability, and exact replay argument"});
+
 const dxmt::test::TestCostRegistration kOutputInterfaceCost(
     "D3D11DxgiOutputContractSpec.QueriesEveryPublicOutputInterface",
     dxmt::test::kResourceTestCost);
@@ -136,6 +167,12 @@ const dxmt::test::TestCostRegistration kOverlayFormatCost(
     dxmt::test::kResourceTestCost);
 const dxmt::test::TestCostRegistration kOverlayColorCost(
     "D3D11DxgiOutputContractSpec.QueriesOverlayColorSpaceCapabilities",
+    dxmt::test::kResourceTestCost);
+const dxmt::test::TestCostRegistration kModeEnumerationCost(
+    "D3D11DxgiOutputContractSpec.EnumeratesVersionedDisplayModes",
+    dxmt::test::kResourceTestCost);
+const dxmt::test::TestCostRegistration kClosestModeCost(
+    "D3D11DxgiOutputContractSpec.MatchesAnEnumeratedDisplayMode",
     dxmt::test::kResourceTestCost);
 
 class D3D11DxgiOutputContractSpec : public ::testing::Test {
@@ -392,6 +429,94 @@ TEST_F(D3D11DxgiOutputContractSpec, QueriesOverlayColorSpaceCapabilities) {
   RecordProperty("logical_cases_executed", selected_count);
   RecordProperty("logical_case_prefix",
                  kOverlayColorRegistration.family().case_id_prefix);
+}
+
+TEST_F(D3D11DxgiOutputContractSpec, EnumeratesVersionedDisplayModes) {
+  ComPtr<IDXGIOutput6> output6;
+  const HRESULT output_result = GetFirstOutput(output6);
+  ASSERT_TRUE(output_result == S_OK || output_result == DXGI_ERROR_NOT_FOUND);
+  std::uint32_t selected_count = 0;
+  for (std::uint32_t logical = 0; logical < kModeEnumerationCases.size();
+       ++logical) {
+    if (!dxmt::test::LogicalCaseSelected(kModeEnumerationRegistration.family(),
+                                         logical))
+      continue;
+    ++selected_count;
+    const ModeEnumerationCase &test_case = kModeEnumerationCases[logical];
+    const auto case_id = dxmt::test::LogicalCaseId(
+        kModeEnumerationRegistration.family(), logical);
+    SCOPED_TRACE(::testing::Message()
+                 << "LogicalCaseId: " << case_id << " case=" << test_case.name
+                 << " flags=" << test_case.flags
+                 << " Replay: --dxmt-case-id=" << case_id);
+    if (output_result == DXGI_ERROR_NOT_FOUND) {
+      EXPECT_EQ(output6.get(), nullptr);
+      continue;
+    }
+    ASSERT_TRUE(output6);
+
+    UINT mode_count = 0;
+    ASSERT_EQ(output6->GetDisplayModeList1(DXGI_FORMAT_R8G8B8A8_UNORM,
+                                           test_case.flags, &mode_count,
+                                           nullptr),
+              S_OK);
+    UINT returned_count = mode_count + 16;
+    std::vector<DXGI_MODE_DESC1> modes(returned_count);
+    ASSERT_EQ(output6->GetDisplayModeList1(DXGI_FORMAT_R8G8B8A8_UNORM,
+                                           test_case.flags, &returned_count,
+                                           modes.data()),
+              S_OK);
+    EXPECT_LE(returned_count, modes.size());
+    for (UINT i = 0; i < returned_count; ++i) {
+      EXPECT_GT(modes[i].Width, 0u) << "mode_index=" << i;
+      EXPECT_GT(modes[i].Height, 0u) << "mode_index=" << i;
+      EXPECT_GT(modes[i].RefreshRate.Numerator, 0u) << "mode_index=" << i;
+      EXPECT_GT(modes[i].RefreshRate.Denominator, 0u) << "mode_index=" << i;
+      EXPECT_EQ(modes[i].Format, DXGI_FORMAT_R8G8B8A8_UNORM)
+          << "mode_index=" << i;
+      EXPECT_TRUE(modes[i].Stereo == TRUE || modes[i].Stereo == FALSE)
+          << "mode_index=" << i;
+    }
+  }
+
+  ASSERT_NE(selected_count, 0u);
+  RecordProperty("logical_cases_executed", selected_count);
+  RecordProperty("logical_case_prefix",
+                 kModeEnumerationRegistration.family().case_id_prefix);
+}
+
+TEST_F(D3D11DxgiOutputContractSpec, MatchesAnEnumeratedDisplayMode) {
+  ASSERT_EQ(context_.InitializeDevice(), S_OK);
+  ComPtr<IDXGIOutput6> output6;
+  const HRESULT output_result = GetFirstOutput(output6);
+  ASSERT_TRUE(output_result == S_OK || output_result == DXGI_ERROR_NOT_FOUND);
+  if (output_result == DXGI_ERROR_NOT_FOUND) {
+    EXPECT_EQ(output6.get(), nullptr);
+    return;
+  }
+  ASSERT_TRUE(output6);
+
+  UINT mode_count = 0;
+  ASSERT_EQ(output6->GetDisplayModeList1(DXGI_FORMAT_R8G8B8A8_UNORM, 0,
+                                         &mode_count, nullptr),
+            S_OK);
+  if (mode_count == 0)
+    return;
+  UINT returned_count = mode_count + 16;
+  std::vector<DXGI_MODE_DESC1> modes(returned_count);
+  ASSERT_EQ(output6->GetDisplayModeList1(DXGI_FORMAT_R8G8B8A8_UNORM, 0,
+                                         &returned_count, modes.data()),
+            S_OK);
+  ASSERT_GT(returned_count, 0u);
+
+  DXGI_MODE_DESC1 closest = {};
+  ASSERT_EQ(
+      output6->FindClosestMatchingMode1(&modes[0], &closest, context_.device()),
+      S_OK);
+  EXPECT_EQ(closest.Width, modes[0].Width);
+  EXPECT_EQ(closest.Height, modes[0].Height);
+  EXPECT_EQ(closest.Format, modes[0].Format);
+  EXPECT_EQ(closest.Stereo, modes[0].Stereo);
 }
 
 } // namespace
