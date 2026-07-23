@@ -6552,7 +6552,6 @@ private:
     DescriptorHeap *heap = nullptr;
     UINT root_index = 0;
     UINT64 base = 0;
-    uint64_t mirror_cursor = 0;
 
     bool operator==(const SubmittedNativeDescriptorSpanKey &) const = default;
   };
@@ -6567,13 +6566,14 @@ private:
       mix(reinterpret_cast<uintptr_t>(key.heap));
       mix(key.root_index);
       mix(key.base);
-      mix(key.mirror_cursor);
       return hash;
     }
   };
 
   struct SubmittedNativeDescriptorSpan {
     std::vector<std::pair<uint32_t, uint32_t>> descriptor_indices;
+    DescriptorHeapMirror *mirror = nullptr;
+    std::vector<uint32_t> used_slots;
     uint64_t content_fingerprint = 0;
   };
 
@@ -9169,6 +9169,21 @@ private:
     }
   }
 
+  static void RecordCompiledDescriptorJournalSpan(
+      GraphicsBindingSnapshot &snapshot,
+      const SubmittedNativeDescriptorSpan &span) {
+    if (!span.mirror)
+      return;
+    for (auto &journal : snapshot.descriptor_journals) {
+      if (journal.mirror != span.mirror)
+        continue;
+      journal.used_slots.insert(journal.used_slots.end(),
+                                span.used_slots.begin(),
+                                span.used_slots.end());
+      return;
+    }
+  }
+
   template <typename Packet>
   void CaptureCompiledDescriptorTableBindings(
       GraphicsBindingSnapshot &snapshot, const Packet &packet,
@@ -9211,9 +9226,12 @@ private:
                          ? sampler_heap
                          : cbv_srv_uav_heap;
         auto *span_mirror = heap ? heap->GetMirror() : nullptr;
+        // The span store lives for exactly one Execute submission and all
+        // participating mirrors stay locked during capture. The heap cursor is
+        // therefore not part of span identity: only this reflected root window
+        // can affect the frozen contents.
         const SubmittedNativeDescriptorSpanKey span_key = {
-            &recipe, heap, root_index, base.ptr,
-            span_mirror ? span_mirror->changeJournalCursor() : 0};
+            &recipe, heap, root_index, base.ptr};
 
         SubmittedNativeDescriptorSpan local_span;
         SubmittedNativeDescriptorSpan *span = nullptr;
@@ -9228,6 +9246,7 @@ private:
           span = &local_span;
         }
         if (build_span) {
+          span->mirror = span_mirror;
           span->content_fingerprint = kGraphicsBindingFingerprintOffset;
           for (size_t i = recipe_index; i < recipe.entries.size(); ++i) {
             const auto &entry = recipe.entries[i];
@@ -9256,12 +9275,19 @@ private:
                 snapshot.descriptor_records->capture(*descriptor);
             span->descriptor_indices.emplace_back(
                 static_cast<uint32_t>(i), descriptor_index);
+            if (descriptor->mirror)
+              span->used_slots.push_back(descriptor->heap_index);
             HashGraphicsBindingDescriptor(span->content_fingerprint,
                                           *descriptor);
           }
         }
         for (const auto &[index, descriptor_index] : span->descriptor_indices)
           snapshot.native_descriptor_indices[index] = descriptor_index;
+        RecordCompiledDescriptorJournalSpan(snapshot, *span);
+        HashGraphicsBindingValue(snapshot.content_fingerprint, root_index);
+        HashGraphicsBindingValue(snapshot.content_fingerprint, base.ptr);
+        HashGraphicsBindingValue(snapshot.content_fingerprint,
+                                 span->content_fingerprint);
         HashGraphicsBindingValue(snapshot.resource_access_fingerprint,
                                  root_index);
         HashGraphicsBindingValue(snapshot.resource_access_fingerprint,
@@ -9518,6 +9544,12 @@ private:
           dxmt::PerfCodePath::QueueCaptureDescriptorJournalFinalize);
       FinalizeCompiledDescriptorSnapshot(*snapshot);
     }
+    // Compiled packets carry an immutable submission snapshot. Its revision is
+    // derived solely from the binding program and reflected descriptor spans,
+    // so later writes to unrelated heap slots cannot invalidate encoder state.
+    snapshot->descriptor_content_revision = {
+        snapshot->compiled_binding_identity_hash,
+        snapshot->content_fingerprint};
     // Resource dependency identity is based on frozen descriptor contents,
     // not the packet/snapshot address. Games commonly rotate descriptor-table
     // handles while binding the same resources; pointer identity turned every
@@ -10336,6 +10368,11 @@ private:
               BuildCompiledDirectGraphicsBindingFingerprint(
                   packet, prepared, pipeline, root,
                   vertex_binding_recipe.get(), bindless_snapshot.get());
+          const auto submitted_descriptor_revision =
+              submitted_snapshot
+                  ? submitted_snapshot->descriptor_content_revision
+                  : dxmt::DescriptorContentRevision{
+                        binding_fingerprint, binding_fingerprint};
           if (packet.draw) {
             RecordGraphicsPipelineResourceAccess(
                 chunk, state, *pipeline, nullptr, submitted_snapshot.get());
@@ -10348,7 +10385,7 @@ private:
             replay_packet.common.binding_content_fingerprint =
                 binding_fingerprint;
             replay_packet.common.descriptor_content_revision =
-                GetDescriptorContentRevision();
+                submitted_descriptor_revision;
             replay_packet.common.pixel_shader_demote_msaa_srv_mask_lo =
                 compiled_demote_msaa_srv_mask_lo;
             replay_packet.common.pixel_shader_demote_msaa_srv_mask_hi =
@@ -10425,7 +10462,7 @@ private:
             replay_packet.common.binding_content_fingerprint =
                 binding_fingerprint;
             replay_packet.common.descriptor_content_revision =
-                GetDescriptorContentRevision();
+                submitted_descriptor_revision;
             replay_packet.common.pixel_shader_demote_msaa_srv_mask_lo =
                 compiled_demote_msaa_srv_mask_lo;
             replay_packet.common.pixel_shader_demote_msaa_srv_mask_hi =
@@ -18580,6 +18617,24 @@ private:
                                entry.descriptor_count, entry.heap_type)
                          : nullptr;
             captured.push_back({destination, record});
+            if (snapshot) {
+              CaptureCompiledDescriptorJournalCursor(
+                  *snapshot, heap ? heap->GetMirror() : nullptr);
+              HashGraphicsBindingValue(snapshot->content_fingerprint, stage);
+              HashGraphicsBindingValue(snapshot->content_fingerprint,
+                                       entry.root_index);
+              HashGraphicsBindingValue(snapshot->content_fingerprint,
+                                       entry.range_type);
+              HashGraphicsBindingValue(snapshot->content_fingerprint,
+                                       destination);
+              HashGraphicsBindingValue(snapshot->content_fingerprint,
+                                       record != nullptr);
+              if (record) {
+                RecordCompiledDescriptorJournalSlot(*snapshot, *record);
+                HashGraphicsBindingDescriptor(snapshot->content_fingerprint,
+                                              *record);
+              }
+            }
             if (snapshot && record &&
                 entry.range_type != D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER) {
               const auto *argument =
