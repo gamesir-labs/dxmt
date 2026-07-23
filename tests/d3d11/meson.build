@@ -66,6 +66,7 @@ d3d11_unit_sources = files(
   'output_merger_binding_matrix_spec.cpp',
   'blend_state_binding_matrix_spec.cpp',
   'blend_state_desc_matrix_spec.cpp',
+  'blend_state1_desc_matrix_spec.cpp',
   'rasterizer_state_binding_matrix_spec.cpp',
   'rasterizer_state_desc_matrix_spec.cpp',
   'clear_state_subset_matrix_spec.cpp',
