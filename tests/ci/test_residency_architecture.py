@@ -129,14 +129,191 @@ class ResidencyArchitecturePolicyTest(unittest.TestCase):
         self.assertLess(signal, logical_remove)
         self.assertLess(logical_remove, retire_texture)
 
-    def test_completion_only_releases_retained_allocations(self):
+    def test_lifetime_keeps_original_resource_separate_from_residency_backing(
+        self,
+    ):
+        implementation = WINEMETAL[
+            WINEMETAL.index("@implementation DXMTMetal4CommandBuffer") :
+        ]
+        retain = braced_body(
+            implementation, "- (void)retainAllocationForLifetime:"
+        )
+        self.assertIn(
+            "dxmt_metal4_backing_allocation(allocation)", retain
+        )
+        self.assertRegex(
+            retain,
+            re.compile(
+                r"\[\s*_[A-Za-z0-9]*(?:retained|lifetime)"
+                r"[A-Za-z0-9]*\s+addObject\s*:\s*allocation\s*\]",
+                re.IGNORECASE,
+            ),
+        )
+        self.assertNotRegex(
+            retain,
+            re.compile(
+                r"\[\s*_queueResidency[A-Za-z0-9]*"
+                r"\s+addObject\s*:\s*allocation\s*\]"
+            ),
+        )
+        self.assertRegex(
+            retain,
+            re.compile(
+                r"\[\s*_queueResidency[A-Za-z0-9]*"
+                r"\s+addObject\s*:\s*backing\s*\]"
+            ),
+        )
+        self.assertNotRegex(
+            retain,
+            re.compile(
+                r"\[\s*_[A-Za-z0-9]*(?:retained|lifetime)"
+                r"[A-Za-z0-9]*\s+addObject\s*:\s*backing\s*\]",
+                re.IGNORECASE,
+            ),
+        )
+
+    def test_lifetime_ownership_has_one_current_container(self):
+        implementation = WINEMETAL[
+            WINEMETAL.index("@implementation DXMTMetal4CommandBuffer") :
+        ]
+        retain = braced_body(
+            implementation, "- (void)retainAllocationForLifetime:"
+        )
+        lifetime_writers = re.findall(
+            r"\[\s*(\w+)\s+addObject\s*:\s*allocation\s*\]", retain
+        )
+        self.assertEqual(
+            len(lifetime_writers),
+            1,
+            "the original resource must have exactly one current lifetime "
+            "owner; array-plus-set ownership can double-release stale objects",
+        )
+        self.assertEqual(
+            len(set(lifetime_writers)),
+            1,
+            "lifetime ownership must not be duplicated across containers",
+        )
+
+    def test_commit_transfers_an_immutable_lifetime_snapshot(self):
+        implementation = WINEMETAL[
+            WINEMETAL.index("@implementation DXMTMetal4CommandBuffer") :
+        ]
+        commit = braced_body(implementation, "- (uint64_t)commitLocked")
+        snapshot = re.search(
+            r"NSArray\s*\*\s*(\w*(?:Retained|Lifetime|Resource)\w*)"
+            r"\s*=\s*\[\s*(\w+)\s+copy\s*\]",
+            commit,
+            re.IGNORECASE,
+        )
+        self.assertIsNotNone(
+            snapshot,
+            "commit must copy the current lifetime generation into an "
+            "immutable completion-owned snapshot",
+        )
+        snapshot_name, current_container = snapshot.groups()
+        after_snapshot = commit[snapshot.end() :]
+        self.assertRegex(
+            after_snapshot,
+            re.compile(
+                rf"{re.escape(current_container)}\s*=\s*"
+                r"\[\[\s*NSMutableArray\s+alloc\s*\]\s+init\s*\]"
+            ),
+            "commit must immediately replace the recording lifetime "
+            "container after taking the snapshot",
+        )
+        self.assertIn(f"[{snapshot_name} release]", commit)
+
+    def test_completion_handler_is_the_only_lifetime_snapshot_releaser(self):
+        implementation = WINEMETAL[
+            WINEMETAL.index("@implementation DXMTMetal4CommandBuffer") :
+        ]
+        commit = braced_body(implementation, "- (uint64_t)commitLocked")
+        snapshot = re.search(
+            r"NSArray\s*\*\s*(\w*(?:Retained|Lifetime|Resource)\w*)"
+            r"\s*=\s*\[\s*\w+\s+copy\s*\]",
+            commit,
+            re.IGNORECASE,
+        )
+        self.assertIsNotNone(snapshot)
+        snapshot_name = snapshot.group(1)
+        release = f"[{snapshot_name} release]"
+        self.assertEqual(commit.count(release), 1)
+        feedback = braced_body(commit, "addFeedbackHandler:^")
+        self.assertIn(release, feedback)
+        self.assertNotIn("releaseRetainedAllocations", implementation)
+
+    def test_feedback_handler_publishes_success_or_error_terminal_state(self):
+        implementation = WINEMETAL[
+            WINEMETAL.index("@implementation DXMTMetal4CommandBuffer") :
+        ]
+        commit = braced_body(implementation, "- (uint64_t)commitLocked")
+        feedback = braced_body(commit, "addFeedbackHandler:^")
+        finalizer = feedback[feedback.index("@finally") :]
+        self.assertRegex(
+            finalizer,
+            re.compile(
+                r"internalStatus\s*=\s*"
+                r"error\s*\?\s*DXMTMetal4CommandBufferStateError"
+                r"\s*:\s*DXMTMetal4CommandBufferStateCompleted"
+            ),
+        )
+        complete = finalizer.index("feedbackComplete = YES")
+        broadcast = finalizer.index("feedbackCondition broadcast")
+        unlock = finalizer.index("feedbackCondition unlock")
+        self.assertLess(complete, broadcast)
+        self.assertLess(broadcast, unlock)
+        self.assertIn("feedbackCondition lock", finalizer)
+
+    def test_queue_preflight_rejection_publishes_completion_latch(self):
+        implementation = WINEMETAL[
+            WINEMETAL.index("@implementation DXMTMetal4CommandBuffer") :
+        ]
+        commit = braced_body(implementation, "- (uint64_t)commitLocked")
+        rejection = braced_body(commit, "if (queueError)")
+        lock = rejection.index("feedbackCondition lock")
+        error = rejection.index(
+            "internalStatus = DXMTMetal4CommandBufferStateError"
+        )
+        complete = rejection.index("feedbackComplete = YES")
+        broadcast = rejection.index("feedbackCondition broadcast")
+        unlock = rejection.index("feedbackCondition unlock")
+        self.assertLess(lock, error)
+        self.assertLess(error, complete)
+        self.assertLess(complete, broadcast)
+        self.assertLess(broadcast, unlock)
+
+    def test_wait_until_completed_waits_for_timeline_and_feedback_latch(self):
         implementation = WINEMETAL[
             WINEMETAL.index("@implementation DXMTMetal4CommandBuffer") :
         ]
         wait = braced_body(implementation, "- (void)waitUntilCompleted")
-        self.assertIn("[self releaseRetainedAllocations]", wait)
-        self.assertNotIn("releaseSparseResidencyAllocations", wait)
+        timeline_wait = wait.index("waitUntilSignaledValue:")
+        latch_lock = wait.rindex("feedbackCondition lock")
+        latch_loop = wait.index("while (!_feedbackComplete)")
+        latch_wait = wait.index("feedbackCondition wait")
+        latch_unlock = wait.rindex("feedbackCondition unlock")
+        self.assertLess(timeline_wait, latch_lock)
+        self.assertLess(latch_lock, latch_loop)
+        self.assertLess(latch_loop, latch_wait)
+        self.assertLess(latch_wait, latch_unlock)
+
+    def test_wait_until_completed_never_cleans_lifetime_resources(self):
+        implementation = WINEMETAL[
+            WINEMETAL.index("@implementation DXMTMetal4CommandBuffer") :
+        ]
+        wait = braced_body(implementation, "- (void)waitUntilCompleted")
+        self.assertNotIn("releaseRetainedAllocations", wait)
+        self.assertNotIn("removeAllObjects", wait)
+        self.assertNotRegex(
+            wait,
+            re.compile(
+                r"\[\s*\w*(?:Retained|Lifetime|Resource)\w*\s+release\s*\]",
+                re.IGNORECASE,
+            ),
+        )
         self.assertNotIn("ResidencySet", wait)
+        self.assertNotIn("DXMTMetal4CommandBufferStateCompleted", wait)
+        self.assertNotIn("_feedbackComplete = YES", wait)
 
 
 if __name__ == "__main__":
