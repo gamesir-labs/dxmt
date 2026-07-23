@@ -11,6 +11,8 @@ namespace dxmt {
 namespace {
 
 constexpr ULONG kObjectNameInformation = 1;
+constexpr NTSTATUS kStatusObjectNameCollision =
+    static_cast<NTSTATUS>(0xc0000035u);
 
 using NtQueryObjectProc =
     NTSTATUS(WINAPI *)(HANDLE, ULONG, PVOID, ULONG, PULONG);
@@ -107,6 +109,8 @@ public:
   CreateSharedHandle(const SECURITY_ATTRIBUTES *pAttributes, DWORD Access,
                      const WCHAR *Name, HANDLE *pHandle) final {
     InitReturnPtr(pHandle);
+    if (!pHandle || Access != GENERIC_ALL)
+      return DXGI_ERROR_INVALID_CALL;
     if (!local_kmt)
       return E_INVALIDARG;
 
@@ -148,7 +152,11 @@ public:
     attr.ObjectName = &name_str;
     attr.Attributes |= OBJ_CASE_INSENSITIVE;
 
-    if (D3DKMTShareObjects(1, &local_kmt, &attr, Access, pHandle)) {
+    const NTSTATUS status =
+        D3DKMTShareObjects(1, &local_kmt, &attr, Access, pHandle);
+    if (status == kStatusObjectNameCollision)
+      return DXGI_ERROR_NAME_ALREADY_EXISTS;
+    if (status) {
       ERR("D3D11Fence: Failed to create shared handle");
       return E_FAIL;
     }
