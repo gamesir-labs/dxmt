@@ -77,7 +77,7 @@ struct FactoryFeatureCase {
   const char *name;
 };
 
-constexpr std::array kFactoryFeatureCases = {
+const std::array kFactoryFeatureCases = {
     FactoryFeatureCase{static_cast<DXGI_FEATURE>(0x12345678), sizeof(BOOL),
                        DXGI_ERROR_INVALID_CALL, false, "UnknownFeature"},
     FactoryFeatureCase{DXGI_FEATURE_PRESENT_ALLOW_TEARING, sizeof(BOOL) - 1,
