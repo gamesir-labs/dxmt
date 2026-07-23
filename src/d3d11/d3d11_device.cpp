@@ -529,10 +529,9 @@ public:
 
   HRESULT STDMETHODCALLTYPE
       CheckFormatSupport(DXGI_FORMAT Format, UINT *pFormatSupport) override {
-
-    if (pFormatSupport) {
-      *pFormatSupport = 0;
-    }
+    if (!pFormatSupport)
+      return E_INVALIDARG;
+    *pFormatSupport = 0;
 
     if (Format == DXGI_FORMAT_UNKNOWN) {
       *pFormatSupport =
@@ -670,6 +669,9 @@ public:
   HRESULT STDMETHODCALLTYPE
   CheckFeatureSupport(D3D11_FEATURE Feature, void *pFeatureSupportData,
                       UINT FeatureSupportDataSize) override {
+    if (!pFeatureSupportData)
+      return E_INVALIDARG;
+
     switch (Feature) {
     // Format support queries are special in that they use in-out
     // structs
@@ -934,6 +936,8 @@ public:
 
   HRESULT STDMETHODCALLTYPE
   CheckMultisampleQualityLevels1(DXGI_FORMAT Format, UINT SampleCount, UINT Flags, UINT *pNumQualityLevels) override {
+    if (!pNumQualityLevels)
+      return E_INVALIDARG;
     if (Flags & D3D11_CHECK_MULTISAMPLE_QUALITY_LEVELS_TILED_RESOURCE) {
       ERR("CheckMultisampleQualityLevels1: unsupported flags ", Flags);
       return E_INVALIDARG;
