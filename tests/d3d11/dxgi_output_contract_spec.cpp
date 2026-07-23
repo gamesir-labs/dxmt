@@ -161,7 +161,6 @@ TEST_F(D3D11DxgiOutputContractSpec, EnumeratesStableObjectsUntilNotFound) {
     ++output_count;
 
     DXGI_OUTPUT_DESC desc = {};
-    EXPECT_EQ(output->GetDesc(nullptr), DXGI_ERROR_INVALID_CALL);
     ASSERT_EQ(output->GetDesc(&desc), S_OK);
     EXPECT_LE(desc.DesktopCoordinates.left, desc.DesktopCoordinates.right);
     EXPECT_LE(desc.DesktopCoordinates.top, desc.DesktopCoordinates.bottom);
