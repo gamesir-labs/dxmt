@@ -30,8 +30,9 @@ constexpr std::array kSharedFlagCases = {
                    E_NOINTERFACE, "Legacy"},
     SharedFlagCase{D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX, S_OK, S_OK,
                    E_INVALIDARG, S_OK, "LegacyKeyedMutex"},
-    SharedFlagCase{D3D11_RESOURCE_MISC_SHARED_NTHANDLE, S_OK, E_INVALIDARG,
-                   S_OK, E_NOINTERFACE, "NtHandle"},
+    SharedFlagCase{D3D11_RESOURCE_MISC_SHARED_NTHANDLE, E_INVALIDARG,
+                   E_INVALIDARG, E_INVALIDARG, E_NOINTERFACE,
+                   "NtHandleWithoutKeyedMutex"},
     SharedFlagCase{D3D11_RESOURCE_MISC_SHARED_NTHANDLE |
                        D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX,
                    S_OK, E_INVALIDARG, S_OK, S_OK, "NtHandleKeyedMutex"},
@@ -67,11 +68,11 @@ const dxmt::test::LogicalCaseFamilyRegistration kSharedFlagRegistration(
      dxmt::test::kResourceTestCost,
      "one test-local D3D11 device and one texture with scoped NT handle and "
      "keyed-mutex state per selected logical case",
-     "create textures with each documented legacy, keyed-mutex, and NT "
-     "sharing flag combination plus the mutually exclusive legacy pair",
+     "create textures with each legacy, keyed-mutex, and NT sharing flag "
+     "combination plus the mutually exclusive legacy pair",
      "valid combinations expose exactly their documented legacy handle, NT "
-     "handle, and keyed-mutex surfaces; the mutually exclusive pair is "
-     "rejected",
+     "handle, and keyed-mutex surfaces; NT handles without a keyed mutex and "
+     "the mutually exclusive legacy pair are rejected",
      "logical ID, flags, creation HRESULT, handle HRESULTs and values, keyed "
      "mutex HRESULT, description, device health, and exact replay argument"});
 
@@ -221,7 +222,8 @@ TEST_F(D3D11SharedResourceFlagContractSpec, ExposesSharingInterfacesByFlag) {
 TEST_F(D3D11SharedResourceFlagContractSpec,
        CreatesNtHandlesWithDocumentedAccess) {
   const D3D11_TEXTURE2D_DESC desc =
-      TextureDesc(D3D11_RESOURCE_MISC_SHARED_NTHANDLE);
+      TextureDesc(D3D11_RESOURCE_MISC_SHARED_NTHANDLE |
+                  D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX);
   ComPtr<ID3D11Texture2D> texture;
   ASSERT_EQ(context_.device()->CreateTexture2D(&desc, nullptr, texture.put()),
             S_OK);
