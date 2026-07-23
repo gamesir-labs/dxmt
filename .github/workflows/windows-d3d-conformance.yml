@@ -53,14 +53,25 @@ jobs:
           DXMT_CI_D3D12_CASE_FILTER: ${{ inputs.d3d12_case_filter }}
           DXMT_CI_D3D12_JOBS: ${{ inputs.d3d12_jobs }}
           DXMT_CI_D3D12_DEBUG: ${{ inputs.d3d12_debug && '1' || '' }}
-        run: call scripts\dxmt-builder.bat test --profile gcc-x64-release-full unit
+        run: |
+          @echo off
+          set "DXMT_ORACLE_RESULTS=%GITHUB_WORKSPACE%\.cache\managed\windows-oracle\gcc-x64-release-full\build-meson-clang\tests\windows-oracle-results"
+          set "DXMT_BUILDER_LOG=%GITHUB_WORKSPACE%\windows-d3d-builder.log"
+          if exist "%DXMT_ORACLE_RESULTS%" rmdir /s /q "%DXMT_ORACLE_RESULTS%"
+          if exist "%DXMT_BUILDER_LOG%" del /q "%DXMT_BUILDER_LOG%"
+          call scripts\dxmt-builder.bat test --profile gcc-x64-release-full unit > "%DXMT_BUILDER_LOG%" 2>&1
+          set "DXMT_BUILDER_EXIT=%ERRORLEVEL%"
+          type "%DXMT_BUILDER_LOG%"
+          exit /b %DXMT_BUILDER_EXIT%
 
       - name: Upload Windows oracle logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: windows-d3d-results-${{ github.sha }}-${{ github.run_attempt }}
-          path: ${{ github.workspace }}\.cache\managed\windows-oracle\**\windows-oracle-results
+          path: |
+            ${{ github.workspace }}\.cache\managed\windows-oracle\**\windows-oracle-results
+            ${{ github.workspace }}\windows-d3d-builder.log
           if-no-files-found: warn
           retention-days: 14
 
