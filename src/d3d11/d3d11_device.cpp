@@ -1671,8 +1671,12 @@ public:
     return S_OK;
   }
 
-  HRESULT STDMETHODCALLTYPE EnqueueSetEvent(HANDLE hEvent) override {
-    return E_FAIL;
+  HRESULT STDMETHODCALLTYPE
+  EnqueueSetEvent(HANDLE hEvent) override {
+    if (!hEvent)
+      return E_INVALIDARG;
+    d3d11_device_.GetImmediateContextPrivate()->Flush1(D3D11_CONTEXT_TYPE_ALL, hEvent);
+    return S_OK;
   }
 
   void STDMETHODCALLTYPE Trim() override { WARN("DXGIDevice3::Trim: no-op"); };

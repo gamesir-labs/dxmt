@@ -18,6 +18,20 @@ namespace {
 using dxmt::test::ComPtr;
 using dxmt::test::D3D11TestContext;
 
+struct ScopedEvent {
+  ScopedEvent() : handle(CreateEventW(nullptr, TRUE, FALSE, nullptr)) {}
+
+  ScopedEvent(const ScopedEvent &) = delete;
+  ScopedEvent &operator=(const ScopedEvent &) = delete;
+
+  ~ScopedEvent() {
+    if (handle)
+      CloseHandle(handle);
+  }
+
+  HANDLE handle = nullptr;
+};
+
 struct InterfaceCase {
   const GUID *iid;
   const char *name;
@@ -314,6 +328,63 @@ TEST_F(D3D11DxgiDeviceSchedulingContractSpec,
   EXPECT_TRUE(actual == 0u || actual == 3u);
   EXPECT_EQ(dxgi_device1_->GetMaximumFrameLatency(nullptr),
             DXGI_ERROR_INVALID_CALL);
+  EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
+}
+
+TEST_F(D3D11DxgiDeviceSchedulingContractSpec,
+       EnqueueSetEventSignalsAfterPriorGpuWorkAndAllowsReuse) {
+  ComPtr<IDXGIDevice2> dxgi_device2;
+  ASSERT_EQ(dxgi_device1_->QueryInterface(
+                __uuidof(IDXGIDevice2),
+                reinterpret_cast<void **>(dxgi_device2.put())),
+            S_OK);
+  ASSERT_NE(dxgi_device2.get(), nullptr);
+
+  const D3D11_BUFFER_DESC desc = {
+      64, D3D11_USAGE_DEFAULT, 0, 0, 0, 0,
+  };
+  ComPtr<ID3D11Buffer> buffer;
+  ASSERT_EQ(context_.device()->CreateBuffer(&desc, nullptr, buffer.put()),
+            S_OK);
+  ASSERT_NE(buffer.get(), nullptr);
+
+  ScopedEvent event;
+  ASSERT_NE(event.handle, nullptr);
+  EXPECT_EQ(WaitForSingleObject(event.handle, 0), WAIT_TIMEOUT);
+
+  constexpr std::array<std::uint32_t, 16> kFirstUpdate = {
+      0x00010203, 0x10111213, 0x20212223, 0x30313233, 0x40414243, 0x50515253,
+      0x60616263, 0x70717273, 0x80818283, 0x90919293, 0xa0a1a2a3, 0xb0b1b2b3,
+      0xc0c1c2c3, 0xd0d1d2d3, 0xe0e1e2e3, 0xf0f1f2f3,
+  };
+  context_.context()->UpdateSubresource(buffer.get(), 0, nullptr,
+                                        kFirstUpdate.data(), 0, 0);
+  ASSERT_EQ(dxgi_device2->EnqueueSetEvent(event.handle), S_OK);
+  ASSERT_EQ(WaitForSingleObject(event.handle, 5000), WAIT_OBJECT_0);
+
+  ASSERT_TRUE(ResetEvent(event.handle));
+  constexpr std::array<std::uint32_t, 16> kSecondUpdate = {
+      0xf0e0d0c0, 0xf1e1d1c1, 0xf2e2d2c2, 0xf3e3d3c3, 0xf4e4d4c4, 0xf5e5d5c5,
+      0xf6e6d6c6, 0xf7e7d7c7, 0xf8e8d8c8, 0xf9e9d9c9, 0xfaeadaca, 0xfbebdbcb,
+      0xfcecdccc, 0xfdedddcd, 0xfeeedece, 0xffefdfcf,
+  };
+  context_.context()->UpdateSubresource(buffer.get(), 0, nullptr,
+                                        kSecondUpdate.data(), 0, 0);
+  ASSERT_EQ(dxgi_device2->EnqueueSetEvent(event.handle), S_OK);
+  EXPECT_EQ(WaitForSingleObject(event.handle, 5000), WAIT_OBJECT_0);
+  EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
+}
+
+TEST_F(D3D11DxgiDeviceSchedulingContractSpec,
+       EnqueueSetEventRejectsNullHandle) {
+  ComPtr<IDXGIDevice2> dxgi_device2;
+  ASSERT_EQ(dxgi_device1_->QueryInterface(
+                __uuidof(IDXGIDevice2),
+                reinterpret_cast<void **>(dxgi_device2.put())),
+            S_OK);
+  ASSERT_NE(dxgi_device2.get(), nullptr);
+
+  EXPECT_EQ(dxgi_device2->EnqueueSetEvent(nullptr), E_INVALIDARG);
   EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
 }
 
