@@ -4990,25 +4990,23 @@ public:
           *submitted_native_descriptor_spans->frozen_native,
           device_->GetMTLDevice());
     }
-    if (perf_stats) {
-      perf_stats->frame_generic_descriptor_span_lookups +=
-          submitted_native_descriptor_spans->lookup_count;
-      perf_stats->frame_generic_descriptor_span_unique +=
-          submitted_native_descriptor_spans->spans.size();
-      perf_stats->frame_generic_descriptor_span_reuses +=
-          submitted_native_descriptor_spans->reuse_count;
-      const auto &frozen =
-          *submitted_native_descriptor_spans->frozen_native;
-      perf_stats->frame_frozen_native_direct_packets +=
-          frozen.direct_packet_count;
-      perf_stats->frame_frozen_range_lookups += frozen.range_lookups;
-      perf_stats->frame_frozen_range_unique += frozen.range_bases.size();
-      perf_stats->frame_frozen_range_reuses += frozen.range_reuses;
-      perf_stats->frame_frozen_root_word_lookups +=
-          frozen.root_word_lookups;
-      perf_stats->frame_frozen_root_word_reuses +=
-          frozen.root_word_reuses;
-    }
+    op.capture_statistics.generic_descriptor_span_lookups =
+        submitted_native_descriptor_spans->lookup_count;
+    op.capture_statistics.generic_descriptor_span_unique =
+        submitted_native_descriptor_spans->spans.size();
+    op.capture_statistics.generic_descriptor_span_reuses =
+        submitted_native_descriptor_spans->reuse_count;
+    const auto &frozen =
+        *submitted_native_descriptor_spans->frozen_native;
+    op.capture_statistics.frozen_native_direct_packets =
+        frozen.direct_packet_count;
+    op.capture_statistics.frozen_range_lookups = frozen.range_lookups;
+    op.capture_statistics.frozen_range_unique = frozen.range_bases.size();
+    op.capture_statistics.frozen_range_reuses = frozen.range_reuses;
+    op.capture_statistics.frozen_root_word_lookups =
+        frozen.root_word_lookups;
+    op.capture_statistics.frozen_root_word_reuses =
+        frozen.root_word_reuses;
 
     dxmt::perf::recordExecuteTime(
         perf_stats, dxmt::perf::ExecuteTimeBucket::Collect,
@@ -6377,6 +6375,7 @@ private:
     std::vector<GraphicsVertexBufferBindingSnapshot> vertex_buffers;
     uint32_t vertex_slot_mask = 0;
     uint64_t content_fingerprint = 0;
+    uint64_t frozen_descriptor_table_fingerprint = 0;
     uint64_t resource_access_fingerprint = 0;
     dxmt::DescriptorContentRevision descriptor_content_revision = {};
     // The interpreted replay cache needs value-by-value identity matching.
@@ -6394,6 +6393,12 @@ private:
     CompiledNativeStageBinding frozen_native_vertex;
     CompiledNativeStageBinding frozen_native_pixel;
     CompiledNativeStageBinding frozen_native_compute;
+    struct FrozenRootConstant {
+      uint64_t offset = 0;
+      uint32_t length = 0;
+      bool valid = false;
+    };
+    std::array<FrozenRootConstant, 64> frozen_root_constants = {};
     bool compiled_compute = false;
     // Full packet binding identity (tables + root CBV/SRV/UAV + root
     // constants). Used to prevent reuse across draws that share table bases
@@ -6505,6 +6510,11 @@ private:
   // Root bases are remapped into these arrays, so only reflected descriptor
   // ranges are copied and later application writes cannot alter queued work.
   struct SubmittedFrozenNativeDescriptorStore {
+    struct PendingRootConstantDescriptor {
+      uint32_t descriptor_slot = 0;
+      uint64_t byte_offset = 0;
+      uint64_t byte_length = 0;
+    };
     struct RangeKeyHash {
       size_t operator()(const std::vector<uint64_t> &key) const {
         size_t hash = 1469598103934665603ull;
@@ -6541,6 +6551,34 @@ private:
       return {offset, static_cast<uint32_t>(words.size())};
     }
 
+    std::pair<uint64_t, uint32_t>
+    appendRootConstants(uint32_t declared_count, uint32_t dst_offset,
+                        std::span<const uint32_t> values) {
+      const auto word_count =
+          std::max<uint32_t>(declared_count,
+                             dst_offset + uint32_t(values.size()));
+      if (!word_count)
+        return {};
+      std::vector<uint32_t> words(word_count, 0);
+      if (!values.empty())
+        std::copy(values.begin(), values.end(),
+                  words.begin() + dst_offset);
+      root_constant_lookups++;
+      if (const auto found = root_constant_offsets.find(words);
+          found != root_constant_offsets.end()) {
+        root_constant_reuses++;
+        return {found->second, word_count * uint32_t(sizeof(uint32_t))};
+      }
+      constexpr size_t kConstantAlignmentWords =
+          D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT / sizeof(uint32_t);
+      while (root_words.size() % kConstantAlignmentWords)
+        root_words.push_back(0);
+      const auto offset = uint64_t(root_words.size()) * sizeof(uint32_t);
+      root_words.insert(root_words.end(), words.begin(), words.end());
+      root_constant_offsets.emplace(std::move(words), offset);
+      return {offset, word_count * uint32_t(sizeof(uint32_t))};
+    }
+
     std::vector<DescriptorTableEntry> descriptor_table;
     std::vector<BufferDescriptorRecord> buffer_records;
     std::vector<BufferResourceTableEntry> buffer_resources =
@@ -6548,18 +6586,25 @@ private:
     std::vector<WMT::Reference<WMT::Resource>> retained_resources;
     std::unordered_set<uint64_t> retained_resource_handles;
     std::vector<uint32_t> root_words;
+    std::vector<PendingRootConstantDescriptor>
+        pending_root_constant_descriptors;
     std::unordered_map<std::vector<uint64_t>, uint32_t, RangeKeyHash>
         range_bases;
     std::map<std::vector<uint32_t>, uint64_t> root_word_offsets;
+    std::map<std::vector<uint32_t>, uint64_t> root_constant_offsets;
     uint64_t direct_packet_count = 0;
     uint64_t range_lookups = 0;
     uint64_t range_reuses = 0;
     uint64_t root_word_lookups = 0;
     uint64_t root_word_reuses = 0;
+    uint64_t root_constant_lookups = 0;
+    uint64_t root_constant_reuses = 0;
+    std::atomic<uint64_t> retained_sequence = UINT64_MAX;
     WMT::Reference<WMT::Buffer> descriptor_table_buffer;
     WMT::Reference<WMT::Buffer> buffer_record_buffer;
     WMT::Reference<WMT::Buffer> buffer_resource_table_buffer;
     WMT::Reference<WMT::Buffer> root_base_buffer;
+    uint64_t root_base_gpu_address = 0;
     uint64_t descriptor_table_buffer_offset = 0;
     uint64_t buffer_record_buffer_offset = 0;
     uint64_t buffer_resource_table_buffer_offset = 0;
@@ -6612,7 +6657,7 @@ private:
     if (store.finalized)
       return store.ready;
     store.finalized = true;
-    if (store.descriptor_table.empty() || store.root_words.empty())
+    if (store.root_words.empty())
       return false;
 
     constexpr uint64_t kSectionAlignment = 256;
@@ -6642,19 +6687,48 @@ private:
         WMTResourceStorageModeShared | WMTResourceHazardTrackingModeUntracked);
     info.memory.set(nullptr);
     store.root_base_buffer = device.newBuffer(info);
+    store.root_base_gpu_address = info.gpu_address;
     auto *mapped = static_cast<std::byte *>(
         info.memory.get_accessible_or_null());
     if (!store.root_base_buffer || !mapped) {
       store.root_base_buffer = nullptr;
       return false;
     }
+    for (const auto &pending : store.pending_root_constant_descriptors) {
+      if (pending.descriptor_slot >= store.buffer_records.size() ||
+          pending.descriptor_slot >= store.descriptor_table.size())
+        continue;
+      const auto resource_index =
+          1u + pending.descriptor_slot * 2u;
+      if (resource_index >= store.buffer_resources.size())
+        continue;
+      store.buffer_resources[resource_index] = BufferResourceTableEntry{
+          store.root_base_gpu_address, total_size,
+          store.root_base_buffer.handle, 1};
+      store.buffer_records[pending.descriptor_slot] =
+          BufferDescriptorRecord{
+              resource_index,
+              BufferDescriptorRecordFlagValid |
+                  BufferDescriptorRecordFlagCBV,
+              pending.byte_offset,
+              pending.byte_length,
+              0,
+              0,
+              kNullDescriptorResourceIndex,
+              0};
+      store.descriptor_table[pending.descriptor_slot].gpu_va =
+          store.root_base_gpu_address + pending.byte_offset;
+    }
     std::memcpy(mapped, store.root_words.data(), root_size);
-    std::memcpy(mapped + store.descriptor_table_buffer_offset,
-                store.descriptor_table.data(), descriptor_table_size);
-    std::memcpy(mapped + store.buffer_record_buffer_offset,
-                store.buffer_records.data(), buffer_record_size);
-    std::memcpy(mapped + store.buffer_resource_table_buffer_offset,
-                store.buffer_resources.data(), buffer_resource_table_size);
+    if (descriptor_table_size)
+      std::memcpy(mapped + store.descriptor_table_buffer_offset,
+                  store.descriptor_table.data(), descriptor_table_size);
+    if (buffer_record_size)
+      std::memcpy(mapped + store.buffer_record_buffer_offset,
+                  store.buffer_records.data(), buffer_record_size);
+    if (buffer_resource_table_size)
+      std::memcpy(mapped + store.buffer_resource_table_buffer_offset,
+                  store.buffer_resources.data(), buffer_resource_table_size);
     store.descriptor_table_buffer = store.root_base_buffer;
     store.buffer_record_buffer = store.root_base_buffer;
     store.buffer_resource_table_buffer = store.root_base_buffer;
@@ -6666,11 +6740,16 @@ private:
     bool valid = false;
     UINT dst_offset = 0;
     std::vector<UINT> values;
+    WMT::Reference<WMT::Buffer> frozen_buffer;
+    uint64_t frozen_offset = 0;
+    uint64_t frozen_length = 0;
+    uint64_t frozen_gpu_address = 0;
   };
 
   struct CompiledRootDescriptorSlot {
     bool valid = false;
     D3D12_GPU_VIRTUAL_ADDRESS address = 0;
+    std::optional<DescriptorRecord> frozen_descriptor;
   };
 
   struct CompiledPacketBindingState {
@@ -6680,6 +6759,16 @@ private:
     std::array<CompiledRootDescriptorSlot, kMaxRootParameters> cbv_roots = {};
     std::array<CompiledRootDescriptorSlot, kMaxRootParameters> srv_roots = {};
     std::array<CompiledRootDescriptorSlot, kMaxRootParameters> uav_roots = {};
+  };
+
+  struct CompiledEncoderBindingIdentity {
+    const void *program = nullptr;
+    const void *resource_heap = nullptr;
+    const void *sampler_heap = nullptr;
+    const void *root_tables = nullptr;
+    const void *root_constants = nullptr;
+    const void *root_descriptors = nullptr;
+    const void *vertex_bindings = nullptr;
   };
 
   enum class CompiledNativeBindingOpKind : uint8_t {
@@ -6697,6 +6786,8 @@ private:
       uint32_t index = 0;
       uint32_t required_dirty_fields = UINT32_MAX;
       uint64_t root_table_mask = 0;
+      uint64_t root_constant_mask = 0;
+      uint64_t root_descriptor_mask = 0;
       bool compute = false;
       WMTRenderStages render_stages = {};
     };
@@ -7100,8 +7191,8 @@ private:
     std::shared_ptr<GraphicsBindingSnapshot> bindless_snapshot;
     std::shared_ptr<SubmittedFrozenNativeDescriptorStore> frozen_native;
     std::shared_ptr<const CompiledNativeBindingRecipe> native_binding_recipe;
+    CompiledEncoderBindingIdentity binding_identity = {};
     dxmt::DescriptorContentRevision descriptor_content_revision = {};
-    uint64_t binding_content_fingerprint = 0;
     std::shared_ptr<CompiledCommandTestTelemetry> test_telemetry;
   };
 
@@ -9574,8 +9665,7 @@ private:
         6 * (packet.root_constants.size() + packet.root_descriptors.size()));
     const bool frozen_native_direct =
         snapshot->native && native_span_store &&
-        native_span_store->frozen_native && packet.root_constants.empty() &&
-        packet.root_descriptors.empty();
+        native_span_store->frozen_native;
     if (!frozen_native_direct) {
       CaptureCompiledDescriptorTableBindings(
           *snapshot, packet, *binding_recipe,
@@ -9601,6 +9691,8 @@ private:
             *snapshot->frozen_native, snapshot->frozen_native_pixel,
             snapshot.get());
       }
+      snapshot->frozen_descriptor_table_fingerprint =
+          snapshot->content_fingerprint;
     }
     // Root CBV/SRV/UAV and 32-bit constants are part of the submitted binding
     // state. Capture them into the same snapshot so encode-time packBindless
@@ -9625,6 +9717,17 @@ private:
               *snapshot, pipeline, root_index, parameter,
               captured ? captured->values.span() : std::span<const UINT>{},
               captured ? captured->dst_offset : 0, compute);
+          if (snapshot->frozen_native &&
+              !snapshot->frozen_root_constants[root_index].valid) {
+            const auto [offset, length] =
+                snapshot->frozen_native->appendRootConstants(
+                    parameter.constants.Num32BitValues,
+                    captured ? captured->dst_offset : 0,
+                    captured ? captured->values.span()
+                             : std::span<const UINT>{});
+            snapshot->frozen_root_constants[root_index] = {
+                offset, length, length != 0};
+          }
           capture_stats.root_constants++;
         } else if (parameter.parameter_type == D3D12_ROOT_PARAMETER_TYPE_CBV ||
                    parameter.parameter_type == D3D12_ROOT_PARAMETER_TYPE_SRV ||
@@ -9657,12 +9760,52 @@ private:
           dxmt::PerfCodePath::QueueCaptureDescriptorJournalFinalize);
       FinalizeCompiledDescriptorSnapshot(*snapshot);
     }
-    // Compiled packets carry an immutable submission snapshot. Its revision is
-    // derived solely from the binding program and reflected descriptor spans,
-    // so later writes to unrelated heap slots cannot invalidate encoder state.
+    // Keep descriptor-table identity independent from root constants and root
+    // descriptors. Those fields have their own slot masks; folding them into
+    // this revision turns every root-word change into a complete descriptor
+    // table rebind.
+    uint64_t descriptor_table_fingerprint =
+        kGraphicsBindingFingerprintOffset;
+    HashGraphicsBindingPointer(descriptor_table_fingerprint,
+                               snapshot->compiled_binding_program_identity);
+    if (snapshot->frozen_native) {
+      HashGraphicsBindingValue(
+          descriptor_table_fingerprint,
+          snapshot->frozen_descriptor_table_fingerprint);
+    } else {
+      HashGraphicsBindingPointer(descriptor_table_fingerprint,
+                                 snapshot->compiled_root_tables_identity);
+      for (size_t index = 0;
+           index < snapshot->native_descriptor_indices.size(); ++index) {
+        const auto descriptor_index =
+            snapshot->native_descriptor_indices[index];
+        HashGraphicsBindingValue(descriptor_table_fingerprint,
+                                 descriptor_index != UINT32_MAX);
+        if (descriptor_index != UINT32_MAX)
+          HashGraphicsBindingDescriptor(
+              descriptor_table_fingerprint,
+              snapshot->descriptor_records->records[descriptor_index]);
+      }
+      for (const auto &entry : snapshot->entries) {
+        if (entry.kind != GraphicsBindingSnapshotEntry::Kind::Descriptor ||
+            (entry.debug_kind &&
+             std::strncmp(entry.debug_kind, "root-", 5) == 0))
+          continue;
+        HashGraphicsBindingValue(descriptor_table_fingerprint,
+                                 entry.root_index);
+        HashGraphicsBindingValue(descriptor_table_fingerprint,
+                                 entry.range_type);
+        HashGraphicsBindingValue(descriptor_table_fingerprint,
+                                 entry.has_descriptor);
+        if (entry.has_descriptor)
+          HashGraphicsBindingDescriptor(descriptor_table_fingerprint,
+                                        SnapshotDescriptor(*snapshot, entry));
+      }
+    }
     snapshot->descriptor_content_revision = {
-        snapshot->compiled_binding_identity_hash,
-        snapshot->content_fingerprint};
+        reinterpret_cast<uintptr_t>(
+            snapshot->compiled_binding_program_identity),
+        descriptor_table_fingerprint};
     // Resource dependency identity is based on frozen descriptor contents,
     // not the packet/snapshot address. Games commonly rotate descriptor-table
     // handles while binding the same resources; pointer identity turned every
@@ -10440,9 +10583,6 @@ private:
                   ? submitted_snapshot->frozen_native
                   : std::shared_ptr<SubmittedFrozenNativeDescriptorStore>{};
           if (native_packet) {
-            if (!packet.root_constants.empty() ||
-                !packet.root_descriptors.empty())
-              return CompiledCommandFallbackReason::NativeShaderAbiMismatch;
             if (frozen_native) {
               if (!submitted_snapshot->frozen_native_vertex.ready ||
                   !submitted_snapshot->frozen_native_pixel.ready)
@@ -10559,7 +10699,8 @@ private:
 
           CompiledPacketBindingState binding_state = {};
           FillCompiledBindingState(binding_state, packet.root_constants,
-                                   packet.root_descriptors);
+                                   packet.root_descriptors,
+                                   submitted_snapshot.get());
           RecordCompiledDescriptorBackendStats(
               dxmt::perf::enabled() ? &queue.CurrentFrameStatistics() : nullptr,
               submitted_root_tables);
@@ -10762,6 +10903,13 @@ private:
               common.pipeline = pipeline;
               common.binding_program = packet.binding_program;
               common.binding_delta = packet.binding_delta;
+              common.binding_identity =
+                  BuildCompiledEncoderBindingIdentity(packet);
+              if (frozen_native) {
+                common.binding_identity.resource_heap = frozen_native.get();
+                common.binding_identity.sampler_heap = frozen_native.get();
+                common.binding_identity.root_tables = nullptr;
+              }
               common.test_telemetry = compiled->test_telemetry;
               common.binding_generation = binding_fingerprint;
               common.binding_content_fingerprint = binding_fingerprint;
@@ -10828,6 +10976,15 @@ private:
             replay_packet.common.pipeline = pipeline;
             replay_packet.common.binding_program = packet.binding_program;
             replay_packet.common.binding_delta = packet.binding_delta;
+            replay_packet.common.binding_identity =
+                BuildCompiledEncoderBindingIdentity(packet);
+            if (frozen_native) {
+              replay_packet.common.binding_identity.resource_heap =
+                  frozen_native.get();
+              replay_packet.common.binding_identity.sampler_heap =
+                  frozen_native.get();
+              replay_packet.common.binding_identity.root_tables = nullptr;
+            }
             replay_packet.common.test_telemetry = compiled->test_telemetry;
             replay_packet.common.binding_generation = binding_fingerprint;
             replay_packet.common.binding_content_fingerprint =
@@ -10908,6 +11065,15 @@ private:
             replay_packet.common.pipeline = pipeline;
             replay_packet.common.binding_program = packet.binding_program;
             replay_packet.common.binding_delta = packet.binding_delta;
+            replay_packet.common.binding_identity =
+                BuildCompiledEncoderBindingIdentity(packet);
+            if (frozen_native) {
+              replay_packet.common.binding_identity.resource_heap =
+                  frozen_native.get();
+              replay_packet.common.binding_identity.sampler_heap =
+                  frozen_native.get();
+              replay_packet.common.binding_identity.root_tables = nullptr;
+            }
             replay_packet.common.test_telemetry = compiled->test_telemetry;
             replay_packet.common.binding_generation = binding_fingerprint;
             replay_packet.common.binding_content_fingerprint =
@@ -11085,9 +11251,6 @@ private:
                   ? submitted_snapshot->frozen_native
                   : std::shared_ptr<SubmittedFrozenNativeDescriptorStore>{};
           if (native_packet) {
-            if (!packet.root_constants.empty() ||
-                !packet.root_descriptors.empty())
-              return CompiledCommandFallbackReason::NativeShaderAbiMismatch;
             if (frozen_native) {
               if (!submitted_snapshot->frozen_native_compute.ready)
                 return CompiledCommandFallbackReason::NativeMissingDescriptorBackend;
@@ -11129,7 +11292,8 @@ private:
             return CompiledCommandFallbackReason::UnsupportedCommand;
           CompiledPacketBindingState binding_state = {};
           FillCompiledBindingState(binding_state, packet.root_constants,
-                                   packet.root_descriptors);
+                                   packet.root_descriptors,
+                                   submitted_snapshot.get());
           RecordCompiledDescriptorBackendStats(
               dxmt::perf::enabled() ? &queue.CurrentFrameStatistics() : nullptr,
               submitted_root_tables);
@@ -11179,6 +11343,15 @@ private:
           auto &binding_payload =
               *dispatch_packet.compiled_binding_payload;
           binding_payload.packet = packet;
+          binding_payload.binding_identity =
+              BuildCompiledEncoderBindingIdentity(packet);
+          if (frozen_native) {
+            binding_payload.binding_identity.resource_heap =
+                frozen_native.get();
+            binding_payload.binding_identity.sampler_heap =
+                frozen_native.get();
+            binding_payload.binding_identity.root_tables = nullptr;
+          }
           binding_payload.binding_state = std::move(binding_state);
           binding_payload.direct_access = std::move(direct_access);
           binding_payload.native_root_base_buffer =
@@ -11198,18 +11371,6 @@ private:
                   : dxmt::DescriptorContentRevision{
                         reinterpret_cast<uintptr_t>(packet.binding_program.get()),
                         reinterpret_cast<uintptr_t>(prepared.root_tables.get())};
-          binding_payload.binding_content_fingerprint =
-              kGraphicsBindingFingerprintOffset;
-          HashGraphicsBindingPointer(
-              binding_payload.binding_content_fingerprint,
-              packet.binding_program.get());
-          HashGraphicsBindingPointer(
-              binding_payload.binding_content_fingerprint,
-              prepared.root_tables.get());
-          if (submitted_snapshot)
-            HashGraphicsBindingValue(
-                binding_payload.binding_content_fingerprint,
-                submitted_snapshot->content_fingerprint);
           if (!native_packet) {
             binding_payload.bindless_snapshot =
                 submitted_snapshot
@@ -17729,6 +17890,12 @@ private:
   };
 
   struct NativeRootBaseStagePlanEntry {
+    enum class Source : uint8_t {
+      DescriptorTable,
+      RootConstants,
+      RootDescriptor,
+    };
+
     uint32_t root_index = 0;
     uint32_t range_offset = 0;
     uint32_t descriptor_index = 0;
@@ -17739,6 +17906,7 @@ private:
     uint16_t argument_index = 0;
     D3D12_DESCRIPTOR_RANGE_TYPE range_type = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
     D3D12_DESCRIPTOR_HEAP_TYPE heap_type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+    Source source = Source::DescriptorTable;
     bool cbuffer = false;
   };
 
@@ -18976,14 +19144,16 @@ private:
     const auto parameters = root.GetParameters();
     for (UINT root_index = 0; root_index < parameters.size(); root_index++) {
       const auto &parameter = parameters[root_index];
-      if (parameter.parameter_type != D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE)
-        continue;
       bool visible = false;
       ForEachVisibleStage(parameter.visibility, compute, [&](PipelineStage s) {
         if (s == want_stage)
           visible = true;
       });
       if (!visible)
+        continue;
+
+      if (parameter.parameter_type !=
+          D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE)
         continue;
 
       UINT running_offset = 0;
@@ -19083,8 +19253,6 @@ private:
     const auto parameters = root.GetParameters();
     for (UINT root_index = 0; root_index < parameters.size(); root_index++) {
       const auto &parameter = parameters[root_index];
-      if (parameter.parameter_type != D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE)
-        continue;
       bool visible = false;
       ForEachVisibleStage(parameter.visibility, compute, [&](PipelineStage s) {
         if (s == want_stage)
@@ -19092,6 +19260,80 @@ private:
       });
       if (!visible)
         continue;
+
+      if (parameter.parameter_type !=
+          D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE) {
+        const bool root_constants =
+            parameter.parameter_type ==
+            D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+        const bool cbuffer =
+            root_constants ||
+            parameter.parameter_type == D3D12_ROOT_PARAMETER_TYPE_CBV;
+        const auto binding_type =
+            cbuffer
+                ? SM50BindingType::ConstantBuffer
+                : parameter.parameter_type == D3D12_ROOT_PARAMETER_TYPE_SRV
+                      ? SM50BindingType::SRV
+                      : parameter.parameter_type == D3D12_ROOT_PARAMETER_TYPE_UAV
+                            ? SM50BindingType::UAV
+                            : SM50BindingType::Sampler;
+        if (binding_type == SM50BindingType::Sampler)
+          continue;
+        const UINT shader_register =
+            root_constants ? parameter.constants.ShaderRegister
+                           : parameter.descriptor.ShaderRegister;
+        const UINT register_space =
+            root_constants ? parameter.constants.RegisterSpace
+                           : parameter.descriptor.RegisterSpace;
+        const auto *arguments =
+            cbuffer ? shader->constantBufferInfo()
+                    : shader->resourceArgumentInfo();
+        const auto argument_count =
+            cbuffer ? shader->reflection().NumConstantBuffers
+                    : shader->reflection().NumArguments;
+        for (UINT i = 0; arguments && i < argument_count; ++i) {
+          const auto &argument = arguments[i];
+          if (argument.Type != binding_type)
+            continue;
+          const auto space =
+              argument.RegisterCount ? argument.RegisterSpace : 0;
+          const auto lower = argument.RegisterCount
+                                 ? argument.RegisterLowerBound
+                                 : argument.SM50BindingSlot;
+          const auto count = ShaderArgumentRangeCount(argument);
+          if (space != register_space || shader_register < lower ||
+              (count != UINT_MAX && shader_register - lower >= count))
+            continue;
+          const auto key = argument.StructurePtrOffset;
+          if (cbuffer)
+            plan.max_cbuffer_key_plus_one =
+                std::max<uint32_t>(plan.max_cbuffer_key_plus_one, key + 1);
+          else
+            plan.max_resource_key_plus_one =
+                std::max<uint32_t>(plan.max_resource_key_plus_one, key + 1);
+          plan.entries.push_back(NativeRootBaseStagePlanEntry{
+              root_index,
+              0,
+              0,
+              1,
+              shader_register - lower,
+              key,
+              1,
+              uint16_t(i),
+              cbuffer
+                  ? D3D12_DESCRIPTOR_RANGE_TYPE_CBV
+                  : binding_type == SM50BindingType::SRV
+                        ? D3D12_DESCRIPTOR_RANGE_TYPE_SRV
+                        : D3D12_DESCRIPTOR_RANGE_TYPE_UAV,
+              D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+              root_constants
+                  ? NativeRootBaseStagePlanEntry::Source::RootConstants
+                  : NativeRootBaseStagePlanEntry::Source::RootDescriptor,
+              cbuffer});
+          break;
+        }
+        continue;
+      }
 
       UINT running_offset = 0;
       for (const auto &range : parameter.ranges) {
@@ -19146,6 +19388,7 @@ private:
                 uint16_t(i),
                 range.range_type,
                 DescriptorHeapTypeForRange(range.range_type),
+                NativeRootBaseStagePlanEntry::Source::DescriptorTable,
                 cbuffer});
           }
         }
@@ -19246,6 +19489,58 @@ private:
     store.buffer_records[destination] = record;
   }
 
+  bool CopyFrozenNativeRootDescriptorSlot(
+      SubmittedFrozenNativeDescriptorStore &store, uint32_t destination,
+      D3D12_GPU_VIRTUAL_ADDRESS address,
+      D3D12_DESCRIPTOR_RANGE_TYPE range_type) {
+    if (!address || destination >= store.descriptor_table.size())
+      return false;
+    Resource *resource = nullptr;
+    const auto resource_offset =
+        ResolveBufferGpuAddress(address, resource);
+    auto *allocation =
+        resource ? resource->GetBufferAllocation() : nullptr;
+    if (!resource || !allocation || !allocation->buffer())
+      return false;
+    const auto byte_offset =
+        resource->GetHeapOffset() + resource_offset;
+    const auto remaining =
+        resource_offset < resource->GetResourceDesc().Width
+            ? resource->GetResourceDesc().Width - resource_offset
+            : 0;
+    const auto resource_index = 1u + destination * 2u;
+    if (!remaining || resource_index >= store.buffer_resources.size())
+      return false;
+    uint32_t flags = BufferDescriptorRecordFlagValid;
+    switch (range_type) {
+    case D3D12_DESCRIPTOR_RANGE_TYPE_CBV:
+      flags |= BufferDescriptorRecordFlagCBV;
+      break;
+    case D3D12_DESCRIPTOR_RANGE_TYPE_SRV:
+      flags |= BufferDescriptorRecordFlagSRV |
+               BufferDescriptorRecordFlagRaw;
+      break;
+    case D3D12_DESCRIPTOR_RANGE_TYPE_UAV:
+      flags |= BufferDescriptorRecordFlagUAV |
+               BufferDescriptorRecordFlagRaw;
+      break;
+    case D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER:
+      return false;
+    }
+    store.buffer_resources[resource_index] = BufferResourceTableEntry{
+        allocation->gpuAddress() + allocation->currentSuballocationOffset(),
+        resource->GetResourceDesc().Width,
+        allocation->buffer().handle, 1};
+    if (store.retained_resource_handles.insert(
+            allocation->buffer().handle).second)
+      store.retained_resources.emplace_back(allocation->buffer().handle);
+    store.buffer_records[destination] = BufferDescriptorRecord{
+        resource_index, flags, byte_offset, remaining, 1, 0,
+        kNullDescriptorResourceIndex, 0};
+    store.descriptor_table[destination].gpu_va = address;
+    return true;
+  }
+
   template <typename Packet>
   void BuildFrozenNativeStageBinding(
       const Packet &packet, PipelineState &pipeline, RootSignature &root,
@@ -19289,7 +19584,14 @@ private:
 
         struct CapturedSlot {
           uint32_t destination = 0;
+          NativeRootBaseStagePlanEntry::Source source =
+              NativeRootBaseStagePlanEntry::Source::DescriptorTable;
           const DescriptorRecord *descriptor = nullptr;
+          uint64_t root_constant_offset = 0;
+          uint32_t root_constant_length = 0;
+          D3D12_GPU_VIRTUAL_ADDRESS root_descriptor_address = 0;
+          D3D12_DESCRIPTOR_RANGE_TYPE range_type =
+              D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
         };
         std::vector<CapturedSlot> captured;
         captured.reserve(group.captured_capacity);
@@ -19297,6 +19599,67 @@ private:
         range_key.reserve(1 + group.captured_capacity * 6);
         for (const auto entry_index : group.entry_indices) {
           const auto &entry = plan->entries[entry_index];
+          if (entry.source ==
+              NativeRootBaseStagePlanEntry::Source::RootConstants) {
+            const auto found = std::find_if(
+                packet.root_constants.begin(), packet.root_constants.end(),
+                [&](const auto &constants) {
+                  return constants.root_parameter_index == entry.root_index;
+                });
+            const auto parameters = root.GetParameters();
+            const auto declared_count =
+                entry.root_index < parameters.size()
+                    ? parameters[entry.root_index].constants.Num32BitValues
+                    : 0;
+            const auto [constant_offset, constant_length] =
+                store.appendRootConstants(
+                    declared_count,
+                    found != packet.root_constants.end() ? found->dst_offset
+                                                         : 0,
+                    found != packet.root_constants.end()
+                        ? found->values.span()
+                        : std::span<const UINT>{});
+            const auto destination = entry.argument_local_start;
+            captured.push_back(
+                {destination, entry.source, nullptr, constant_offset,
+                 constant_length, 0, entry.range_type});
+            range_key.push_back(destination);
+            range_key.push_back(uint64_t(entry.source));
+            range_key.push_back(constant_offset);
+            range_key.push_back(constant_length);
+            if (snapshot && entry.root_index <
+                                snapshot->frozen_root_constants.size()) {
+              snapshot->frozen_root_constants[entry.root_index] = {
+                  constant_offset, constant_length, constant_length != 0};
+            }
+            continue;
+          }
+          if (entry.source ==
+              NativeRootBaseStagePlanEntry::Source::RootDescriptor) {
+            const auto parameter_type =
+                entry.range_type == D3D12_DESCRIPTOR_RANGE_TYPE_CBV
+                    ? D3D12_ROOT_PARAMETER_TYPE_CBV
+                    : entry.range_type == D3D12_DESCRIPTOR_RANGE_TYPE_SRV
+                          ? D3D12_ROOT_PARAMETER_TYPE_SRV
+                          : D3D12_ROOT_PARAMETER_TYPE_UAV;
+            const auto found = std::find_if(
+                packet.root_descriptors.begin(), packet.root_descriptors.end(),
+                [&](const auto &descriptor) {
+                  return descriptor.root_parameter_index == entry.root_index &&
+                         descriptor.parameter_type == parameter_type;
+                });
+            const auto address =
+                found != packet.root_descriptors.end() ? found->address : 0;
+            const auto destination = entry.argument_local_start;
+            captured.push_back(
+                {destination, entry.source, nullptr, 0, 0, address,
+                 entry.range_type});
+            range_key.push_back(destination);
+            range_key.push_back(uint64_t(entry.source));
+            range_key.push_back(address);
+            range_key.push_back(uint64_t(entry.range_type));
+            continue;
+          }
           auto *heap = get_heap(entry.heap_type);
           const auto base = entry.root_index < tables.size()
                                 ? tables[entry.root_index]
@@ -19312,7 +19675,9 @@ private:
                                entry.descriptor_index + local,
                                entry.descriptor_count, entry.heap_type)
                          : nullptr;
-            captured.push_back({destination, record});
+            captured.push_back(
+                {destination, entry.source, record, 0, 0, 0,
+                 entry.range_type});
             if (snapshot) {
               CaptureCompiledDescriptorJournalCursor(
                   *snapshot, heap ? heap->GetMirror() : nullptr);
@@ -19373,11 +19738,25 @@ private:
         store.range_reuses += inserted ? 0 : 1;
         if (inserted) {
           range_it->second = store.allocateSlots(range_length);
-          for (const auto &slot : captured)
-            if (slot.descriptor)
-              CopyFrozenNativeDescriptorSlot(
-                  store, range_it->second + slot.destination,
-                  *slot.descriptor);
+          for (const auto &slot : captured) {
+            const auto destination = range_it->second + slot.destination;
+            if (slot.source ==
+                NativeRootBaseStagePlanEntry::Source::DescriptorTable) {
+              if (slot.descriptor)
+                CopyFrozenNativeDescriptorSlot(store, destination,
+                                               *slot.descriptor);
+            } else if (slot.source ==
+                       NativeRootBaseStagePlanEntry::Source::RootConstants) {
+              if (slot.root_constant_length)
+                store.pending_root_constant_descriptors.push_back(
+                    {destination, slot.root_constant_offset,
+                     slot.root_constant_length});
+            } else {
+              CopyFrozenNativeRootDescriptorSlot(
+                  store, destination, slot.root_descriptor_address,
+                  slot.range_type);
+            }
+          }
         }
         words[key_index] = range_it->second;
       }
@@ -19387,8 +19766,16 @@ private:
     for (const auto &entry : plan->entries) {
       if (entry.root_index >= 64)
         continue;
-      auto &mask = entry.cbuffer ? out.cbuffer_root_table_mask
-                                 : out.resource_root_table_mask;
+      auto &mask =
+          entry.source == NativeRootBaseStagePlanEntry::Source::RootConstants
+              ? (entry.cbuffer ? out.cbuffer_root_constant_mask
+                               : out.resource_root_constant_mask)
+          : entry.source ==
+                  NativeRootBaseStagePlanEntry::Source::RootDescriptor
+              ? (entry.cbuffer ? out.cbuffer_root_descriptor_mask
+                               : out.resource_root_descriptor_mask)
+              : (entry.cbuffer ? out.cbuffer_root_table_mask
+                               : out.resource_root_table_mask);
       mask |= uint64_t{1} << entry.root_index;
     }
     std::tie(out.cbuffer_root_base_offset, out.cbuffer_root_base_count) =
@@ -21976,13 +22363,16 @@ private:
                                    uint32_t index,
                                    WMTRenderStages render_stages,
                                    uint32_t required_dirty_fields,
-                                   uint64_t root_table_mask = 0) {
+                                   uint64_t root_table_mask = 0,
+                                   uint64_t root_constant_mask = 0,
+                                   uint64_t root_descriptor_mask = 0) {
       if (!buffer)
         return;
       recipe->ops.push_back(CompiledNativeBindingRecipe::Op{
           CompiledNativeBindingOpKind::ArgumentBuffer,
           WMT::Reference<WMT::Buffer>(buffer), offset, index,
-          required_dirty_fields, root_table_mask, compute, render_stages});
+          required_dirty_fields, root_table_mask, root_constant_mask,
+          root_descriptor_mask, compute, render_stages});
     };
 
     const WMTRenderStages all_render_stages =
@@ -22050,12 +22440,14 @@ private:
       if (shader->reflection().NumConstantBuffers) {
         recipe->ops.push_back(CompiledNativeBindingRecipe::Op{
             CompiledNativeBindingOpKind::NullConstantBuffer, {}, 0, 0,
-            CompiledBindingDirtyPipelineLayout, 0, compute, render_stages});
+            CompiledBindingDirtyPipelineLayout, 0, 0, 0, compute,
+            render_stages});
       }
       if (NativeShaderUsesBufferSrv(*shader)) {
         recipe->ops.push_back(CompiledNativeBindingRecipe::Op{
             CompiledNativeBindingOpKind::NullBuffer, {}, 0, 0,
-            CompiledBindingDirtyPipelineLayout, 0, compute, render_stages});
+            CompiledBindingDirtyPipelineLayout, 0, 0, 0, compute,
+            render_stages});
       }
       if (binding->cbuffer_root_base_count) {
         add_argument_buffer(
@@ -22063,16 +22455,24 @@ private:
             DXMT12_MTL4_NATIVE_CBUFFER_ROOT_TABLE_BASE_BIND_INDEX,
             render_stages,
             CompiledBindingDirtyPipelineLayout |
-                CompiledBindingDirtyRootTables,
-            binding->cbuffer_root_table_mask);
+                CompiledBindingDirtyRootTables |
+                CompiledBindingDirtyRootConstants |
+                CompiledBindingDirtyRootDescriptors,
+            binding->cbuffer_root_table_mask,
+            binding->cbuffer_root_constant_mask,
+            binding->cbuffer_root_descriptor_mask);
       }
       if (binding->resource_root_base_count) {
         add_argument_buffer(
             native_root_base_buffer, binding->resource_root_base_offset,
             DXMT12_MTL4_NATIVE_ROOT_TABLE_BASE_BIND_INDEX, render_stages,
             CompiledBindingDirtyPipelineLayout |
-                CompiledBindingDirtyRootTables,
-            binding->resource_root_table_mask);
+                CompiledBindingDirtyRootTables |
+                CompiledBindingDirtyRootConstants |
+                CompiledBindingDirtyRootDescriptors,
+            binding->resource_root_table_mask,
+            binding->resource_root_constant_mask,
+            binding->resource_root_descriptor_mask);
       }
     }
     return recipe;
@@ -22082,17 +22482,34 @@ private:
       ArgumentEncodingContext &enc,
       const CompiledNativeBindingRecipe &recipe, uint32_t dirty_fields,
       uint64_t root_table_dirty_mask,
+      uint64_t root_constant_dirty_mask,
+      uint64_t root_descriptor_dirty_mask,
       CompiledCommandTestTelemetry *test_telemetry = nullptr) {
     for (const auto &op : recipe.ops) {
       const auto matching_fields =
           op.required_dirty_fields & dirty_fields;
-      const bool non_root_dirty =
+      const uint32_t non_root_dirty =
           matching_fields & ~CompiledBindingDirtyRootTables;
       const bool root_dirty =
           (matching_fields & CompiledBindingDirtyRootTables) &&
           (!op.root_table_mask || root_table_dirty_mask == UINT64_MAX ||
            (op.root_table_mask & root_table_dirty_mask));
-      if (!non_root_dirty && !root_dirty) {
+      const bool constant_dirty =
+          (matching_fields & CompiledBindingDirtyRootConstants) &&
+          (!op.root_constant_mask ||
+           root_constant_dirty_mask == UINT64_MAX ||
+           (op.root_constant_mask & root_constant_dirty_mask));
+      const bool descriptor_dirty =
+          (matching_fields & CompiledBindingDirtyRootDescriptors) &&
+          (!op.root_descriptor_mask ||
+           root_descriptor_dirty_mask == UINT64_MAX ||
+           (op.root_descriptor_mask & root_descriptor_dirty_mask));
+      const uint32_t other_dirty =
+          non_root_dirty &
+          ~(CompiledBindingDirtyRootConstants |
+            CompiledBindingDirtyRootDescriptors);
+      if (!other_dirty && !root_dirty && !constant_dirty &&
+          !descriptor_dirty) {
         if (test_telemetry)
           test_telemetry->encoder_native_binding_ops_skipped.fetch_add(
               1, std::memory_order_relaxed);
@@ -22161,6 +22578,8 @@ private:
             : type == DescriptorRecordType::ShaderResourceView
                   ? state.srv_roots[root_index]
                   : state.uav_roots[root_index];
+    if (slot.frozen_descriptor)
+      return *slot.frozen_descriptor;
     if (!slot.valid)
       return {};
 
@@ -22214,25 +22633,34 @@ private:
       return;
 
     const auto byte_length = uint64_t(actual_count) * sizeof(UINT);
-    auto constants = device_->GetDXMTDevice().queue().AllocateArgumentBuffer(
-        enc.currentSeqId(), byte_length,
-        D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT);
-    if (!constants.mapped || !constants.gpu_buffer)
-      return;
-    std::memset(constants.mapped, 0, constants.length);
-    const auto dst_byte_offset = uint64_t(slot.dst_offset) * sizeof(UINT);
-    if (slot.valid && !slot.values.empty() &&
-        dst_byte_offset < constants.length) {
-      std::memcpy(static_cast<uint8_t *>(constants.mapped) + dst_byte_offset,
-                  slot.values.data(),
-                  std::min<uint64_t>(
-                      uint64_t(slot.values.size()) * sizeof(UINT),
-                      constants.length - dst_byte_offset));
+    AllocatedArgumentBufferSlice constants = {};
+    WMT::Buffer constant_buffer;
+    uint64_t gpu_address = 0;
+    if (slot.frozen_buffer && slot.frozen_length >= byte_length) {
+      constant_buffer = slot.frozen_buffer;
+      gpu_address = slot.frozen_gpu_address;
+    } else {
+      constants = device_->GetDXMTDevice().queue().AllocateArgumentBuffer(
+          enc.currentSeqId(), byte_length,
+          D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT);
+      if (!constants.mapped || !constants.gpu_buffer)
+        return;
+      std::memset(constants.mapped, 0, constants.length);
+      const auto dst_byte_offset = uint64_t(slot.dst_offset) * sizeof(UINT);
+      if (slot.valid && !slot.values.empty() &&
+          dst_byte_offset < constants.length) {
+        std::memcpy(static_cast<uint8_t *>(constants.mapped) + dst_byte_offset,
+                    slot.values.data(),
+                    std::min<uint64_t>(
+                        uint64_t(slot.values.size()) * sizeof(UINT),
+                        constants.length - dst_byte_offset));
+      }
+      if (constants.needs_flush)
+        constants.gpu_buffer.updateContents(constants.offset, constants.mapped,
+                                            constants.length);
+      constant_buffer = constants.gpu_buffer;
+      gpu_address = constants.gpu_address + constants.offset;
     }
-    if (constants.needs_flush)
-      constants.gpu_buffer.updateContents(constants.offset, constants.mapped,
-                                          constants.length);
-    const auto gpu_address = constants.gpu_address + constants.offset;
 
     ForEachVisibleStage(parameter.visibility, compute, [&](PipelineStage stage) {
       auto binding_slot = ResolveShaderBindingSlot(
@@ -22248,16 +22676,16 @@ private:
       switch (stage) {
       case PipelineStage::Compute:
         enc.bindConstantBufferDirect<PipelineStage::Compute>(
-            *binding_slot, constants.gpu_buffer, gpu_address, byte_length);
+            *binding_slot, constant_buffer, gpu_address, byte_length);
         break;
       case PipelineStage::Pixel:
         enc.bindConstantBufferDirect<PipelineStage::Pixel>(
-            *binding_slot, constants.gpu_buffer, gpu_address, byte_length);
+            *binding_slot, constant_buffer, gpu_address, byte_length);
         break;
       case PipelineStage::Vertex:
       default:
         enc.bindConstantBufferDirect<PipelineStage::Vertex>(
-            *binding_slot, constants.gpu_buffer, gpu_address, byte_length);
+            *binding_slot, constant_buffer, gpu_address, byte_length);
         break;
       }
     });
@@ -22853,7 +23281,11 @@ private:
                         CompiledBindingDirtyResourceHeap |
                         CompiledBindingDirtySamplerHeap |
                         CompiledBindingDirtyRootTables);
-    if (native && tables_dirty) {
+    const bool native_recipe_dirty =
+        tables_dirty ||
+        (dirty_fields & (CompiledBindingDirtyRootConstants |
+                         CompiledBindingDirtyRootDescriptors));
+    if (native && native_recipe_dirty) {
       if (payload.native_binding_recipe) {
         EncodeCompiledNativeBindingRecipe(enc,
                                           *payload.native_binding_recipe,
@@ -22861,7 +23293,15 @@ private:
                                           binding_delta
                                               ? binding_delta
                                                     ->root_table_dirty_mask
-                                          : UINT64_MAX,
+                                              : UINT64_MAX,
+                                          binding_delta
+                                              ? binding_delta
+                                                    ->root_constant_dirty_mask
+                                              : UINT64_MAX,
+                                          binding_delta
+                                              ? binding_delta
+                                                    ->root_descriptor_dirty_mask
+                                              : UINT64_MAX,
                                           test_telemetry);
       } else {
         EncodeCompiledNativeArgumentTables(
@@ -22880,10 +23320,9 @@ private:
       EncodeCompiledVertexBuffers(enc, payload.input_assembler,
                                   pipeline.GetGraphicsState(), argbuf_offset);
     }
-    // Native packets reject root constants/descriptors during submission.
-    // Their complete argument-table and root-base program is already the
-    // flat recipe above, so avoid walking the root signature and shader list
-    // again on the asynchronous encoder thread.
+    // Native shaders consume descriptor tables and root arguments through the
+    // same frozen root-base backing store. The recipe above only switches the
+    // stage offset whose field mask changed.
     if (native && payload.native_binding_recipe)
       return;
     const uint64_t constant_mask =
@@ -22929,7 +23368,8 @@ private:
   static void FillCompiledBindingState(
       CompiledPacketBindingState &state,
       const std::vector<CompiledCommandRootConstants> &constants,
-      const std::vector<CompiledCommandRootDescriptor> &descriptors) {
+      const std::vector<CompiledCommandRootDescriptor> &descriptors,
+      const GraphicsBindingSnapshot *snapshot = nullptr) {
     for (const auto &entry : constants) {
       if (entry.root_parameter_index >= state.root_constants.size())
         continue;
@@ -22948,6 +23388,38 @@ private:
                              : &state.uav_roots[entry.root_parameter_index];
       slot->valid = true;
       slot->address = entry.address;
+    }
+    if (!snapshot)
+      return;
+    if (snapshot->frozen_native && snapshot->frozen_native->ready) {
+      for (UINT root_index = 0;
+           root_index < snapshot->frozen_root_constants.size();
+           ++root_index) {
+        const auto &frozen = snapshot->frozen_root_constants[root_index];
+        if (!frozen.valid)
+          continue;
+        auto &slot = state.root_constants[root_index];
+        slot.frozen_buffer = snapshot->frozen_native->root_base_buffer;
+        slot.frozen_offset = frozen.offset;
+        slot.frozen_length = frozen.length;
+        slot.frozen_gpu_address =
+            snapshot->frozen_native->root_base_gpu_address + frozen.offset;
+      }
+    }
+    for (const auto &entry : snapshot->entries) {
+      if (entry.kind != GraphicsBindingSnapshotEntry::Kind::Descriptor ||
+          !entry.has_descriptor || entry.root_index >= state.cbv_roots.size() ||
+          !entry.debug_kind ||
+          std::strncmp(entry.debug_kind, "root-", 5) != 0)
+        continue;
+      auto *slot =
+          entry.range_type == D3D12_DESCRIPTOR_RANGE_TYPE_CBV
+              ? &state.cbv_roots[entry.root_index]
+              : entry.range_type == D3D12_DESCRIPTOR_RANGE_TYPE_SRV
+                    ? &state.srv_roots[entry.root_index]
+                    : &state.uav_roots[entry.root_index];
+      if (!slot->frozen_descriptor)
+        slot->frozen_descriptor = SnapshotDescriptor(*snapshot, entry);
     }
   }
 
@@ -22984,6 +23456,149 @@ private:
       HashGraphicsBindingValue(fingerprint,
                                bindless_snapshot->content_fingerprint);
     return fingerprint;
+  }
+
+  template <typename Packet>
+  static CompiledEncoderBindingIdentity
+  BuildCompiledEncoderBindingIdentity(const Packet &packet) {
+    CompiledEncoderBindingIdentity identity = {};
+    identity.program = packet.binding_program.get();
+    identity.resource_heap = packet.descriptor_heaps.cbv_srv_uav.ptr();
+    identity.sampler_heap = packet.descriptor_heaps.sampler.ptr();
+    identity.root_tables = packet.root_tables.identity();
+    identity.root_constants = packet.root_constants.identity();
+    identity.root_descriptors = packet.root_descriptors.identity();
+    if constexpr (std::is_same_v<Packet, CompiledGraphicsPacket>)
+      identity.vertex_bindings = packet.vertex_binding_recipe.get();
+    return identity;
+  }
+
+  static uint64_t ResolveCompiledDirtyMask(
+      const void *cached_identity, const void *base_identity,
+      uint64_t compiled_mask) {
+    return cached_identity == base_identity && compiled_mask
+               ? compiled_mask
+               : UINT64_MAX;
+  }
+
+  static uint32_t ResolveCompiledDirtyMask(
+      const void *cached_identity, const void *base_identity,
+      uint32_t compiled_mask) {
+    return cached_identity == base_identity && compiled_mask
+               ? compiled_mask
+               : UINT32_MAX;
+  }
+
+  static CompiledBindingDelta ResolveRenderEncoderBindingDelta(
+      const CompiledEncoderBindingIdentity &identity,
+      const CompiledBindingDelta &compiled,
+      dxmt::DescriptorContentRevision descriptor_content_revision,
+      const dxmt::RenderBindingStateCache &cache) {
+    CompiledBindingDelta delta = {};
+    const bool layout_changed =
+        !cache.valid || cache.binding_program != identity.program;
+    delta.full_bind = layout_changed;
+    if (layout_changed)
+      delta.dirty_fields = UINT32_MAX;
+    if (!layout_changed && cache.resource_heap != identity.resource_heap)
+      delta.dirty_fields |= CompiledBindingDirtyResourceHeap;
+    if (!layout_changed && cache.sampler_heap != identity.sampler_heap)
+      delta.dirty_fields |= CompiledBindingDirtySamplerHeap;
+    const bool descriptor_content_changed =
+        cache.descriptor_content_revision !=
+        descriptor_content_revision;
+    if (!layout_changed &&
+        (cache.root_tables != identity.root_tables ||
+         descriptor_content_changed)) {
+      delta.dirty_fields |= CompiledBindingDirtyRootTables;
+      delta.root_table_dirty_mask =
+          descriptor_content_changed
+              ? UINT64_MAX
+              : ResolveCompiledDirtyMask(
+                    cache.root_tables,
+                    compiled.base_root_tables_identity,
+                    compiled.root_table_dirty_mask);
+    }
+    if (!layout_changed &&
+        cache.root_constants != identity.root_constants) {
+      delta.dirty_fields |= CompiledBindingDirtyRootConstants;
+      delta.root_constant_dirty_mask = ResolveCompiledDirtyMask(
+          cache.root_constants, compiled.base_root_constants_identity,
+          compiled.root_constant_dirty_mask);
+    }
+    if (!layout_changed &&
+        cache.root_descriptors != identity.root_descriptors) {
+      delta.dirty_fields |= CompiledBindingDirtyRootDescriptors;
+      delta.root_descriptor_dirty_mask = ResolveCompiledDirtyMask(
+          cache.root_descriptors, compiled.base_root_descriptors_identity,
+          compiled.root_descriptor_dirty_mask);
+    }
+    if (!layout_changed &&
+        cache.vertex_bindings != identity.vertex_bindings) {
+      delta.dirty_fields |= CompiledBindingDirtyVertexBuffers;
+      delta.vertex_buffer_dirty_mask = ResolveCompiledDirtyMask(
+          cache.vertex_bindings, compiled.base_vertex_bindings_identity,
+          compiled.vertex_buffer_dirty_mask);
+    }
+    if (layout_changed) {
+      delta.root_table_dirty_mask = UINT64_MAX;
+      delta.root_constant_dirty_mask = UINT64_MAX;
+      delta.root_descriptor_dirty_mask = UINT64_MAX;
+      delta.vertex_buffer_dirty_mask = UINT32_MAX;
+    }
+    return delta;
+  }
+
+  static CompiledBindingDelta ResolveComputeEncoderBindingDelta(
+      const CompiledDirectComputeBindingPayload &payload,
+      const dxmt::ComputeBindingStateCache &cache) {
+    CompiledBindingDelta delta = {};
+    const auto &identity = payload.binding_identity;
+    const auto &compiled = payload.packet.binding_delta;
+    const bool layout_changed =
+        !cache.binding_valid || cache.binding_program != identity.program;
+    delta.full_bind = layout_changed;
+    if (layout_changed)
+      delta.dirty_fields = UINT32_MAX;
+    if (!layout_changed && cache.resource_heap != identity.resource_heap)
+      delta.dirty_fields |= CompiledBindingDirtyResourceHeap;
+    if (!layout_changed && cache.sampler_heap != identity.sampler_heap)
+      delta.dirty_fields |= CompiledBindingDirtySamplerHeap;
+    const bool descriptor_content_changed =
+        cache.descriptor_content_revision !=
+        payload.descriptor_content_revision;
+    if (!layout_changed &&
+        (cache.root_tables != identity.root_tables ||
+         descriptor_content_changed)) {
+      delta.dirty_fields |= CompiledBindingDirtyRootTables;
+      delta.root_table_dirty_mask =
+          descriptor_content_changed
+              ? UINT64_MAX
+              : ResolveCompiledDirtyMask(
+                    cache.root_tables,
+                    compiled.base_root_tables_identity,
+                    compiled.root_table_dirty_mask);
+    }
+    if (!layout_changed &&
+        cache.root_constants != identity.root_constants) {
+      delta.dirty_fields |= CompiledBindingDirtyRootConstants;
+      delta.root_constant_dirty_mask = ResolveCompiledDirtyMask(
+          cache.root_constants, compiled.base_root_constants_identity,
+          compiled.root_constant_dirty_mask);
+    }
+    if (!layout_changed &&
+        cache.root_descriptors != identity.root_descriptors) {
+      delta.dirty_fields |= CompiledBindingDirtyRootDescriptors;
+      delta.root_descriptor_dirty_mask = ResolveCompiledDirtyMask(
+          cache.root_descriptors, compiled.base_root_descriptors_identity,
+          compiled.root_descriptor_dirty_mask);
+    }
+    if (layout_changed) {
+      delta.root_table_dirty_mask = UINT64_MAX;
+      delta.root_constant_dirty_mask = UINT64_MAX;
+      delta.root_descriptor_dirty_mask = UINT64_MAX;
+    }
+    return delta;
   }
 
   static void AddCompiledDirectEncoderAccess(
@@ -23112,6 +23727,15 @@ private:
             &entry.argument);
       }
     }
+    for (const auto &entry : snapshot->entries) {
+      if (entry.kind != GraphicsBindingSnapshotEntry::Kind::Descriptor ||
+          !entry.has_descriptor || !entry.debug_kind ||
+          std::strncmp(entry.debug_kind, "root-", 5) != 0)
+        continue;
+      AddCompiledDescriptorEncoderAccess(
+          list, entry.stage, entry.range_type,
+          SnapshotDescriptor(*snapshot, entry), entry.argument);
+    }
   }
 
   static void PublishCompiledDirectAccessListForEncode(
@@ -23210,6 +23834,27 @@ private:
     }
   }
 
+  static void RetainFrozenNativeStoreForGpu(
+      ArgumentEncodingContext &enc,
+      const std::shared_ptr<SubmittedFrozenNativeDescriptorStore> &store) {
+    if (!store)
+      return;
+    const auto sequence = enc.currentSeqId();
+    auto retained =
+        store->retained_sequence.load(std::memory_order_acquire);
+    while (retained != sequence) {
+      if (store->retained_sequence.compare_exchange_weak(
+              retained, sequence, std::memory_order_acq_rel,
+              std::memory_order_acquire)) {
+        enc.queue().RetainUntilGpuComplete(
+            sequence, [retained_store = store]() {
+              (void)retained_store;
+            });
+        return;
+      }
+    }
+  }
+
   void EncodeCompiledComputeBindings(
       ArgumentEncodingContext &enc, const CompiledComputePacket &packet,
       const std::vector<CompiledCommandRootDescriptorTable> &root_tables,
@@ -23233,11 +23878,19 @@ private:
                         CompiledBindingDirtyResourceHeap |
                         CompiledBindingDirtySamplerHeap |
                         CompiledBindingDirtyRootTables);
-    if (native && tables_dirty) {
+    const bool native_recipe_dirty =
+        tables_dirty ||
+        (dirty_fields & (CompiledBindingDirtyRootConstants |
+                         CompiledBindingDirtyRootDescriptors));
+    if (native && native_recipe_dirty) {
       if (native_binding_recipe)
         EncodeCompiledNativeBindingRecipe(
             enc, *native_binding_recipe, dirty_fields,
             binding_delta ? binding_delta->root_table_dirty_mask
+                          : UINT64_MAX,
+            binding_delta ? binding_delta->root_constant_dirty_mask
+                          : UINT64_MAX,
+            binding_delta ? binding_delta->root_descriptor_dirty_mask
                           : UINT64_MAX,
             test_telemetry);
       else
@@ -23299,27 +23952,19 @@ private:
     if (compiled) {
       auto &payload = *packet.compiled_binding_payload;
       assert(payload.root_tables);
-      const auto *program = payload.packet.binding_program.get();
-      const bool binding_hit =
-          encoder_cache.binding_valid &&
-          encoder_cache.binding_program == program &&
-          encoder_cache.descriptor_content_revision ==
-              payload.descriptor_content_revision &&
-          encoder_cache.content_fingerprint ==
-              payload.binding_content_fingerprint;
+      const auto resolved_delta =
+          ResolveComputeEncoderBindingDelta(payload, encoder_cache);
+      const bool binding_hit = !resolved_delta.dirty_fields;
       if (!binding_hit) {
-        const auto &delta = payload.packet.binding_delta;
-        const bool delta_applicable =
-            encoder_cache.binding_valid && delta.base_program &&
-            encoder_cache.binding_program == delta.base_program.get();
         if (payload.test_telemetry) {
-          auto &counter = delta_applicable
+          auto &counter = resolved_delta.full_bind
                               ? payload.test_telemetry
-                                    ->encoder_delta_binding_programs
+                                    ->encoder_full_binding_programs
                               : payload.test_telemetry
-                                    ->encoder_full_binding_programs;
+                                    ->encoder_delta_binding_programs;
           counter.fetch_add(1, std::memory_order_relaxed);
         }
+        RetainFrozenNativeStoreForGpu(enc, payload.frozen_native);
         PublishCompiledDirectAccessListForEncode(
             enc, payload.direct_access, payload.test_telemetry.get());
         EncodeCompiledComputeBindings(
@@ -23329,13 +23974,17 @@ private:
             payload.bindless_snapshot, payload.frozen_native.get(),
             payload.direct_access.descriptor_accesses_precompiled,
             payload.native_binding_recipe.get(),
-            delta_applicable ? &delta : nullptr,
+            &resolved_delta,
             payload.test_telemetry.get());
-        encoder_cache.binding_program = program;
+        encoder_cache.binding_program = payload.binding_identity.program;
+        encoder_cache.resource_heap = payload.binding_identity.resource_heap;
+        encoder_cache.sampler_heap = payload.binding_identity.sampler_heap;
+        encoder_cache.root_tables = payload.binding_identity.root_tables;
+        encoder_cache.root_constants = payload.binding_identity.root_constants;
+        encoder_cache.root_descriptors =
+            payload.binding_identity.root_descriptors;
         encoder_cache.descriptor_content_revision =
             payload.descriptor_content_revision;
-        encoder_cache.content_fingerprint =
-            payload.binding_content_fingerprint;
         encoder_cache.binding_valid = true;
       } else if (payload.test_telemetry) {
         payload.test_telemetry->encoder_binding_program_hits.fetch_add(
@@ -25310,6 +25959,7 @@ private:
     CompiledDirectAccessList compiled_direct_access;
     std::shared_ptr<const CompiledBindingProgram> binding_program;
     CompiledBindingDelta binding_delta;
+    CompiledEncoderBindingIdentity binding_identity = {};
     std::shared_ptr<CompiledCommandTestTelemetry> test_telemetry;
     uint64_t binding_generation = 0;
     dxmt::DescriptorContentRevision descriptor_content_revision = {};
@@ -25586,16 +26236,10 @@ private:
 
     auto &binding_cache = render_encoder->binding_state_cache;
     if (packet.compiled_binding_payload) {
-      const auto *binding_program = packet.binding_program.get();
-      const bool generation_hit =
-          binding_cache.valid &&
-          binding_cache.binding_program == binding_program &&
-          binding_cache.graphics_generation == packet.binding_generation &&
-          binding_cache.descriptor_content_revision ==
-              packet.descriptor_content_revision &&
-          binding_cache.content_fingerprint ==
-              packet.binding_content_fingerprint;
-      if (generation_hit) {
+      const auto resolved_delta = ResolveRenderEncoderBindingDelta(
+          packet.binding_identity, packet.binding_delta,
+          packet.descriptor_content_revision, binding_cache);
+      if (!resolved_delta.dirty_fields) {
         if (packet.test_telemetry)
           packet.test_telemetry->encoder_binding_program_hits.fetch_add(
               1, std::memory_order_relaxed);
@@ -25610,6 +26254,8 @@ private:
           dxmt::perf::ScopedFrameDuration retain_scope(
               perf_stats,
               &dxmt::FrameStatistics::frame_compiled_draw_retain_interval);
+          RetainFrozenNativeStoreForGpu(
+              enc, packet.compiled_binding_payload->frozen_native);
           PublishCompiledDirectAccessListForEncode(
               enc, packet.compiled_direct_access,
               packet.test_telemetry.get());
@@ -25618,27 +26264,29 @@ private:
           dxmt::perf::ScopedFrameDuration binding_scope(
               perf_stats,
               &dxmt::FrameStatistics::frame_compiled_draw_binding_snapshot_interval);
-          const bool delta_applicable =
-              binding_cache.valid && packet.binding_delta.base_program &&
-              binding_cache.binding_program ==
-                  packet.binding_delta.base_program.get();
           if (packet.test_telemetry) {
             auto &counter =
-                delta_applicable
-                    ? packet.test_telemetry->encoder_delta_binding_programs
-                    : packet.test_telemetry->encoder_full_binding_programs;
+                resolved_delta.full_bind
+                    ? packet.test_telemetry->encoder_full_binding_programs
+                    : packet.test_telemetry->encoder_delta_binding_programs;
             counter.fetch_add(1, std::memory_order_relaxed);
           }
           EncodeCompiledDirectGraphicsBindings(
               enc, *packet.compiled_binding_payload,
               packet.compiled_binding_state, packet, argbuf_offset,
-              delta_applicable ? &packet.binding_delta : nullptr);
+              &resolved_delta);
         }
-        binding_cache.binding_program = binding_program;
-        binding_cache.graphics_generation = packet.binding_generation;
+        binding_cache.binding_program = packet.binding_identity.program;
+        binding_cache.resource_heap = packet.binding_identity.resource_heap;
+        binding_cache.sampler_heap = packet.binding_identity.sampler_heap;
+        binding_cache.root_tables = packet.binding_identity.root_tables;
+        binding_cache.root_constants = packet.binding_identity.root_constants;
+        binding_cache.root_descriptors =
+            packet.binding_identity.root_descriptors;
+        binding_cache.vertex_bindings =
+            packet.binding_identity.vertex_bindings;
         binding_cache.descriptor_content_revision =
             packet.descriptor_content_revision;
-        binding_cache.content_fingerprint = packet.binding_content_fingerprint;
         binding_cache.valid = true;
       }
       {
@@ -27962,6 +28610,18 @@ private:
   };
 
   struct PendingOperation {
+    struct SubmissionCaptureStatistics {
+      uint64_t generic_descriptor_span_lookups = 0;
+      uint64_t generic_descriptor_span_unique = 0;
+      uint64_t generic_descriptor_span_reuses = 0;
+      uint64_t frozen_native_direct_packets = 0;
+      uint64_t frozen_range_lookups = 0;
+      uint64_t frozen_range_unique = 0;
+      uint64_t frozen_range_reuses = 0;
+      uint64_t frozen_root_word_lookups = 0;
+      uint64_t frozen_root_word_reuses = 0;
+    };
+
     PendingOperationType type = PendingOperationType::Execute;
     std::vector<std::shared_ptr<const SubmittedCompiledCommandListPlan>>
         submitted_command_lists;
@@ -27974,6 +28634,7 @@ private:
     uint64_t frame_id = ~0ull;
     bool wait_callback_armed = false;
     std::shared_ptr<std::atomic_bool> wait_completion;
+    SubmissionCaptureStatistics capture_statistics = {};
 
     PendingOperation() = default;
     PendingOperation(const PendingOperation &) = delete;
@@ -27989,7 +28650,8 @@ private:
           value(other.value),
           frame_id(other.frame_id),
           wait_callback_armed(other.wait_callback_armed),
-          wait_completion(std::move(other.wait_completion)) {
+          wait_completion(std::move(other.wait_completion)),
+          capture_statistics(other.capture_statistics) {
       other.fence = nullptr;
     }
     PendingOperation &operator=(PendingOperation &&other) noexcept {
@@ -28006,6 +28668,7 @@ private:
         frame_id = other.frame_id;
         wait_callback_armed = other.wait_callback_armed;
         wait_completion = std::move(other.wait_completion);
+        capture_statistics = other.capture_statistics;
         other.fence = nullptr;
       }
       return *this;
@@ -28327,6 +28990,27 @@ private:
         operation_perf_stats = BeginReplayPerfFrame(operation.frame_id);
         dxmt::perf::ScopedFrameStatisticsBinding perf_stats_binding(
             operation_perf_stats);
+        if (operation_perf_stats) {
+          const auto &capture = operation.capture_statistics;
+          operation_perf_stats->frame_generic_descriptor_span_lookups +=
+              capture.generic_descriptor_span_lookups;
+          operation_perf_stats->frame_generic_descriptor_span_unique +=
+              capture.generic_descriptor_span_unique;
+          operation_perf_stats->frame_generic_descriptor_span_reuses +=
+              capture.generic_descriptor_span_reuses;
+          operation_perf_stats->frame_frozen_native_direct_packets +=
+              capture.frozen_native_direct_packets;
+          operation_perf_stats->frame_frozen_range_lookups +=
+              capture.frozen_range_lookups;
+          operation_perf_stats->frame_frozen_range_unique +=
+              capture.frozen_range_unique;
+          operation_perf_stats->frame_frozen_range_reuses +=
+              capture.frozen_range_reuses;
+          operation_perf_stats->frame_frozen_root_word_lookups +=
+              capture.frozen_root_word_lookups;
+          operation_perf_stats->frame_frozen_root_word_reuses +=
+              capture.frozen_root_word_reuses;
+        }
         RecordExecuteDrainTime(
             operation_perf_stats,
             dxmt::perf::ExecuteTimeBucket::DrainLock,

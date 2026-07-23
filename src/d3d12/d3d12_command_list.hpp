@@ -833,6 +833,12 @@ struct CompiledBindingProgram;
 
 struct CompiledBindingDelta {
   std::shared_ptr<const CompiledBindingProgram> base_program;
+  const void *base_resource_heap_identity = nullptr;
+  const void *base_sampler_heap_identity = nullptr;
+  const void *base_root_tables_identity = nullptr;
+  const void *base_root_constants_identity = nullptr;
+  const void *base_root_descriptors_identity = nullptr;
+  const void *base_vertex_bindings_identity = nullptr;
   std::uint32_t dirty_fields = 0;
   std::uint64_t root_table_dirty_mask = 0;
   std::uint64_t root_constant_dirty_mask = 0;
@@ -841,17 +847,12 @@ struct CompiledBindingDelta {
   bool full_bind = false;
 };
 
-// Immutable Close-time binding state. Packets with identical binding inputs
-// share this object even when draw parameters, raster state, or the selected
-// Metal PSO variant differ. The encoder consumes the accompanying delta and
-// keeps the resulting state alive until the encoder ends.
+// Immutable Close-time binding layout. Mutable descriptor heaps, root
+// arguments and vertex bindings deliberately do not participate in this
+// object's identity. The encoder keeps this layout installed while applying
+// field/slot deltas from packet binding state.
 struct CompiledBindingProgram {
   CompiledCommandPipelineBinding pipeline;
-  CompiledCommandDescriptorHeaps descriptor_heaps;
-  CompiledImmutableVector<CompiledCommandRootDescriptorTable> root_tables;
-  CompiledImmutableVector<CompiledCommandRootConstants> root_constants;
-  CompiledImmutableVector<CompiledCommandRootDescriptor> root_descriptors;
-  std::shared_ptr<const CompiledVertexBindingRecipe> vertex_binding_recipe;
   bool compute = false;
 };
 
@@ -862,6 +863,10 @@ struct CompiledNativeStageBinding {
   uint32_t resource_root_base_count = 0;
   std::uint64_t cbuffer_root_table_mask = 0;
   std::uint64_t resource_root_table_mask = 0;
+  std::uint64_t cbuffer_root_constant_mask = 0;
+  std::uint64_t resource_root_constant_mask = 0;
+  std::uint64_t cbuffer_root_descriptor_mask = 0;
+  std::uint64_t resource_root_descriptor_mask = 0;
   // CPU copies are retained for bounded diagnostics. The GPU consumes the
   // packed native_root_base_buffer; keeping the source words lets a hang log
   // identify the exact descriptor-table bases without a synchronizing GPU

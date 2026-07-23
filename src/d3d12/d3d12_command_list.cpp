@@ -2593,44 +2593,36 @@ static bool CompiledBindingProgramMatchesPacket(
       program.pipeline.metadata.shader_abi_version !=
           packet.pipeline.metadata.shader_abi_version ||
       program.pipeline.metadata.binding_layout_fingerprint !=
-          packet.pipeline.metadata.binding_layout_fingerprint ||
-      program.descriptor_heaps.cbv_srv_uav.ptr() !=
-          packet.descriptor_heaps.cbv_srv_uav.ptr() ||
-      program.descriptor_heaps.sampler.ptr() !=
-          packet.descriptor_heaps.sampler.ptr() ||
-      program.root_tables.identity() != packet.root_tables.identity() ||
-      program.root_constants.identity() != packet.root_constants.identity() ||
-      program.root_descriptors.identity() !=
-          packet.root_descriptors.identity())
+          packet.pipeline.metadata.binding_layout_fingerprint)
     return false;
-  if constexpr (std::is_same_v<Packet, CompiledGraphicsPacket>)
-    return program.vertex_binding_recipe.get() ==
-           packet.vertex_binding_recipe.get();
   return true;
 }
 
 template <typename Packet>
 static CompiledBindingDelta BuildCompiledBindingDelta(
-    const CompiledBindingProgram *previous, const Packet &packet,
+    const Packet *previous_packet,
+    const CompiledBindingProgram *previous_program, const Packet &packet,
     bool compute) {
   CompiledBindingDelta delta = {};
   const bool layout_changed =
-      !previous || previous->compute != compute ||
-      previous->pipeline.metadata.shader_abi_version !=
+      !previous_program || previous_program->compute != compute ||
+      previous_program->pipeline.metadata.shader_abi_version !=
           packet.pipeline.metadata.shader_abi_version ||
-      previous->pipeline.metadata.binding_layout_fingerprint !=
+      previous_program->pipeline.metadata.binding_layout_fingerprint !=
           packet.pipeline.metadata.binding_layout_fingerprint ||
-      previous->pipeline.root_signature.ptr() !=
+      previous_program->pipeline.root_signature.ptr() !=
           packet.pipeline.root_signature.ptr();
   delta.full_bind = layout_changed;
   if (layout_changed)
     delta.dirty_fields |= CompiledBindingDirtyPipelineLayout;
 
   const bool resource_heap_changed =
-      !previous || previous->descriptor_heaps.cbv_srv_uav.ptr() !=
+      !previous_packet ||
+      previous_packet->descriptor_heaps.cbv_srv_uav.ptr() !=
                        packet.descriptor_heaps.cbv_srv_uav.ptr();
   const bool sampler_heap_changed =
-      !previous || previous->descriptor_heaps.sampler.ptr() !=
+      !previous_packet ||
+      previous_packet->descriptor_heaps.sampler.ptr() !=
                        packet.descriptor_heaps.sampler.ptr();
   if (resource_heap_changed)
     delta.dirty_fields |= CompiledBindingDirtyResourceHeap;
@@ -2638,23 +2630,24 @@ static CompiledBindingDelta BuildCompiledBindingDelta(
     delta.dirty_fields |= CompiledBindingDirtySamplerHeap;
 
   if (layout_changed || resource_heap_changed || sampler_heap_changed ||
-      !previous ||
-      previous->root_tables.identity() != packet.root_tables.identity()) {
+      !previous_packet ||
+      previous_packet->root_tables.identity() != packet.root_tables.identity()) {
     delta.dirty_fields |= CompiledBindingDirtyRootTables;
     delta.root_table_dirty_mask = packet.state_delta.root_table_dirty_mask;
     if (!delta.root_table_dirty_mask)
       delta.root_table_dirty_mask = UINT64_MAX;
   }
-  if (layout_changed || !previous ||
-      previous->root_constants.identity() != packet.root_constants.identity()) {
+  if (layout_changed || !previous_packet ||
+      previous_packet->root_constants.identity() !=
+          packet.root_constants.identity()) {
     delta.dirty_fields |= CompiledBindingDirtyRootConstants;
     delta.root_constant_dirty_mask =
         packet.state_delta.root_constant_dirty_mask;
     if (!delta.root_constant_dirty_mask)
       delta.root_constant_dirty_mask = UINT64_MAX;
   }
-  if (layout_changed || !previous ||
-      previous->root_descriptors.identity() !=
+  if (layout_changed || !previous_packet ||
+      previous_packet->root_descriptors.identity() !=
           packet.root_descriptors.identity()) {
     delta.dirty_fields |= CompiledBindingDirtyRootDescriptors;
     delta.root_descriptor_dirty_mask =
@@ -2664,14 +2657,14 @@ static CompiledBindingDelta BuildCompiledBindingDelta(
   }
   if constexpr (std::is_same_v<Packet, CompiledGraphicsPacket>) {
     const auto previous_slots =
-        previous && previous->vertex_binding_recipe
-            ? previous->vertex_binding_recipe->slot_mask
+        previous_packet && previous_packet->vertex_binding_recipe
+            ? previous_packet->vertex_binding_recipe->slot_mask
             : 0;
     const auto current_slots = packet.vertex_binding_recipe
                                    ? packet.vertex_binding_recipe->slot_mask
                                    : 0;
-    if (layout_changed || !previous ||
-        previous->vertex_binding_recipe.get() !=
+    if (layout_changed || !previous_packet ||
+        previous_packet->vertex_binding_recipe.get() !=
             packet.vertex_binding_recipe.get()) {
       delta.dirty_fields |= CompiledBindingDirtyVertexBuffers;
       delta.vertex_buffer_dirty_mask =
@@ -2688,29 +2681,41 @@ static void BuildCompiledBindingProgramsForPackets(
     CompiledCommandList &compiled, std::vector<Packet> &packets,
     bool compute) {
   std::shared_ptr<const CompiledBindingProgram> previous_program;
+  const Packet *previous_packet = nullptr;
   for (auto &packet : packets) {
     packet.binding_delta = BuildCompiledBindingDelta(
-        previous_program.get(), packet, compute);
+        previous_packet, previous_program.get(), packet, compute);
     packet.binding_delta.base_program = previous_program;
+    if (previous_packet) {
+      packet.binding_delta.base_resource_heap_identity =
+          previous_packet->descriptor_heaps.cbv_srv_uav.ptr();
+      packet.binding_delta.base_sampler_heap_identity =
+          previous_packet->descriptor_heaps.sampler.ptr();
+      packet.binding_delta.base_root_tables_identity =
+          previous_packet->root_tables.identity();
+      packet.binding_delta.base_root_constants_identity =
+          previous_packet->root_constants.identity();
+      packet.binding_delta.base_root_descriptors_identity =
+          previous_packet->root_descriptors.identity();
+      if constexpr (std::is_same_v<Packet, CompiledGraphicsPacket>)
+        packet.binding_delta.base_vertex_bindings_identity =
+            previous_packet->vertex_binding_recipe.get();
+    }
     if (previous_program &&
         CompiledBindingProgramMatchesPacket(*previous_program, packet,
                                             compute)) {
       packet.binding_program = previous_program;
       compiled.close_binding_program_reuses++;
+      previous_packet = &packet;
       continue;
     }
 
     auto program = std::make_shared<CompiledBindingProgram>();
     program->pipeline = packet.pipeline;
-    program->descriptor_heaps = packet.descriptor_heaps;
-    program->root_tables = packet.root_tables;
-    program->root_constants = packet.root_constants;
-    program->root_descriptors = packet.root_descriptors;
     program->compute = compute;
-    if constexpr (std::is_same_v<Packet, CompiledGraphicsPacket>)
-      program->vertex_binding_recipe = packet.vertex_binding_recipe;
     packet.binding_program = program;
     previous_program = std::move(program);
+    previous_packet = &packet;
     compiled.close_binding_programs++;
     if (packet.binding_delta.full_bind)
       compiled.close_full_binding_programs++;

@@ -321,6 +321,12 @@ struct RenderDynamicStateCache {
 
 struct RenderBindingStateCache {
   const void *binding_program = nullptr;
+  const void *resource_heap = nullptr;
+  const void *sampler_heap = nullptr;
+  const void *root_tables = nullptr;
+  const void *root_constants = nullptr;
+  const void *root_descriptors = nullptr;
+  const void *vertex_bindings = nullptr;
   uint64_t graphics_generation = 0;
   DescriptorContentRevision descriptor_content_revision = {};
   uint64_t content_fingerprint = 0;
@@ -329,6 +335,11 @@ struct RenderBindingStateCache {
 
 struct ComputeBindingStateCache {
   const void *binding_program = nullptr;
+  const void *resource_heap = nullptr;
+  const void *sampler_heap = nullptr;
+  const void *root_tables = nullptr;
+  const void *root_constants = nullptr;
+  const void *root_descriptors = nullptr;
   DescriptorContentRevision descriptor_content_revision = {};
   uint64_t content_fingerprint = 0;
   uint64_t pso_handle = 0;

@@ -179,10 +179,13 @@ TEST_F(CompiledGenerationSpec, MergesComputeNodesAcrossElidedState) {
   EXPECT_EQ(stats.encoder_graph_node_count, 1u);
   EXPECT_EQ(stats.compute_encoder_node_count, 1u);
   EXPECT_GE(stats.encoder_graph_elided_state_records, 3u);
-  EXPECT_EQ(stats.close_binding_programs, 2u);
-  EXPECT_EQ(stats.close_binding_program_reuses, 0u);
+  // Root argument contents are packet state, not part of the immutable
+  // encoder binding layout. Both dispatches share one program and the second
+  // packet carries only the constant-slot delta.
+  EXPECT_EQ(stats.close_binding_programs, 1u);
+  EXPECT_EQ(stats.close_binding_program_reuses, 1u);
   EXPECT_EQ(stats.close_full_binding_programs, 1u);
-  EXPECT_EQ(stats.close_delta_binding_programs, 1u);
+  EXPECT_EQ(stats.close_delta_binding_programs, 0u);
 
   ID3D12CommandList *lists[] = {context_.list()};
   context_.queue()->ExecuteCommandLists(1, lists);

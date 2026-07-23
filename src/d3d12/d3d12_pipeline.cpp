@@ -2973,10 +2973,32 @@ NativeShaderArgumentHasSingleTableRange(
 
   uint32_t matches = 0;
   for (const auto &parameter : root.GetParameters()) {
-    if (parameter.parameter_type !=
-            D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE ||
-        !NativeRootParameterVisibleToShader(parameter, stage))
+    if (!NativeRootParameterVisibleToShader(parameter, stage))
       continue;
+    if (parameter.parameter_type !=
+        D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE) {
+      const bool constants =
+          parameter.parameter_type ==
+          D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+      const auto parameter_type =
+          constants || parameter.parameter_type == D3D12_ROOT_PARAMETER_TYPE_CBV
+              ? D3D12_DESCRIPTOR_RANGE_TYPE_CBV
+              : parameter.parameter_type == D3D12_ROOT_PARAMETER_TYPE_SRV
+                    ? D3D12_DESCRIPTOR_RANGE_TYPE_SRV
+                    : parameter.parameter_type == D3D12_ROOT_PARAMETER_TYPE_UAV
+                          ? D3D12_DESCRIPTOR_RANGE_TYPE_UAV
+                          : D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER;
+      const uint32_t parameter_register =
+          constants ? parameter.constants.ShaderRegister
+                    : parameter.descriptor.ShaderRegister;
+      const uint32_t parameter_space =
+          constants ? parameter.constants.RegisterSpace
+                    : parameter.descriptor.RegisterSpace;
+      if (count == 1 && parameter_type == *wanted_type &&
+          parameter_register == lower && parameter_space == space)
+        matches++;
+      continue;
+    }
     for (const auto &range : parameter.ranges) {
       if (range.range_type != *wanted_type ||
           range.register_space != space || !range.descriptor_count ||
@@ -3000,6 +3022,11 @@ GetNativeShaderAbiEligibilityImpl(
   if (!root_signature || !root_signature->GetStaticSamplers().empty())
     return NativeShaderAbiEligibilityReason::UnsupportedRootSignature;
 
+  const bool compute_pipeline =
+      std::any_of(shaders.begin(), shaders.end(), [](const auto &shader) {
+        return shader.stage == PipelineShaderStage::Compute;
+      });
+
   for (const auto &shader : shaders) {
     if (shader.kind() == PipelineShaderBytecodeKind::Dxil)
       return NativeShaderAbiEligibilityReason::ShaderAbiMismatch;
@@ -3012,8 +3039,24 @@ GetNativeShaderAbiEligibilityImpl(
 
   for (const auto &parameter : root_signature->GetParameters()) {
     if (parameter.parameter_type !=
-        D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE)
-      return NativeShaderAbiEligibilityReason::UnsupportedRootDescriptor;
+        D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE) {
+      // The native compute root-argument ABI still observes live descriptor
+      // state across queued submissions. Keep it on the bindless path until
+      // dispatch consumes the same frozen root backing used by graphics.
+      if (compute_pipeline)
+        return NativeShaderAbiEligibilityReason::UnsupportedRootDescriptor;
+      if (parameter.parameter_type ==
+              D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS &&
+          !parameter.constants.Num32BitValues)
+        return NativeShaderAbiEligibilityReason::UnsupportedRootDescriptor;
+      if (parameter.parameter_type !=
+              D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS &&
+          parameter.parameter_type != D3D12_ROOT_PARAMETER_TYPE_CBV &&
+          parameter.parameter_type != D3D12_ROOT_PARAMETER_TYPE_SRV &&
+          parameter.parameter_type != D3D12_ROOT_PARAMETER_TYPE_UAV)
+        return NativeShaderAbiEligibilityReason::UnsupportedRootDescriptor;
+      continue;
+    }
     if (parameter.ranges.empty())
       return NativeShaderAbiEligibilityReason::UnsupportedDescriptorRange;
 
