@@ -84,6 +84,10 @@ const dxmt::test::TestCostRegistration kTextureContentsCost(
 const dxmt::test::TestCostRegistration kNtHandleTypeCost(
     "D3D11SharedNtHandleContractSpec.RejectsNtHandleInLegacyOpenMethod",
     dxmt::test::kResourceTestCost);
+const dxmt::test::TestCostRegistration
+    kDuplicateHandleCost("D3D11SharedNtHandleContractSpec."
+                         "DuplicatedHandleRemainsUsableAfterOriginalCloses",
+                         dxmt::test::kResourceTestCost);
 
 HRESULT ReadTextureContents(ID3D11Device *device, ID3D11DeviceContext *context,
                             ID3D11Texture2D *texture,
@@ -399,6 +403,40 @@ TEST_F(D3D11SharedNtHandleContractSpec, RejectsNtHandleInLegacyOpenMethod) {
                 reinterpret_cast<void **>(opened.put())),
             E_INVALIDARG);
   EXPECT_EQ(opened.get(), nullptr);
+  EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
+  EXPECT_EQ(second_device_->GetDeviceRemovedReason(), S_OK);
+}
+
+TEST_F(D3D11SharedNtHandleContractSpec,
+       DuplicatedHandleRemainsUsableAfterOriginalCloses) {
+  ScopedNtHandle duplicate;
+  ASSERT_TRUE(DuplicateHandle(GetCurrentProcess(), shared_handle_.handle,
+                              GetCurrentProcess(), &duplicate.handle, 0, FALSE,
+                              DUPLICATE_SAME_ACCESS));
+  ASSERT_NE(duplicate.handle, nullptr);
+  ASSERT_NE(duplicate.handle, shared_handle_.handle);
+
+  ASSERT_TRUE(CloseHandle(shared_handle_.handle));
+  shared_handle_.handle = nullptr;
+
+  ComPtr<ID3D11Texture2D> opened;
+  ASSERT_EQ(second_device1_->OpenSharedResource1(
+                duplicate.handle, __uuidof(ID3D11Texture2D),
+                reinterpret_cast<void **>(opened.put())),
+            S_OK);
+  ASSERT_TRUE(opened);
+  D3D11_TEXTURE2D_DESC opened_desc = {};
+  opened->GetDesc(&opened_desc);
+  EXPECT_EQ(opened_desc.Width, desc_.Width);
+  EXPECT_EQ(opened_desc.Height, desc_.Height);
+  EXPECT_EQ(opened_desc.Format, desc_.Format);
+
+  ComPtr<IDXGIKeyedMutex> mutex;
+  ASSERT_EQ(opened->QueryInterface(__uuidof(IDXGIKeyedMutex),
+                                   reinterpret_cast<void **>(mutex.put())),
+            S_OK);
+  ASSERT_EQ(mutex->AcquireSync(0, 0), S_OK);
+  ASSERT_EQ(mutex->ReleaseSync(0), S_OK);
   EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
   EXPECT_EQ(second_device_->GetDeviceRemovedReason(), S_OK);
 }
