@@ -51,6 +51,10 @@ const dxmt::test::TestCostRegistration
     kForeignFenceCost("D3D11FenceSynchronizationContractSpec."
                       "RejectsFenceOwnedByDifferentDevice",
                       dxmt::test::kResourceTestCost);
+const dxmt::test::TestCostRegistration
+    kNullFenceCost("D3D11FenceSynchronizationContractSpec."
+                   "RejectsNullFenceSynchronization",
+                   dxmt::test::kResourceTestCost);
 
 std::atomic<std::uint32_t> g_next_fence_name_id{0};
 
@@ -187,10 +191,8 @@ TEST_F(D3D11FenceSynchronizationContractSpec,
   ComPtr<ID3D11Fence> fence = CreateFence();
   ASSERT_NE(fence.get(), nullptr);
 
-  const HRESULT signal_result = deferred4->Signal(fence.get(), 1);
-  const HRESULT wait_result = deferred4->Wait(fence.get(), 1);
-  EXPECT_TRUE(FAILED(signal_result));
-  EXPECT_TRUE(FAILED(wait_result));
+  EXPECT_EQ(deferred4->Signal(fence.get(), 1), DXGI_ERROR_INVALID_CALL);
+  EXPECT_EQ(deferred4->Wait(fence.get(), 1), DXGI_ERROR_INVALID_CALL);
   EXPECT_EQ(fence->GetCompletedValue(), 0u);
   EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
 }
@@ -552,6 +554,12 @@ TEST_F(D3D11FenceSynchronizationContractSpec,
   EXPECT_EQ(foreign_fence->GetCompletedValue(), 0u);
   EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
   EXPECT_EQ(second_device->GetDeviceRemovedReason(), S_OK);
+}
+
+TEST_F(D3D11FenceSynchronizationContractSpec, RejectsNullFenceSynchronization) {
+  EXPECT_EQ(immediate4_->Signal(nullptr, 1), E_INVALIDARG);
+  EXPECT_EQ(immediate4_->Wait(nullptr, 0), E_INVALIDARG);
+  EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
 }
 
 } // namespace
