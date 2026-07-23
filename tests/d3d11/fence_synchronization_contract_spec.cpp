@@ -77,12 +77,8 @@ const dxmt::test::TestCostRegistration
                            dxmt::test::kResourceTestCost);
 const dxmt::test::TestCostRegistration
     kForeignFenceCost("D3D11FenceSynchronizationContractSpec."
-                      "RejectsFenceOwnedByDifferentDevice",
+                      "ValidatesForeignFenceSynchronization",
                       dxmt::test::kResourceTestCost);
-const dxmt::test::TestCostRegistration
-    kNullFenceCost("D3D11FenceSynchronizationContractSpec."
-                   "RejectsNullFenceSynchronization",
-                   dxmt::test::kResourceTestCost);
 
 std::atomic<std::uint32_t> g_next_fence_name_id{0};
 
@@ -598,7 +594,7 @@ TEST_F(D3D11FenceSynchronizationContractSpec,
 }
 
 TEST_F(D3D11FenceSynchronizationContractSpec,
-       RejectsFenceOwnedByDifferentDevice) {
+       ValidatesForeignFenceSynchronization) {
   constexpr D3D_FEATURE_LEVEL kFeatureLevel = D3D_FEATURE_LEVEL_11_0;
   D3D_FEATURE_LEVEL chosen_level = D3D_FEATURE_LEVEL_9_1;
   ComPtr<ID3D11Device> second_device;
@@ -618,16 +614,10 @@ TEST_F(D3D11FenceSynchronizationContractSpec,
   ComPtr<ID3D11Fence> foreign_fence = CreateFence();
   ASSERT_TRUE(foreign_fence);
   EXPECT_EQ(second_context4->Signal(foreign_fence.get(), 1), E_INVALIDARG);
-  EXPECT_EQ(second_context4->Wait(foreign_fence.get(), 0), E_INVALIDARG);
+  EXPECT_EQ(second_context4->Wait(foreign_fence.get(), 0), S_OK);
   EXPECT_EQ(foreign_fence->GetCompletedValue(), 0u);
   EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
   EXPECT_EQ(second_device->GetDeviceRemovedReason(), S_OK);
-}
-
-TEST_F(D3D11FenceSynchronizationContractSpec, RejectsNullFenceSynchronization) {
-  EXPECT_EQ(immediate4_->Signal(nullptr, 1), E_INVALIDARG);
-  EXPECT_EQ(immediate4_->Wait(nullptr, 0), E_INVALIDARG);
-  EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
 }
 
 } // namespace

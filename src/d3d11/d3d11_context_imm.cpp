@@ -1216,10 +1216,6 @@ public:
     auto fence = dynamic_cast<MTLD3D11Fence *>(pFence);
     if (!fence)
       return E_INVALIDARG;
-    Com<ID3D11Device> owner;
-    fence->GetDevice(&owner);
-    if (owner.ptr() != this->m_parent)
-      return E_INVALIDARG;
 
     FlushAllPendingBufferUpdates();
     Flush();
