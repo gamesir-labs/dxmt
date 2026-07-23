@@ -25,12 +25,26 @@ struct FenceAccessCase {
   const char *name;
 };
 
+struct FenceInterfaceCase {
+  const GUID *iid;
+  HRESULT expected;
+  const char *name;
+};
+
 constexpr std::array kFenceAccessCases = {
     FenceAccessCase{GENERIC_ALL, "GenericAll"},
     FenceAccessCase{0, "Zero"},
     FenceAccessCase{GENERIC_READ, "GenericRead"},
     FenceAccessCase{GENERIC_WRITE, "GenericWrite"},
     FenceAccessCase{GENERIC_READ | GENERIC_WRITE, "GenericReadWrite"},
+};
+
+constexpr std::array kFenceInterfaceCases = {
+    FenceInterfaceCase{&__uuidof(IUnknown), S_OK, "IUnknown"},
+    FenceInterfaceCase{&__uuidof(ID3D11DeviceChild), S_OK, "DeviceChild"},
+    FenceInterfaceCase{&__uuidof(ID3D11Fence), S_OK, "Fence"},
+    FenceInterfaceCase{&__uuidof(ID3D11Buffer), E_NOINTERFACE,
+                       "UnsupportedBuffer"},
 };
 
 enum class InvalidHandleKind {
@@ -87,14 +101,33 @@ const dxmt::test::LogicalCaseFamilyRegistration kInvalidHandleRegistration(
      "logical ID, handle kind and value, HRESULT, output value, device "
      "health, and exact replay argument"});
 
+const dxmt::test::LogicalCaseFamilyRegistration kFenceInterfaceRegistration(
+    "D3D11FenceSharedHandleContractSpec.OpensFenceByPublicInterface",
+    "D3D11.Fence.Open.Interface.", kFenceInterfaceCases.size(), 1,
+    {dxmt::test::TestClass::Conformance,
+     dxmt::test::ExecutionPath::Auto,
+     {"11_0", "None", "Device",
+      "ID3D11Device5,OpenSharedFence,IUnknown,ID3D11DeviceChild,"
+      "ID3D11Fence,ID3D11Buffer,GetCompletedValue,GetDevice"},
+     dxmt::test::kResourceTestCost,
+     "one test-local D3D11 device, one shared fence, and one scoped NT "
+     "handle per physical test",
+     "open one shared fence through each supported public interface plus one "
+     "unrelated interface",
+     "supported interfaces expose a fence with the original value and "
+     "ownership by the opening device; the unrelated interface returns "
+     "E_NOINTERFACE and no object",
+     "logical ID, interface, open HRESULT, COM object, completed value, "
+     "owner, device health, and exact replay argument"});
+
 const dxmt::test::TestCostRegistration
     kFenceAccessCost("D3D11FenceSharedHandleContractSpec.AcceptsAccessMasks",
                      dxmt::test::kResourceTestCost);
 const dxmt::test::TestCostRegistration kInvalidHandleCost(
     "D3D11FenceSharedHandleContractSpec.RejectsNonFenceHandles",
     dxmt::test::kResourceTestCost);
-const dxmt::test::TestCostRegistration kOpenOutputCost(
-    "D3D11FenceSharedHandleContractSpec.RejectsUnsupportedInterface",
+const dxmt::test::TestCostRegistration kOpenInterfaceCost(
+    "D3D11FenceSharedHandleContractSpec.OpensFenceByPublicInterface",
     dxmt::test::kResourceTestCost);
 const dxmt::test::TestCostRegistration kCreateOutputCost(
     "D3D11FenceSharedHandleContractSpec.RejectsNullSharedHandleOutput",
@@ -249,7 +282,7 @@ TEST_F(D3D11FenceSharedHandleContractSpec, RejectsNonFenceHandles) {
   EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
 }
 
-TEST_F(D3D11FenceSharedHandleContractSpec, RejectsUnsupportedInterface) {
+TEST_F(D3D11FenceSharedHandleContractSpec, OpensFenceByPublicInterface) {
   ComPtr<ID3D11Fence> fence = CreateSharedFence(13);
   ASSERT_TRUE(fence);
   ScopedHandle handle;
@@ -258,11 +291,45 @@ TEST_F(D3D11FenceSharedHandleContractSpec, RejectsUnsupportedInterface) {
       S_OK);
   ASSERT_NE(handle.handle, nullptr);
 
-  void *opened = reinterpret_cast<void *>(std::uintptr_t{1});
-  EXPECT_EQ(
-      device5_->OpenSharedFence(handle.handle, __uuidof(ID3D11Buffer), &opened),
-      E_NOINTERFACE);
-  EXPECT_EQ(opened, nullptr);
+  std::uint32_t selected_count = 0;
+  for (std::uint32_t logical = 0; logical < kFenceInterfaceCases.size();
+       ++logical) {
+    if (!dxmt::test::LogicalCaseSelected(kFenceInterfaceRegistration.family(),
+                                         logical))
+      continue;
+    ++selected_count;
+    const FenceInterfaceCase &test_case = kFenceInterfaceCases[logical];
+    const auto case_id = dxmt::test::LogicalCaseId(
+        kFenceInterfaceRegistration.family(), logical);
+    SCOPED_TRACE(::testing::Message()
+                 << "LogicalCaseId: " << case_id << " case=" << test_case.name
+                 << " Replay: --dxmt-case-id=" << case_id);
+
+    void *opened = reinterpret_cast<void *>(std::uintptr_t{1});
+    const HRESULT open_result =
+        device5_->OpenSharedFence(handle.handle, *test_case.iid, &opened);
+    EXPECT_EQ(open_result, test_case.expected);
+    if (FAILED(test_case.expected)) {
+      EXPECT_EQ(opened, nullptr);
+      continue;
+    }
+    ASSERT_NE(opened, nullptr);
+    ComPtr<IUnknown> object(reinterpret_cast<IUnknown *>(opened));
+    ComPtr<ID3D11Fence> opened_fence;
+    ASSERT_EQ(
+        object->QueryInterface(__uuidof(ID3D11Fence),
+                               reinterpret_cast<void **>(opened_fence.put())),
+        S_OK);
+    EXPECT_EQ(opened_fence->GetCompletedValue(), 13u);
+    ComPtr<ID3D11Device> owner;
+    opened_fence->GetDevice(owner.put());
+    EXPECT_EQ(owner.get(), context_.device());
+  }
+
+  ASSERT_NE(selected_count, 0u);
+  RecordProperty("logical_cases_executed", selected_count);
+  RecordProperty("logical_case_prefix",
+                 kFenceInterfaceRegistration.family().case_id_prefix);
   EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
 }
 
