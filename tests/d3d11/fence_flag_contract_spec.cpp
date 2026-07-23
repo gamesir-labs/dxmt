@@ -22,20 +22,13 @@ struct FenceFlagCase {
   const char *name;
 };
 
-constexpr UINT kKnownFenceFlagMask =
-    D3D11_FENCE_FLAG_NONE | D3D11_FENCE_FLAG_SHARED |
-    D3D11_FENCE_FLAG_SHARED_CROSS_ADAPTER | D3D11_FENCE_FLAG_NON_MONITORED;
-constexpr UINT kUnknownLowBit = [] {
-  UINT bit = 1;
-  while (kKnownFenceFlagMask & bit)
-    bit <<= 1;
-  return bit;
-}();
 constexpr HRESULT kZeroCreateResult =
     D3D11_FENCE_FLAG_NONE == 0 ? S_OK : E_INVALIDARG;
+constexpr UINT kUnknownLowBit = D3D11_FENCE_FLAG_NON_MONITORED << 1;
 
 constexpr std::array kFenceFlagCases = {
     FenceFlagCase{0, kZeroCreateResult, E_INVALIDARG, "RawZero"},
+    FenceFlagCase{1, S_OK, E_INVALIDARG, "CompatibilityNone"},
     FenceFlagCase{D3D11_FENCE_FLAG_NONE, S_OK, E_INVALIDARG, "None"},
     FenceFlagCase{D3D11_FENCE_FLAG_SHARED, S_OK, S_OK, "Shared"},
     FenceFlagCase{D3D11_FENCE_FLAG_SHARED_CROSS_ADAPTER, E_INVALIDARG,
@@ -44,16 +37,16 @@ constexpr std::array kFenceFlagCases = {
                       D3D11_FENCE_FLAG_SHARED_CROSS_ADAPTER,
                   S_OK, S_OK, "SharedCrossAdapter"},
     FenceFlagCase{D3D11_FENCE_FLAG_NON_MONITORED, E_INVALIDARG, E_INVALIDARG,
-                  "NonMonitoredWithoutShared"},
+                  "NonMonitored"},
     FenceFlagCase{D3D11_FENCE_FLAG_SHARED | D3D11_FENCE_FLAG_NON_MONITORED,
-                  S_OK, S_OK, "SharedNonMonitored"},
+                  E_INVALIDARG, E_INVALIDARG, "SharedNonMonitored"},
     FenceFlagCase{D3D11_FENCE_FLAG_SHARED_CROSS_ADAPTER |
                       D3D11_FENCE_FLAG_NON_MONITORED,
                   E_INVALIDARG, E_INVALIDARG, "ModifiersWithoutShared"},
     FenceFlagCase{D3D11_FENCE_FLAG_SHARED |
                       D3D11_FENCE_FLAG_SHARED_CROSS_ADAPTER |
                       D3D11_FENCE_FLAG_NON_MONITORED,
-                  S_OK, S_OK, "SharedCrossAdapterNonMonitored"},
+                  E_INVALIDARG, E_INVALIDARG, "SharedCrossAdapterNonMonitored"},
     FenceFlagCase{kUnknownLowBit, E_INVALIDARG, E_INVALIDARG, "UnknownLowBit"},
     FenceFlagCase{0x80000000u, E_INVALIDARG, E_INVALIDARG, "UnknownHighBit"},
 };
@@ -71,10 +64,10 @@ const dxmt::test::LogicalCaseFamilyRegistration kFenceFlagRegistration(
      "one test-local D3D11 device, one fence, and at most one scoped NT "
      "handle per selected logical case",
      "create fences with the portable sharing/modifier combinations, raw "
-     "zero, and unknown low/high flag bits",
-     "NONE and valid shared combinations create a fence at the requested "
-     "initial value; modifier bits require SHARED, raw zero follows the "
-     "active header ABI, and unknown bits are rejected",
+     "zero, the compatibility NONE bit, and unknown low/high bits",
+     "NONE aliases and valid shared/cross-adapter combinations create a fence "
+     "at the requested initial value; NON_MONITORED and unknown bits are "
+     "rejected, and raw zero follows the active header ABI",
      "logical ID, flags, creation and sharing HRESULTs, completed value, "
      "handle value, device health, and exact replay argument"});
 
