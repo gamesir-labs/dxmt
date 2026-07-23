@@ -16,7 +16,7 @@ using dxmt::test::ComPtr;
 using dxmt::test::D3D11TestContext;
 
 struct FenceFlagCase {
-  D3D11_FENCE_FLAG flags;
+  UINT flags;
   HRESULT create_result;
   HRESULT shared_handle_result;
   const char *name;
@@ -29,12 +29,9 @@ constexpr std::array kFenceFlagCases = {
                   "SharedCrossAdapter"},
     FenceFlagCase{D3D11_FENCE_FLAG_NON_MONITORED, S_OK, E_INVALIDARG,
                   "NonMonitored"},
-    FenceFlagCase{static_cast<D3D11_FENCE_FLAG>(0), E_INVALIDARG, E_INVALIDARG,
-                  "Zero"},
-    FenceFlagCase{static_cast<D3D11_FENCE_FLAG>(0x10), E_INVALIDARG,
-                  E_INVALIDARG, "UnknownLowBit"},
-    FenceFlagCase{static_cast<D3D11_FENCE_FLAG>(0x80000000u), E_INVALIDARG,
-                  E_INVALIDARG, "UnknownHighBit"},
+    FenceFlagCase{0, E_INVALIDARG, E_INVALIDARG, "Zero"},
+    FenceFlagCase{0x10, E_INVALIDARG, E_INVALIDARG, "UnknownLowBit"},
+    FenceFlagCase{0x80000000u, E_INVALIDARG, E_INVALIDARG, "UnknownHighBit"},
 };
 
 const dxmt::test::LogicalCaseFamilyRegistration kFenceFlagRegistration(
@@ -99,13 +96,13 @@ TEST_F(D3D11FenceFlagContractSpec, CreatesOnlyDefinedFenceModes) {
         dxmt::test::LogicalCaseId(kFenceFlagRegistration.family(), logical);
     SCOPED_TRACE(::testing::Message()
                  << "LogicalCaseId: " << case_id << " case=" << test_case.name
-                 << " flags=" << static_cast<UINT>(test_case.flags)
+                 << " flags=" << test_case.flags
                  << " Replay: --dxmt-case-id=" << case_id);
 
     ComPtr<ID3D11Fence> fence;
-    const HRESULT create_result =
-        device5_->CreateFence(23, test_case.flags, __uuidof(ID3D11Fence),
-                              reinterpret_cast<void **>(fence.put()));
+    const HRESULT create_result = device5_->CreateFence(
+        23, static_cast<D3D11_FENCE_FLAG>(test_case.flags),
+        __uuidof(ID3D11Fence), reinterpret_cast<void **>(fence.put()));
     EXPECT_EQ(create_result, test_case.create_result);
     if (FAILED(test_case.create_result)) {
       EXPECT_EQ(fence.get(), nullptr);
