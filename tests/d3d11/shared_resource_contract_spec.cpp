@@ -6,6 +6,8 @@
 
 #include <array>
 #include <cstdint>
+#include <cstring>
+#include <vector>
 
 // Public legacy shared-resource coverage. Every case uses an unnamed KMT
 // handle owned by one test-local texture and a second test-local device, so no
@@ -60,6 +62,42 @@ const dxmt::test::TestCostRegistration kSharedInterfaceCost(
 const dxmt::test::TestCostRegistration kLegacyHandleTypeCost(
     "D3D11SharedResourceContractSpec.RejectsLegacyHandleInNtOpenMethod",
     dxmt::test::kResourceTestCost);
+const dxmt::test::TestCostRegistration kLegacyTextureContentsCost(
+    "D3D11SharedResourceContractSpec.SharesTextureContentsBidirectionally",
+    dxmt::test::kResourceTestCost);
+
+HRESULT ReadTextureContents(ID3D11Device *device, ID3D11DeviceContext *context,
+                            ID3D11Texture2D *texture,
+                            const D3D11_TEXTURE2D_DESC &source_desc,
+                            std::vector<std::uint32_t> *contents) {
+  D3D11_TEXTURE2D_DESC staging_desc = source_desc;
+  staging_desc.Usage = D3D11_USAGE_STAGING;
+  staging_desc.BindFlags = 0;
+  staging_desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+  staging_desc.MiscFlags = 0;
+
+  ComPtr<ID3D11Texture2D> staging;
+  HRESULT hr = device->CreateTexture2D(&staging_desc, nullptr, staging.put());
+  if (FAILED(hr))
+    return hr;
+
+  context->CopyResource(staging.get(), texture);
+  D3D11_MAPPED_SUBRESOURCE mapped = {};
+  hr = context->Map(staging.get(), 0, D3D11_MAP_READ, 0, &mapped);
+  if (FAILED(hr))
+    return hr;
+
+  contents->resize(source_desc.Width * source_desc.Height);
+  const std::size_t row_size = source_desc.Width * sizeof(std::uint32_t);
+  for (UINT y = 0; y < source_desc.Height; ++y) {
+    std::memcpy(contents->data() + y * source_desc.Width,
+                static_cast<const std::uint8_t *>(mapped.pData) +
+                    y * mapped.RowPitch,
+                row_size);
+  }
+  context->Unmap(staging.get(), 0);
+  return S_OK;
+}
 
 class D3D11SharedResourceContractSpec : public ::testing::Test {
 protected:
@@ -187,6 +225,56 @@ TEST_F(D3D11SharedResourceContractSpec, RejectsLegacyHandleInNtOpenMethod) {
                 reinterpret_cast<void **>(opened.put())),
             E_INVALIDARG);
   EXPECT_EQ(opened.get(), nullptr);
+  EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
+  EXPECT_EQ(second_device_->GetDeviceRemovedReason(), S_OK);
+}
+
+TEST_F(D3D11SharedResourceContractSpec, SharesTextureContentsBidirectionally) {
+  ComPtr<ID3D11Texture2D> opened;
+  ASSERT_EQ(second_device_->OpenSharedResource(
+                shared_handle_, __uuidof(ID3D11Texture2D),
+                reinterpret_cast<void **>(opened.put())),
+            S_OK);
+
+  const std::size_t pixel_count = desc_.Width * desc_.Height;
+  std::vector<std::uint32_t> creator_contents(pixel_count);
+  std::vector<std::uint32_t> opened_contents(pixel_count);
+  for (UINT y = 0; y < desc_.Height; ++y) {
+    for (UINT x = 0; x < desc_.Width; ++x) {
+      const std::size_t index = y * desc_.Width + x;
+      creator_contents[index] =
+          0xff000000u | (x * 5u) | (y * 9u << 8u) | ((x + y) * 3u << 16u);
+      opened_contents[index] =
+          0xff000000u | (y * 7u) | (x * 4u << 8u) | ((x + y * 2u) << 16u);
+    }
+  }
+
+  context_.context()->UpdateSubresource(shared_texture_.get(), 0, nullptr,
+                                        creator_contents.data(),
+                                        desc_.Width * sizeof(std::uint32_t), 0);
+  context_.context()->Flush();
+  std::vector<std::uint32_t> actual;
+  ASSERT_EQ(ReadTextureContents(context_.device(), context_.context(),
+                                shared_texture_.get(), desc_, &actual),
+            S_OK);
+  ASSERT_EQ(actual, creator_contents);
+  ASSERT_EQ(ReadTextureContents(second_device_.get(), second_context_.get(),
+                                opened.get(), desc_, &actual),
+            S_OK);
+  EXPECT_EQ(actual, creator_contents);
+
+  second_context_->UpdateSubresource(opened.get(), 0, nullptr,
+                                     opened_contents.data(),
+                                     desc_.Width * sizeof(std::uint32_t), 0);
+  second_context_->Flush();
+  ASSERT_EQ(ReadTextureContents(second_device_.get(), second_context_.get(),
+                                opened.get(), desc_, &actual),
+            S_OK);
+  ASSERT_EQ(actual, opened_contents);
+  ASSERT_EQ(ReadTextureContents(context_.device(), context_.context(),
+                                shared_texture_.get(), desc_, &actual),
+            S_OK);
+  EXPECT_EQ(actual, opened_contents);
   EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
   EXPECT_EQ(second_device_->GetDeviceRemovedReason(), S_OK);
 }
