@@ -103,6 +103,9 @@ extern "C" HRESULT WINAPI D3D11CreateDeviceAndSwapChain(
   if (ppSwapChain && !pSwapChainDesc)
     return ERR_E_INVALIDARG(__func__);
 
+  if (!pAdapter && DriverType == D3D_DRIVER_TYPE_UNKNOWN)
+    return ERR_E_INVALIDARG(__func__);
+
   if (!pAdapter) {
     // Ignore DriverType
     if (DriverType != D3D_DRIVER_TYPE_HARDWARE)

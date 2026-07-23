@@ -1,5 +1,6 @@
 d3d11_unit_sources = files(
   'device_spec.cpp',
+  'device_creation_contract_spec.cpp',
   'capability_spec.cpp',
   'device_feature_contract_spec.cpp',
   'device_capability_validation_contract_spec.cpp',
