@@ -5,6 +5,10 @@
 #include <d3d11_1.h>
 #include <dxgi1_2.h>
 
+#include <cstdint>
+#include <cstring>
+#include <vector>
+
 // Public D3D11.1 NT-handle sharing coverage. Each test owns its texture,
 // anonymous NT handle, devices, and keyed mutex state. Zero-timeout probes make
 // lock ownership deterministic without blocking or sharing synchronization
@@ -34,6 +38,42 @@ const dxmt::test::TestCostRegistration kExactReleasedKeyCost(
 const dxmt::test::TestCostRegistration
     kNonOwnerReleaseCost("D3D11SharedNtHandleContractSpec.NonOwnerReleaseFails",
                          dxmt::test::kResourceTestCost);
+const dxmt::test::TestCostRegistration kTextureContentsCost(
+    "D3D11SharedNtHandleContractSpec.SharesTextureContentsBidirectionally",
+    dxmt::test::kResourceTestCost);
+
+HRESULT ReadTextureContents(ID3D11Device *device, ID3D11DeviceContext *context,
+                            ID3D11Texture2D *texture,
+                            const D3D11_TEXTURE2D_DESC &source_desc,
+                            std::vector<std::uint32_t> *contents) {
+  D3D11_TEXTURE2D_DESC staging_desc = source_desc;
+  staging_desc.Usage = D3D11_USAGE_STAGING;
+  staging_desc.BindFlags = 0;
+  staging_desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+  staging_desc.MiscFlags = 0;
+
+  ComPtr<ID3D11Texture2D> staging;
+  HRESULT hr = device->CreateTexture2D(&staging_desc, nullptr, staging.put());
+  if (FAILED(hr))
+    return hr;
+
+  context->CopyResource(staging.get(), texture);
+  D3D11_MAPPED_SUBRESOURCE mapped = {};
+  hr = context->Map(staging.get(), 0, D3D11_MAP_READ, 0, &mapped);
+  if (FAILED(hr))
+    return hr;
+
+  contents->resize(source_desc.Width * source_desc.Height);
+  const std::size_t row_size = source_desc.Width * sizeof(std::uint32_t);
+  for (UINT y = 0; y < source_desc.Height; ++y) {
+    std::memcpy(contents->data() + y * source_desc.Width,
+                static_cast<const std::uint8_t *>(mapped.pData) +
+                    y * mapped.RowPitch,
+                row_size);
+  }
+  context->Unmap(staging.get(), 0);
+  return S_OK;
+}
 
 struct ScopedNtHandle {
   ScopedNtHandle() = default;
@@ -214,6 +254,49 @@ TEST_F(D3D11SharedNtHandleContractSpec, ReleasedStateRequiresExactKey) {
 TEST_F(D3D11SharedNtHandleContractSpec, NonOwnerReleaseFails) {
   EXPECT_EQ(opened_mutex_->ReleaseSync(5), E_FAIL);
   ASSERT_EQ(creator_mutex_->AcquireSync(0, 0), S_OK);
+  ASSERT_EQ(creator_mutex_->ReleaseSync(0), S_OK);
+  EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
+  EXPECT_EQ(second_device_->GetDeviceRemovedReason(), S_OK);
+}
+
+TEST_F(D3D11SharedNtHandleContractSpec, SharesTextureContentsBidirectionally) {
+  const std::size_t pixel_count = desc_.Width * desc_.Height;
+  std::vector<std::uint32_t> creator_contents(pixel_count);
+  std::vector<std::uint32_t> opened_contents(pixel_count);
+  for (UINT y = 0; y < desc_.Height; ++y) {
+    for (UINT x = 0; x < desc_.Width; ++x) {
+      const std::size_t index = y * desc_.Width + x;
+      creator_contents[index] =
+          0xff000000u | (x * 7u) | (y * 11u << 8u) | ((x + y) * 5u << 16u);
+      opened_contents[index] =
+          0xff000000u | (y * 13u) | (x * 3u << 8u) | ((x * 2u + y * 3u) << 16u);
+    }
+  }
+
+  ASSERT_EQ(creator_mutex_->AcquireSync(0, 0), S_OK);
+  context_.context()->UpdateSubresource(texture_.get(), 0, nullptr,
+                                        creator_contents.data(),
+                                        desc_.Width * sizeof(std::uint32_t), 0);
+  context_.context()->Flush();
+  ASSERT_EQ(creator_mutex_->ReleaseSync(21), S_OK);
+
+  ASSERT_EQ(opened_mutex_->AcquireSync(21, 0), S_OK);
+  std::vector<std::uint32_t> actual;
+  ASSERT_EQ(ReadTextureContents(second_device_.get(), second_context_.get(),
+                                opened_texture_.get(), desc_, &actual),
+            S_OK);
+  EXPECT_EQ(actual, creator_contents);
+  second_context_->UpdateSubresource(opened_texture_.get(), 0, nullptr,
+                                     opened_contents.data(),
+                                     desc_.Width * sizeof(std::uint32_t), 0);
+  second_context_->Flush();
+  ASSERT_EQ(opened_mutex_->ReleaseSync(34), S_OK);
+
+  ASSERT_EQ(creator_mutex_->AcquireSync(34, 0), S_OK);
+  ASSERT_EQ(ReadTextureContents(context_.device(), context_.context(),
+                                texture_.get(), desc_, &actual),
+            S_OK);
+  EXPECT_EQ(actual, opened_contents);
   ASSERT_EQ(creator_mutex_->ReleaseSync(0), S_OK);
   EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
   EXPECT_EQ(second_device_->GetDeviceRemovedReason(), S_OK);
