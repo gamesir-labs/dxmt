@@ -1,5 +1,6 @@
 #include "d3d12_binding_hotspot_scenarios.hpp"
 
+#include "../../include/dxmt_d3d12_test_path.hpp"
 #include "d3d12_test_context.hpp"
 #include "shaders/bindless_dxil_shaders.hpp"
 
@@ -627,7 +628,6 @@ RunCompiledRootDescriptorResidencyScenario(
               nullptr, __uuidof(ID3D12GraphicsCommandList),
               reinterpret_cast<void **>(submission_list.put()))))
     return error;
-
   RecordGraphicsState(context, resources, nullptr, submission_list.get());
   const auto begin = std::chrono::steady_clock::now();
   for (std::uint32_t draw = 0; draw < draw_count; ++draw) {
@@ -802,6 +802,13 @@ BindingHotspotError RunCompiledDescriptorSubmissionSnapshotScenario(
               nullptr, __uuidof(ID3D12GraphicsCommandList),
               reinterpret_cast<void **>(submission_list.put()))))
     return error;
+  const dxmt::d3d12::test::ExecutionPathConfig execution_path_config = {};
+  if (auto error = HResultError(
+          "compiled descriptor snapshot telemetry enable",
+          submission_list->SetPrivateData(
+              dxmt::d3d12::test::kExecutionPathConfigGuid,
+              sizeof(execution_path_config), &execution_path_config)))
+    return error;
 
   D3D12TestContext::Transition(submission_list.get(), source.get(),
                                D3D12_RESOURCE_STATE_COPY_DEST,
@@ -861,6 +868,25 @@ BindingHotspotError RunCompiledDescriptorSubmissionSnapshotScenario(
   if (auto error = HResultError("compiled descriptor snapshot completion",
                                 context.SignalAndWait()))
     return error;
+  dxmt::d3d12::test::ExecutionPathStats execution_path_stats = {};
+  UINT execution_path_stats_size = sizeof(execution_path_stats);
+  if (auto error = HResultError(
+          "compiled descriptor snapshot telemetry read",
+          submission_list->GetPrivateData(
+              dxmt::d3d12::test::kExecutionPathStatsGuid,
+              &execution_path_stats_size, &execution_path_stats)))
+    return error;
+  if (execution_path_stats_size != sizeof(execution_path_stats) ||
+      execution_path_stats.struct_size != sizeof(execution_path_stats))
+    return "compiled descriptor snapshot telemetry ABI mismatch";
+  if (!execution_path_stats.submitted_descriptor_snapshots ||
+      !execution_path_stats.submitted_unique_descriptor_snapshots)
+    return "compiled bindless direct packet did not retain a submission snapshot";
+  if (execution_path_stats.replayed_compiled_packet_fallbacks ||
+      execution_path_stats.legacy_replay_records)
+    return "compiled bindless direct packet entered compatibility replay";
+  if (execution_path_stats.frozen_native_direct_packets)
+    return "compiled bindless direct packet entered the native frozen path";
 
   TextureReadback readback;
   if (auto error = HResultError(

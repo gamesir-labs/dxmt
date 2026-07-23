@@ -18,8 +18,12 @@ class CompiledGenerationSpec : public ::testing::Test {
 protected:
   void SetUp() override { ASSERT_EQ(context_.Initialize(), S_OK); }
 
-  static void EnableStats(ID3D12GraphicsCommandList *list) {
-    const ExecutionPathConfig config = {};
+  static void EnableStats(
+      ID3D12GraphicsCommandList *list,
+      dxmt::d3d12::test::ExecutionPathMode mode =
+          dxmt::d3d12::test::ExecutionPathMode::Auto) {
+    ExecutionPathConfig config = {};
+    config.mode = mode;
     ASSERT_EQ(list->SetPrivateData(
                   dxmt::d3d12::test::kExecutionPathConfigGuid,
                   sizeof(config), &config),
@@ -136,10 +140,9 @@ TEST_F(CompiledGenerationSpec, ReusesImmutableStateAndMergesTypedRanges) {
   const auto submitted = ReadStats(context_.list());
   EXPECT_EQ(submitted.submitted_generation_shares, 1u);
   EXPECT_EQ(submitted.submitted_generation_deep_copies, 0u);
-  // SM5 bytecode deliberately uses the compatibility packet encoder. The
-  // Close plan still contains no typed nodes; each dispatch lowers directly
-  // from its complete compiled packet without entering legacy record replay.
-  EXPECT_EQ(submitted.replayed_compiled_packet_fallbacks, 4u);
+  // The submission-frozen native program now covers SM5 packets directly;
+  // none of the dispatches may re-enter compatibility replay.
+  EXPECT_EQ(submitted.replayed_compiled_packet_fallbacks, 0u);
   EXPECT_EQ(submitted.legacy_replay_records, 0u);
 }
 
@@ -195,6 +198,171 @@ TEST_F(CompiledGenerationSpec, MergesComputeNodesAcrossElidedState) {
   EXPECT_EQ(submitted.encoder_full_binding_programs, 1u);
   EXPECT_EQ(submitted.encoder_delta_binding_programs, 1u);
   EXPECT_EQ(submitted.encoder_binding_program_hits, 0u);
+}
+
+TEST_F(CompiledGenerationSpec,
+       FreezesNativeDescriptorTablesBeforeCompiledDirectEncoding) {
+  std::array<D3D12_DESCRIPTOR_RANGE, 2> ranges = {};
+  ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_CBV;
+  ranges[0].NumDescriptors = 1;
+  ranges[0].BaseShaderRegister = 0;
+  ranges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+  ranges[1].NumDescriptors = 1;
+  ranges[1].BaseShaderRegister = 0;
+  ranges[1].RegisterSpace = 1;
+  std::array<D3D12_ROOT_PARAMETER, 2> parameters = {};
+  for (UINT index = 0; index < parameters.size(); ++index) {
+    parameters[index].ParameterType =
+        D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    parameters[index].DescriptorTable.NumDescriptorRanges = 1;
+    parameters[index].DescriptorTable.pDescriptorRanges = &ranges[index];
+    parameters[index].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+  }
+  D3D12_ROOT_SIGNATURE_DESC root_desc = {};
+  root_desc.NumParameters = static_cast<UINT>(parameters.size());
+  root_desc.pParameters = parameters.data();
+  auto root_signature = context_.CreateRootSignature(root_desc);
+  ASSERT_TRUE(root_signature);
+
+  const auto vertex_shader = dxmt::test::CompileShader(
+      R"(
+        cbuffer FrameData : register(b0) {
+          float4x4 projection;
+        };
+        float4 main(float4 position : POSITION) : SV_Position {
+          return mul(projection, position);
+        }
+      )",
+      "vs_5_1");
+  ASSERT_EQ(vertex_shader.result, S_OK) << vertex_shader.diagnostic_text();
+  const auto pixel_shader = dxmt::test::CompileShader(
+      R"(
+        Texture2D<float4> source_texture : register(t0, space1);
+        float4 main() : SV_Target {
+          return source_texture.Load(int3(0, 0, 0));
+        }
+      )",
+      "ps_5_1");
+  ASSERT_EQ(pixel_shader.result, S_OK) << pixel_shader.diagnostic_text();
+  const D3D12_INPUT_ELEMENT_DESC element = {
+      "POSITION", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 0,
+      D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0};
+  D3D12_GRAPHICS_PIPELINE_STATE_DESC pso_desc = {};
+  pso_desc.pRootSignature = root_signature.get();
+  pso_desc.VS = {vertex_shader.bytecode->GetBufferPointer(),
+                 vertex_shader.bytecode->GetBufferSize()};
+  pso_desc.PS = {pixel_shader.bytecode->GetBufferPointer(),
+                 pixel_shader.bytecode->GetBufferSize()};
+  pso_desc.BlendState.RenderTarget[0].RenderTargetWriteMask =
+      D3D12_COLOR_WRITE_ENABLE_ALL;
+  pso_desc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+  pso_desc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+  pso_desc.SampleMask = UINT_MAX;
+  pso_desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+  pso_desc.NumRenderTargets = 1;
+  pso_desc.RTVFormats[0] = DXGI_FORMAT_R32G32B32A32_FLOAT;
+  pso_desc.SampleDesc.Count = 1;
+  pso_desc.InputLayout = {&element, 1};
+  ComPtr<ID3D12PipelineState> pipeline;
+  ASSERT_EQ(context_.device()->CreateGraphicsPipelineState(
+                &pso_desc, IID_PPV_ARGS(pipeline.put())),
+            S_OK);
+
+  auto target = context_.CreateTexture2D(
+      4, 4, 1, DXGI_FORMAT_R32G32B32A32_FLOAT,
+      D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+      D3D12_RESOURCE_STATE_RENDER_TARGET);
+  auto source = context_.CreateTexture2D(
+      1, 1, 1, DXGI_FORMAT_R32G32B32A32_FLOAT, D3D12_RESOURCE_FLAG_NONE,
+      D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+  auto rtv_heap = context_.CreateDescriptorHeap(
+      D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1, false);
+  auto resource_heap = context_.CreateDescriptorHeap(
+      D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 2, true);
+  ASSERT_TRUE(target);
+  ASSERT_TRUE(source);
+  ASSERT_TRUE(rtv_heap);
+  ASSERT_TRUE(resource_heap);
+
+  struct FrameData {
+    float projection[16];
+    float max_edr;
+    float brightness;
+    float current_edr_bias;
+    float padding;
+  } frame = {};
+  frame.projection[0] = frame.projection[5] = frame.projection[10] =
+      frame.projection[15] = 1.0f;
+  frame.max_edr = frame.brightness = 1.0f;
+  auto frame_buffer = context_.CreateUploadBuffer(
+      D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT, &frame, sizeof(frame));
+  const std::array<std::array<float, 4>, 3> vertices = {{
+      {{-1.0f, -1.0f, 0.0f, 1.0f}},
+      {{-1.0f, 3.0f, 0.0f, 1.0f}},
+      {{3.0f, -1.0f, 0.0f, 1.0f}},
+  }};
+  auto vertex_buffer = context_.CreateUploadBuffer(
+      sizeof(vertices), vertices.data(), sizeof(vertices));
+  ASSERT_TRUE(frame_buffer);
+  ASSERT_TRUE(vertex_buffer);
+
+  auto resource_cpu = resource_heap->GetCPUDescriptorHandleForHeapStart();
+  D3D12_CONSTANT_BUFFER_VIEW_DESC cbv = {};
+  cbv.BufferLocation = frame_buffer->GetGPUVirtualAddress();
+  cbv.SizeInBytes = D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT;
+  context_.device()->CreateConstantBufferView(&cbv, resource_cpu);
+  const auto resource_increment =
+      context_.device()->GetDescriptorHandleIncrementSize(
+          D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+  resource_cpu.ptr += resource_increment;
+  context_.device()->CreateShaderResourceView(source.get(), nullptr,
+                                               resource_cpu);
+  const auto rtv = rtv_heap->GetCPUDescriptorHandleForHeapStart();
+  context_.device()->CreateRenderTargetView(target.get(), nullptr, rtv);
+
+  EnableStats(context_.list(),
+              dxmt::d3d12::test::ExecutionPathMode::NativeCompiled);
+  ID3D12DescriptorHeap *heaps[] = {resource_heap.get()};
+  context_.list()->SetDescriptorHeaps(ARRAYSIZE(heaps), heaps);
+  context_.list()->SetGraphicsRootSignature(root_signature.get());
+  context_.list()->SetPipelineState(pipeline.get());
+  auto resource_gpu = resource_heap->GetGPUDescriptorHandleForHeapStart();
+  context_.list()->SetGraphicsRootDescriptorTable(0, resource_gpu);
+  resource_gpu.ptr += resource_increment;
+  context_.list()->SetGraphicsRootDescriptorTable(1, resource_gpu);
+  D3D12_VERTEX_BUFFER_VIEW vertex_view = {};
+  vertex_view.BufferLocation = vertex_buffer->GetGPUVirtualAddress();
+  vertex_view.SizeInBytes = sizeof(vertices);
+  vertex_view.StrideInBytes = sizeof(vertices[0]);
+  context_.list()->IASetVertexBuffers(0, 1, &vertex_view);
+  context_.list()->IASetPrimitiveTopology(
+      D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+  const D3D12_VIEWPORT viewport = {0, 0, 4, 4, 0, 1};
+  const D3D12_RECT scissor = {0, 0, 4, 4};
+  context_.list()->RSSetViewports(1, &viewport);
+  context_.list()->RSSetScissorRects(1, &scissor);
+  context_.list()->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+  context_.list()->DrawInstanced(3, 1, 0, 0);
+  context_.list()->DrawInstanced(3, 1, 0, 0);
+  ASSERT_EQ(context_.list()->Close(), S_OK);
+
+  ID3D12CommandList *lists[] = {context_.list()};
+  context_.queue()->ExecuteCommandLists(1, lists);
+  ASSERT_EQ(context_.SignalAndWait(), S_OK);
+  const auto stats = ReadStats(context_.list());
+  EXPECT_EQ(stats.native_requirement_satisfied, 1u);
+  EXPECT_EQ(stats.replayed_compiled_packet_fallbacks, 0u);
+  EXPECT_EQ(stats.legacy_replay_records, 0u);
+  EXPECT_EQ(stats.submitted_descriptor_snapshots, 2u);
+  EXPECT_GT(stats.submitted_unique_descriptor_snapshots, 0u);
+  EXPECT_LE(stats.submitted_unique_descriptor_snapshots,
+            stats.submitted_descriptor_snapshots);
+  EXPECT_GT(stats.frozen_native_direct_packets, 0u);
+  EXPECT_GT(stats.frozen_range_lookups, 0u);
+  EXPECT_GT(stats.frozen_range_unique, 0u);
+  EXPECT_LE(stats.frozen_range_unique, stats.frozen_range_lookups);
+  EXPECT_GT(stats.frozen_root_word_lookups, 0u);
+  EXPECT_LE(stats.frozen_root_word_reuses, stats.frozen_root_word_lookups);
 }
 
 TEST_F(CompiledGenerationSpec,
@@ -539,10 +707,9 @@ TEST_F(CompiledGenerationSpec,
   ASSERT_EQ(context_.SignalAndWait(), S_OK);
   const auto submitted = ReadStats(context_.list());
   EXPECT_EQ(submitted.legacy_replay_records, 0u);
-  // SM5 shaders intentionally use the compatibility packet encoder. The
-  // Close-time assertions above cover the PSO-independent program identity;
-  // native Encoder full/delta behavior is covered by the native path tests.
-  EXPECT_EQ(submitted.replayed_compiled_packet_fallbacks, 2u);
+  // Raster-only PSO changes retain the same native binding program and no
+  // longer route the draws through compatibility replay.
+  EXPECT_EQ(submitted.replayed_compiled_packet_fallbacks, 0u);
 }
 
 TEST_F(CompiledGenerationSpec, SplitsGraphicsEncodersForDifferentAttachments) {
