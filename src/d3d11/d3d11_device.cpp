@@ -791,13 +791,14 @@ public:
   }
 
   HRESULT STDMETHODCALLTYPE SetExceptionMode(UINT RaiseFlags) override {
-    ERR("Not implemented");
-    return E_NOTIMPL;
+    if (RaiseFlags & ~D3D11_RAISE_FLAG_DRIVER_INTERNAL_ERROR)
+      return E_INVALIDARG;
+    exception_mode_.store(RaiseFlags, std::memory_order_relaxed);
+    return S_OK;
   }
 
   UINT STDMETHODCALLTYPE GetExceptionMode() override {
-    ERR("Not implemented");
-    return 0;
+    return exception_mode_.load(std::memory_order_relaxed);
   }
 
   void STDMETHODCALLTYPE
@@ -1228,6 +1229,7 @@ private:
   std::unique_ptr<MTLD3D11CommandListPoolBase> commandlist_pool_;
   std::unique_ptr<MTLD3D11PipelineCacheBase> pipeline_cache_;
   std::atomic<DWORD> removed_event_cookie_{1};
+  std::atomic<UINT> exception_mode_{0};
 
   Device& device_;
   /** ensure destructor called first */
