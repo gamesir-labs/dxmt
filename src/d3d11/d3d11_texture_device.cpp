@@ -453,6 +453,16 @@ public:
                                                     &finalDesc))) {
       return E_INVALIDARG;
     }
+    if constexpr (std::is_same_v<typename tag_texture::DESC1, D3D11_TEXTURE3D_DESC1>) {
+      if (finalDesc.ViewDimension == D3D11_UAV_DIMENSION_TEXTURE3D) {
+        if (finalDesc.Texture3D.MipSlice >= this->desc.MipLevels)
+          return E_INVALIDARG;
+        const UINT mipDepth = std::max(this->desc.Depth >> finalDesc.Texture3D.MipSlice, 1u);
+        if (!finalDesc.Texture3D.WSize || finalDesc.Texture3D.FirstWSlice >= mipDepth ||
+            finalDesc.Texture3D.WSize > mipDepth - finalDesc.Texture3D.FirstWSlice)
+          return E_INVALIDARG;
+      }
+    }
     TextureViewDescriptor descriptor;
     uint32_t arraySize;
     if constexpr (std::is_same_v<typename tag_texture::DESC1, D3D11_TEXTURE3D_DESC1>) {
