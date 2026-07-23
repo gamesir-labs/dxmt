@@ -15,6 +15,7 @@ d3d11_unit_sources = files(
   'texture2d_desc_matrix_spec.cpp',
   'texture3d_desc_matrix_spec.cpp',
   'versioned_texture_creation_contract_spec.cpp',
+  'versioned_texture2d_view_desc_matrix_spec.cpp',
   'resource_eviction_priority_matrix_spec.cpp',
   'resource_min_lod_matrix_spec.cpp',
   'draw_matrix_spec.cpp',

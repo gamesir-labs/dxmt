@@ -70,6 +70,51 @@ IsTypedTextureViewFormat(MTLD3D11Device *device, DXGI_FORMAT format) {
          !(format_desc.Flag & MTL_DXGI_FORMAT_TYPELESS);
 }
 
+static UINT
+TextureViewPlaneSlice(const D3D11_SHADER_RESOURCE_VIEW_DESC1 &desc) {
+  switch (desc.ViewDimension) {
+  case D3D11_SRV_DIMENSION_TEXTURE2D:
+    return desc.Texture2D.PlaneSlice;
+  case D3D11_SRV_DIMENSION_TEXTURE2DARRAY:
+    return desc.Texture2DArray.PlaneSlice;
+  default:
+    return 0;
+  }
+}
+
+static UINT
+TextureViewPlaneSlice(const D3D11_RENDER_TARGET_VIEW_DESC1 &desc) {
+  switch (desc.ViewDimension) {
+  case D3D11_RTV_DIMENSION_TEXTURE2D:
+    return desc.Texture2D.PlaneSlice;
+  case D3D11_RTV_DIMENSION_TEXTURE2DARRAY:
+    return desc.Texture2DArray.PlaneSlice;
+  default:
+    return 0;
+  }
+}
+
+static UINT
+TextureViewPlaneSlice(const D3D11_UNORDERED_ACCESS_VIEW_DESC1 &desc) {
+  switch (desc.ViewDimension) {
+  case D3D11_UAV_DIMENSION_TEXTURE2D:
+    return desc.Texture2D.PlaneSlice;
+  case D3D11_UAV_DIMENSION_TEXTURE2DARRAY:
+    return desc.Texture2DArray.PlaneSlice;
+  default:
+    return 0;
+  }
+}
+
+template <typename ViewDesc>
+static bool
+IsTextureViewPlaneValid(DXGI_FORMAT resource_format,
+                        const ViewDesc &view_desc) {
+  const UINT plane_count =
+      std::max(1u, GetDXGIFormatTraits(resource_format).planeCount);
+  return TextureViewPlaneSlice(view_desc) < plane_count;
+}
+
 static constexpr SIZE_T kD3DKMTExistingHeapPageSize = 0x1000;
 
 static SIZE_T
@@ -342,6 +387,8 @@ public:
     }
     if (!IsTypedTextureViewFormat(this->m_parent, finalDesc.Format))
       return E_INVALIDARG;
+    if (!IsTextureViewPlaneValid(this->desc.Format, finalDesc))
+      return E_INVALIDARG;
     if constexpr (std::is_same_v<typename tag_texture::DESC1, D3D11_TEXTURE3D_DESC1>) {
       if (finalDesc.ViewDimension == D3D11_RTV_DIMENSION_TEXTURE3D) {
         if (finalDesc.Texture3D.MipSlice >= this->desc.MipLevels)
@@ -434,6 +481,8 @@ public:
     }
     if (!IsTypedTextureViewFormat(this->m_parent, finalDesc.Format))
       return E_INVALIDARG;
+    if (!IsTextureViewPlaneValid(this->desc.Format, finalDesc))
+      return E_INVALIDARG;
     TextureViewDescriptor descriptor;
     uint32_t arraySize;
     if constexpr (std::is_same_v<typename tag_texture::DESC1, D3D11_TEXTURE3D_DESC1>) {
@@ -467,6 +516,8 @@ public:
     }
     if (!IsTypedTextureViewFormat(this->m_parent, finalDesc.Format))
       return E_INVALIDARG;
+    if (!IsTextureViewPlaneValid(this->desc.Format, finalDesc))
+      return E_INVALIDARG;
     if constexpr (std::is_same_v<typename tag_texture::DESC1, D3D11_TEXTURE3D_DESC1>) {
       if (finalDesc.ViewDimension == D3D11_UAV_DIMENSION_TEXTURE3D) {
         if (finalDesc.Texture3D.MipSlice >= this->desc.MipLevels)
@@ -488,7 +539,7 @@ public:
             this->m_parent, this->desc.MipLevels, arraySize, this->texture_.ptr(), finalDesc, descriptor
         ))) {
       ERR("DeviceTexture: Failed to create texture UAV");
-      return E_FAIL;
+      return E_INVALIDARG;
     }
     if (!IsTextureViewRangeValid(descriptor, this->desc.MipLevels, arraySize))
       return E_INVALIDARG;
