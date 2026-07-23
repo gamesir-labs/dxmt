@@ -16,6 +16,7 @@ namespace {
 using dxmt::test::CompileShader;
 using dxmt::test::ComPtr;
 using dxmt::test::D3D12TestContext;
+using dxmt::test::IsSoftwareAdapter;
 
 constexpr std::uint32_t FourCC(char a, char b, char c, char d) {
   return std::uint32_t(std::uint8_t(a)) |
@@ -432,6 +433,15 @@ protected:
 };
 
 TEST_P(ShaderContainerSpec, CorruptionCorpus) {
+  if (GetParam().corruption ==
+          ShaderContainerCorruption::ZeroInstructionLength &&
+      IsSoftwareAdapter(context_.device())) {
+    GTEST_SKIP()
+        << "Native Windows 10 WARP stalls indefinitely while parsing a DXBC "
+           "instruction whose encoded length is zero; hardware adapters "
+           "retain malformed-token coverage";
+  }
+
   D3D12_COMPUTE_PIPELINE_STATE_DESC valid_desc = {};
   valid_desc.pRootSignature = root_signature_.get();
   valid_desc.CS = {shader_.data(), shader_.size()};
