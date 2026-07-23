@@ -289,6 +289,9 @@ public:
     fh4bypass::ApplyBadFiberDataBypass();
     InitReturnPtr(ppAdapter);
 
+    if (ppAdapter == nullptr)
+      return DXGI_ERROR_INVALID_CALL;
+
     auto candidates = EnumerateAdapterCandidates();
     UINT adapter_count = UINT(candidates.size());
 
