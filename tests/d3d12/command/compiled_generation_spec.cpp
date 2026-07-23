@@ -94,6 +94,10 @@ TEST_F(CompiledGenerationSpec, ReusesImmutableStateAndMergesTypedRanges) {
   EXPECT_EQ(first.graphics_encoder_node_count, 0u);
   EXPECT_GT(first.encoder_graph_elided_state_records, 0u);
   EXPECT_EQ(first.close_materialized_root_table_sets, 1u);
+  EXPECT_EQ(first.close_binding_programs, 1u);
+  EXPECT_EQ(first.close_binding_program_reuses, 3u);
+  EXPECT_EQ(first.close_full_binding_programs, 1u);
+  EXPECT_EQ(first.close_delta_binding_programs, 0u);
 
   // Warm every same-type block required by a complete generation before
   // asserting the steady-state high-water contract. Other tests in the same
@@ -175,6 +179,10 @@ TEST_F(CompiledGenerationSpec, MergesComputeNodesAcrossElidedState) {
   EXPECT_EQ(stats.encoder_graph_node_count, 1u);
   EXPECT_EQ(stats.compute_encoder_node_count, 1u);
   EXPECT_GE(stats.encoder_graph_elided_state_records, 3u);
+  EXPECT_EQ(stats.close_binding_programs, 2u);
+  EXPECT_EQ(stats.close_binding_program_reuses, 0u);
+  EXPECT_EQ(stats.close_full_binding_programs, 1u);
+  EXPECT_EQ(stats.close_delta_binding_programs, 1u);
 
   ID3D12CommandList *lists[] = {context_.list()};
   context_.queue()->ExecuteCommandLists(1, lists);
@@ -285,6 +293,8 @@ TEST_F(CompiledGenerationSpec,
   EXPECT_EQ(stats.encoder_group_count, 1u);
   EXPECT_EQ(stats.graphics_encoder_node_count, 1u);
   EXPECT_EQ(stats.encoder_inlined_barrier_nodes, 1u);
+  EXPECT_EQ(stats.close_binding_programs, 1u);
+  EXPECT_EQ(stats.close_binding_program_reuses, 1u);
 
   ID3D12CommandList *lists[] = {context_.list()};
   context_.queue()->ExecuteCommandLists(1, lists);

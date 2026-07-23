@@ -814,6 +814,39 @@ struct CompiledVertexBindingRecipe {
   uint32_t cleared_slot_mask = 0;
 };
 
+enum CompiledBindingDirtyField : std::uint32_t {
+  CompiledBindingDirtyPipelineLayout = 1u << 0,
+  CompiledBindingDirtyResourceHeap = 1u << 1,
+  CompiledBindingDirtySamplerHeap = 1u << 2,
+  CompiledBindingDirtyRootTables = 1u << 3,
+  CompiledBindingDirtyRootConstants = 1u << 4,
+  CompiledBindingDirtyRootDescriptors = 1u << 5,
+  CompiledBindingDirtyVertexBuffers = 1u << 6,
+};
+
+struct CompiledBindingDelta {
+  std::uint32_t dirty_fields = 0;
+  std::uint64_t root_table_dirty_mask = 0;
+  std::uint64_t root_constant_dirty_mask = 0;
+  std::uint64_t root_descriptor_dirty_mask = 0;
+  std::uint32_t vertex_buffer_dirty_mask = 0;
+  bool full_bind = false;
+};
+
+// Immutable Close-time binding state. Packets with identical binding inputs
+// share this object even when draw parameters, raster state, or the selected
+// Metal PSO variant differ. The encoder consumes the accompanying delta and
+// keeps the resulting state alive until the encoder ends.
+struct CompiledBindingProgram {
+  CompiledCommandPipelineBinding pipeline;
+  CompiledCommandDescriptorHeaps descriptor_heaps;
+  CompiledImmutableVector<CompiledCommandRootDescriptorTable> root_tables;
+  CompiledImmutableVector<CompiledCommandRootConstants> root_constants;
+  CompiledImmutableVector<CompiledCommandRootDescriptor> root_descriptors;
+  std::shared_ptr<const CompiledVertexBindingRecipe> vertex_binding_recipe;
+  bool compute = false;
+};
+
 struct CompiledNativeStageBinding {
   uint64_t cbuffer_root_base_offset = 0;
   uint64_t resource_root_base_offset = 0;
@@ -841,6 +874,8 @@ struct CompiledGraphicsPacket {
   std::shared_ptr<const CompiledDynamicRenderStateRecipe>
       dynamic_render_state_recipe;
   std::shared_ptr<const CompiledVertexBindingRecipe> vertex_binding_recipe;
+  std::shared_ptr<const CompiledBindingProgram> binding_program;
+  CompiledBindingDelta binding_delta;
   CompiledImmutableVector<Rc<BufferAllocation>> direct_buffer_allocations;
   CompiledCommandStateDelta state_delta;
   CompiledCommandFallbackReason vertex_binding_recipe_reason =
@@ -860,6 +895,8 @@ struct CompiledComputePacket {
   CompiledImmutableVector<CompiledCommandRootDescriptorTable> root_tables;
   CompiledImmutableVector<CompiledCommandRootConstants> root_constants;
   CompiledImmutableVector<CompiledCommandRootDescriptor> root_descriptors;
+  std::shared_ptr<const CompiledBindingProgram> binding_program;
+  CompiledBindingDelta binding_delta;
   CompiledImmutableVector<Rc<BufferAllocation>> direct_buffer_allocations;
   CompiledCommandStateDelta state_delta;
   bool root_tables_close_materialized = false;
@@ -1070,6 +1107,10 @@ struct CompiledCommandList {
   UINT close_dynamic_render_state_recipes = 0;
   UINT close_vertex_binding_recipes = 0;
   UINT close_direct_access_plans = 0;
+  UINT close_binding_programs = 0;
+  UINT close_binding_program_reuses = 0;
+  UINT close_full_binding_programs = 0;
+  UINT close_delta_binding_programs = 0;
   dxmt::d3d12::test::ExecutionPathMode test_path_mode =
       dxmt::d3d12::test::ExecutionPathMode::Auto;
   UINT test_work_record_count = 0;

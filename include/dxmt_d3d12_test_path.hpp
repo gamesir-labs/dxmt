@@ -116,6 +116,10 @@ struct ExecutionPathStats {
   std::uint32_t close_dynamic_render_state_recipes = 0;
   std::uint32_t close_vertex_binding_recipes = 0;
   std::uint32_t close_direct_access_plans = 0;
+  std::uint32_t close_binding_programs = 0;
+  std::uint32_t close_binding_program_reuses = 0;
+  std::uint32_t close_full_binding_programs = 0;
+  std::uint32_t close_delta_binding_programs = 0;
   // segment_count always reports the complete count. traced_segment_count is
   // capped at kExecutionPathMaxTracedSegments; the parallel arrays preserve
   // builder order and make N/F boundary topology directly testable.

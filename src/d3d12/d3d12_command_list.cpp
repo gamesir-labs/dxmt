@@ -23,6 +23,7 @@
 #include <map>
 #include <mutex>
 #include <tuple>
+#include <type_traits>
 #include <unordered_map>
 #include <utility>
 
@@ -2499,6 +2500,144 @@ static void BuildCompiledVertexBindingRecipes(CompiledCommandList &compiled) {
   }
 }
 
+template <typename Packet>
+static bool CompiledBindingProgramMatchesPacket(
+    const CompiledBindingProgram &program, const Packet &packet,
+    bool compute) {
+  if (program.compute != compute ||
+      program.pipeline.pipeline_state.ptr() !=
+          packet.pipeline.pipeline_state.ptr() ||
+      program.pipeline.root_signature.ptr() !=
+          packet.pipeline.root_signature.ptr() ||
+      program.pipeline.metadata.pipeline != packet.pipeline.metadata.pipeline ||
+      program.descriptor_heaps.cbv_srv_uav.ptr() !=
+          packet.descriptor_heaps.cbv_srv_uav.ptr() ||
+      program.descriptor_heaps.sampler.ptr() !=
+          packet.descriptor_heaps.sampler.ptr() ||
+      program.root_tables.identity() != packet.root_tables.identity() ||
+      program.root_constants.identity() != packet.root_constants.identity() ||
+      program.root_descriptors.identity() !=
+          packet.root_descriptors.identity())
+    return false;
+  if constexpr (std::is_same_v<Packet, CompiledGraphicsPacket>)
+    return program.vertex_binding_recipe.get() ==
+           packet.vertex_binding_recipe.get();
+  return true;
+}
+
+template <typename Packet>
+static CompiledBindingDelta BuildCompiledBindingDelta(
+    const CompiledBindingProgram *previous, const Packet &packet,
+    bool compute) {
+  CompiledBindingDelta delta = {};
+  const bool layout_changed =
+      !previous || previous->compute != compute ||
+      previous->pipeline.metadata.pipeline != packet.pipeline.metadata.pipeline ||
+      previous->pipeline.root_signature.ptr() !=
+          packet.pipeline.root_signature.ptr();
+  delta.full_bind = layout_changed;
+  if (layout_changed)
+    delta.dirty_fields |= CompiledBindingDirtyPipelineLayout;
+
+  const bool resource_heap_changed =
+      !previous || previous->descriptor_heaps.cbv_srv_uav.ptr() !=
+                       packet.descriptor_heaps.cbv_srv_uav.ptr();
+  const bool sampler_heap_changed =
+      !previous || previous->descriptor_heaps.sampler.ptr() !=
+                       packet.descriptor_heaps.sampler.ptr();
+  if (resource_heap_changed)
+    delta.dirty_fields |= CompiledBindingDirtyResourceHeap;
+  if (sampler_heap_changed)
+    delta.dirty_fields |= CompiledBindingDirtySamplerHeap;
+
+  if (layout_changed || resource_heap_changed || sampler_heap_changed ||
+      !previous ||
+      previous->root_tables.identity() != packet.root_tables.identity()) {
+    delta.dirty_fields |= CompiledBindingDirtyRootTables;
+    delta.root_table_dirty_mask = packet.state_delta.root_table_dirty_mask;
+    if (!delta.root_table_dirty_mask)
+      delta.root_table_dirty_mask = UINT64_MAX;
+  }
+  if (layout_changed || !previous ||
+      previous->root_constants.identity() != packet.root_constants.identity()) {
+    delta.dirty_fields |= CompiledBindingDirtyRootConstants;
+    delta.root_constant_dirty_mask =
+        packet.state_delta.root_constant_dirty_mask;
+    if (!delta.root_constant_dirty_mask)
+      delta.root_constant_dirty_mask = UINT64_MAX;
+  }
+  if (layout_changed || !previous ||
+      previous->root_descriptors.identity() !=
+          packet.root_descriptors.identity()) {
+    delta.dirty_fields |= CompiledBindingDirtyRootDescriptors;
+    delta.root_descriptor_dirty_mask =
+        packet.state_delta.root_descriptor_dirty_mask;
+    if (!delta.root_descriptor_dirty_mask)
+      delta.root_descriptor_dirty_mask = UINT64_MAX;
+  }
+  if constexpr (std::is_same_v<Packet, CompiledGraphicsPacket>) {
+    const auto previous_slots =
+        previous && previous->vertex_binding_recipe
+            ? previous->vertex_binding_recipe->slot_mask
+            : 0;
+    const auto current_slots = packet.vertex_binding_recipe
+                                   ? packet.vertex_binding_recipe->slot_mask
+                                   : 0;
+    if (layout_changed || !previous ||
+        previous->vertex_binding_recipe.get() !=
+            packet.vertex_binding_recipe.get()) {
+      delta.dirty_fields |= CompiledBindingDirtyVertexBuffers;
+      delta.vertex_buffer_dirty_mask =
+          previous_slots | current_slots |
+          static_cast<std::uint32_t>(
+              packet.input_assembler.vertex_buffer_dirty_mask);
+    }
+  }
+  return delta;
+}
+
+template <typename Packet>
+static void BuildCompiledBindingProgramsForPackets(
+    CompiledCommandList &compiled, std::vector<Packet> &packets,
+    bool compute) {
+  std::shared_ptr<const CompiledBindingProgram> previous_program;
+  for (auto &packet : packets) {
+    packet.binding_delta = BuildCompiledBindingDelta(
+        previous_program.get(), packet, compute);
+    if (previous_program &&
+        CompiledBindingProgramMatchesPacket(*previous_program, packet,
+                                            compute)) {
+      packet.binding_program = previous_program;
+      compiled.close_binding_program_reuses++;
+      continue;
+    }
+
+    auto program = std::make_shared<CompiledBindingProgram>();
+    program->pipeline = packet.pipeline;
+    program->descriptor_heaps = packet.descriptor_heaps;
+    program->root_tables = packet.root_tables;
+    program->root_constants = packet.root_constants;
+    program->root_descriptors = packet.root_descriptors;
+    program->compute = compute;
+    if constexpr (std::is_same_v<Packet, CompiledGraphicsPacket>)
+      program->vertex_binding_recipe = packet.vertex_binding_recipe;
+    packet.binding_program = program;
+    previous_program = std::move(program);
+    compiled.close_binding_programs++;
+    if (packet.binding_delta.full_bind)
+      compiled.close_full_binding_programs++;
+    else
+      compiled.close_delta_binding_programs++;
+  }
+}
+
+static void BuildCompiledBindingPrograms(CompiledCommandList &compiled) {
+  BuildCompiledBindingProgramsForPackets(
+      compiled, compiled.graphics_packets.mutableView(), false);
+  BuildCompiledBindingProgramsForPackets(
+      compiled, compiled.compute_packets.mutableView(), true);
+}
+
 static void AddCompiledDirectBufferAllocation(
     std::vector<Rc<BufferAllocation>> &allocations,
     D3D12_GPU_VIRTUAL_ADDRESS address) {
@@ -3139,6 +3278,7 @@ BuildCompiledCommandList(const std::vector<CommandRecord> &records,
     PreMaterializeCompiledRootTables(*compiled);
     BuildCompiledDynamicRenderStateRecipes(*compiled);
     BuildCompiledVertexBindingRecipes(*compiled);
+    BuildCompiledBindingPrograms(*compiled);
     BuildCompiledDirectAccessPlans(*compiled);
     BuildCompiledEncoderGraph(*compiled);
     FinalizeCompiledStorageAllocationEvents(*compiled,
@@ -3362,6 +3502,7 @@ BuildCompiledCommandList(const std::vector<CommandRecord> &records,
   PreMaterializeCompiledRootTables(*compiled);
   BuildCompiledDynamicRenderStateRecipes(*compiled);
   BuildCompiledVertexBindingRecipes(*compiled);
+  BuildCompiledBindingPrograms(*compiled);
   BuildCompiledDirectAccessPlans(*compiled);
   BuildCompiledEncoderGraph(*compiled);
   FinalizeCompiledStorageAllocationEvents(*compiled,
@@ -3773,6 +3914,13 @@ BuildExecutionPathTestStats(const CompiledCommandList &compiled) {
   stats.close_vertex_binding_recipes =
       compiled.close_vertex_binding_recipes;
   stats.close_direct_access_plans = compiled.close_direct_access_plans;
+  stats.close_binding_programs = compiled.close_binding_programs;
+  stats.close_binding_program_reuses =
+      compiled.close_binding_program_reuses;
+  stats.close_full_binding_programs =
+      compiled.close_full_binding_programs;
+  stats.close_delta_binding_programs =
+      compiled.close_delta_binding_programs;
   auto count_state_delta = [&](const CompiledCommandStateDelta &delta) {
     stats.state_delta_packets++;
     if (!delta.dirty_domains && !delta.root_table_dirty_mask &&

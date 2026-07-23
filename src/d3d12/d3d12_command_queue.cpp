@@ -22121,23 +22121,28 @@ private:
       const CompiledVertexBindingRecipe *vertex_binding_recipe,
       const GraphicsBindingSnapshot *bindless_snapshot) {
     uint64_t fingerprint = kGraphicsBindingFingerprintOffset;
-    HashGraphicsBindingPointer(fingerprint, pipeline);
-    HashGraphicsBindingPointer(fingerprint, root);
-    HashGraphicsBindingPointer(fingerprint, prepared.root_tables.get());
-    HashGraphicsBindingPointer(fingerprint,
-                               packet.descriptor_heaps.cbv_srv_uav.ptr());
-    HashGraphicsBindingPointer(fingerprint,
-                               packet.descriptor_heaps.sampler.ptr());
-    HashGraphicsBindingPointer(fingerprint, packet.root_constants.identity());
-    HashGraphicsBindingPointer(fingerprint,
-                               packet.root_descriptors.identity());
-    HashGraphicsBindingPointer(fingerprint, vertex_binding_recipe);
-    if (!vertex_binding_recipe) {
-      HashGraphicsBindingPointer(
-          fingerprint, packet.input_assembler.vertex_buffers.identity());
-      HashGraphicsBindingValue(
-          fingerprint, packet.input_assembler.vertex_buffer_dirty_mask);
+    if (packet.binding_program) {
+      HashGraphicsBindingPointer(fingerprint, packet.binding_program.get());
+    } else {
+      HashGraphicsBindingPointer(fingerprint, pipeline);
+      HashGraphicsBindingPointer(fingerprint, root);
+      HashGraphicsBindingPointer(fingerprint,
+                                 packet.descriptor_heaps.cbv_srv_uav.ptr());
+      HashGraphicsBindingPointer(fingerprint,
+                                 packet.descriptor_heaps.sampler.ptr());
+      HashGraphicsBindingPointer(fingerprint,
+                                 packet.root_constants.identity());
+      HashGraphicsBindingPointer(fingerprint,
+                                 packet.root_descriptors.identity());
+      HashGraphicsBindingPointer(fingerprint, vertex_binding_recipe);
+      if (!vertex_binding_recipe) {
+        HashGraphicsBindingPointer(
+            fingerprint, packet.input_assembler.vertex_buffers.identity());
+        HashGraphicsBindingValue(
+            fingerprint, packet.input_assembler.vertex_buffer_dirty_mask);
+      }
     }
+    HashGraphicsBindingPointer(fingerprint, prepared.root_tables.get());
     if (bindless_snapshot)
       HashGraphicsBindingValue(fingerprint,
                                bindless_snapshot->content_fingerprint);
