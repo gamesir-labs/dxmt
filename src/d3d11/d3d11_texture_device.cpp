@@ -8,19 +8,15 @@
 #include "d3d11_resource.hpp"
 #include "util_win32_compat.h"
 #include <cstddef>
-#include <vector>
 
 namespace dxmt {
 
 namespace {
 
-constexpr INT kObjectNameInformation = 1;
-
-struct DxmtObjectNameInformation {
-  UNICODE_STRING name;
-};
-
-using NtQueryObjectProc = NTSTATUS(WINAPI *)(HANDLE, INT, PVOID, ULONG, PULONG);
+constexpr NTSTATUS kStatusObjectNameCollision =
+    static_cast<NTSTATUS>(0xc0000035u);
+constexpr HRESULT kD3dErrNotAvailable =
+    static_cast<HRESULT>(0x8876086au);
 
 } // namespace
 
@@ -608,13 +604,17 @@ public:
       name_str.Buffer = buffer;
 
       attr.ObjectName = &name_str;
-      attr.Attributes = 0;
+      attr.Attributes = OBJ_CASE_INSENSITIVE;
     }
 
     D3DKMT_HANDLE handles[3] = {local_kmt_, keyed_mutex_, sync_object_};
     UINT count = (this->desc.MiscFlags & D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX) ? 3 : 1;
 
-    if (D3DKMTShareObjects(count, handles, &attr, Access, pNTHandle)) {
+    const NTSTATUS status =
+        D3DKMTShareObjects(count, handles, &attr, Access, pNTHandle);
+    if (status == kStatusObjectNameCollision)
+      return DXGI_ERROR_NAME_ALREADY_EXISTS;
+    if (status) {
       ERR("DeviceTexture: Failed to create shared handle");
       return E_FAIL;
     }
@@ -1341,6 +1341,9 @@ HRESULT
 ImportSharedTextureByName(
     MTLD3D11Device *pDevice, LPCWSTR lpName, DWORD dwDesiredAccess, REFIID riid, void **ppTexture
 ) {
+  if (!(dwDesiredAccess & DXGI_SHARED_RESOURCE_READ))
+    return kD3dErrNotAvailable;
+
   D3DKMT_OPENNTHANDLEFROMNAME openFromName = {};
   openFromName.dwDesiredAccess = dwDesiredAccess;
 
@@ -1359,30 +1362,11 @@ ImportSharedTextureByName(
   name_str.Buffer = buffer;
 
   attr.ObjectName = &name_str;
-  attr.Attributes = 0;
+  attr.Attributes = OBJ_CASE_INSENSITIVE;
   openFromName.pObjAttrib = &attr;
 
   if (D3DKMTOpenNtHandleFromName(&openFromName)) {
     WARN(str::format("ImportSharedTextureByName: Failed to open NT handle from name: ", lpName));
-    return E_INVALIDARG;
-  }
-
-  ULONG object_name_size = 0;
-  const auto nt_query_object = reinterpret_cast<NtQueryObjectProc>(
-      GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryObject"));
-  if (nt_query_object)
-    nt_query_object(openFromName.hNtHandle, kObjectNameInformation, nullptr, 0,
-                    &object_name_size);
-  std::vector<std::byte> object_name_storage(object_name_size);
-  auto *object_name = reinterpret_cast<DxmtObjectNameInformation *>(
-      object_name_storage.data());
-  if (!nt_query_object || !object_name_size ||
-      nt_query_object(openFromName.hNtHandle, kObjectNameInformation,
-                      object_name, object_name_size, &object_name_size) < 0 ||
-      object_name->name.Length != name_str.Length ||
-      memcmp(object_name->name.Buffer, name_str.Buffer, name_str.Length)) {
-    WARN(str::format("ImportSharedTextureByName: Opened name does not match exactly: ", lpName));
-    CloseHandle(openFromName.hNtHandle);
     return E_INVALIDARG;
   }
 

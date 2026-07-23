@@ -34,14 +34,17 @@ struct ScopedNtHandle {
 
 struct NamedAccessCase {
   DWORD access;
+  HRESULT expected;
   const char *name;
 };
 
+constexpr HRESULT kD3dErrNotAvailable = static_cast<HRESULT>(0x8876086au);
+
 constexpr std::array kNamedAccessCases = {
-    NamedAccessCase{DXGI_SHARED_RESOURCE_READ, "Read"},
-    NamedAccessCase{DXGI_SHARED_RESOURCE_WRITE, "Write"},
+    NamedAccessCase{DXGI_SHARED_RESOURCE_READ, S_OK, "Read"},
+    NamedAccessCase{DXGI_SHARED_RESOURCE_WRITE, kD3dErrNotAvailable, "Write"},
     NamedAccessCase{DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE,
-                    "ReadWrite"},
+                    S_OK, "ReadWrite"},
 };
 
 const dxmt::test::LogicalCaseFamilyRegistration kNamedAccessRegistration(
@@ -60,8 +63,9 @@ const dxmt::test::LogicalCaseFamilyRegistration kNamedAccessRegistration(
      "NT handle with a process-unique object name",
      "open one named resource with read, write, and combined documented "
      "access masks on a second device",
-     "every granted access mask opens a texture with the original description "
-     "and ownership by the opening device",
+     "read and combined access open a texture with the original description "
+     "and ownership by the opening device; write-only access returns the "
+     "native D3DERR_NOTAVAILABLE result",
      "logical ID, access mask, object name, open HRESULT, description, owner, "
      "and exact replay argument"});
 
@@ -73,8 +77,12 @@ const dxmt::test::TestCostRegistration
     kNamedRepeatedOpenCost("D3D11SharedNamedResourceContractSpec."
                            "RepeatedOpenByNameCreatesDistinctResourceObjects",
                            dxmt::test::kResourceTestCost);
-const dxmt::test::TestCostRegistration kNamedCaseCost(
-    "D3D11SharedNamedResourceContractSpec.NameComparisonIsCaseSensitive",
+const dxmt::test::TestCostRegistration
+    kNamedCaseCost("D3D11SharedNamedResourceContractSpec."
+                   "NameComparisonMatchesNativeCaseInsensitivity",
+                   dxmt::test::kResourceTestCost);
+const dxmt::test::TestCostRegistration kDuplicateNameCost(
+    "D3D11SharedNamedResourceContractSpec.RejectsDuplicateLiveName",
     dxmt::test::kResourceTestCost);
 
 std::atomic<std::uint32_t> g_next_name_id{0};
@@ -162,11 +170,14 @@ TEST_F(D3D11SharedNamedResourceContractSpec,
                  << " Replay: --dxmt-case-id=" << case_id);
 
     ComPtr<ID3D11Texture2D> opened;
-    ASSERT_EQ(second_device1_->OpenSharedResourceByName(
-                  shared_name_.data(), test_case.access,
-                  __uuidof(ID3D11Texture2D),
-                  reinterpret_cast<void **>(opened.put())),
-              S_OK);
+    const HRESULT open_result = second_device1_->OpenSharedResourceByName(
+        shared_name_.data(), test_case.access, __uuidof(ID3D11Texture2D),
+        reinterpret_cast<void **>(opened.put()));
+    EXPECT_EQ(open_result, test_case.expected);
+    if (FAILED(test_case.expected)) {
+      EXPECT_EQ(opened.get(), nullptr);
+      continue;
+    }
     ASSERT_TRUE(opened);
 
     D3D11_TEXTURE2D_DESC opened_desc = {};
@@ -219,20 +230,42 @@ TEST_F(D3D11SharedNamedResourceContractSpec,
   EXPECT_EQ(second_device_->GetDeviceRemovedReason(), S_OK);
 }
 
-TEST_F(D3D11SharedNamedResourceContractSpec, NameComparisonIsCaseSensitive) {
+TEST_F(D3D11SharedNamedResourceContractSpec,
+       NameComparisonMatchesNativeCaseInsensitivity) {
   std::array<wchar_t, MAX_PATH> different_case = shared_name_;
   ASSERT_EQ(different_case[0], L'D');
   different_case[0] = L'd';
 
   ComPtr<ID3D11Texture2D> opened;
-  const HRESULT open_result = second_device1_->OpenSharedResourceByName(
-      different_case.data(),
-      DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE,
-      __uuidof(ID3D11Texture2D), reinterpret_cast<void **>(opened.put()));
-  EXPECT_TRUE(FAILED(open_result));
-  EXPECT_EQ(opened.get(), nullptr);
+  ASSERT_EQ(second_device1_->OpenSharedResourceByName(
+                different_case.data(), DXGI_SHARED_RESOURCE_READ,
+                __uuidof(ID3D11Texture2D),
+                reinterpret_cast<void **>(opened.put())),
+            S_OK);
+  ASSERT_TRUE(opened);
   EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
   EXPECT_EQ(second_device_->GetDeviceRemovedReason(), S_OK);
+}
+
+TEST_F(D3D11SharedNamedResourceContractSpec, RejectsDuplicateLiveName) {
+  ComPtr<ID3D11Texture2D> duplicate_texture;
+  ASSERT_EQ(context_.device()->CreateTexture2D(&desc_, nullptr,
+                                               duplicate_texture.put()),
+            S_OK);
+  ComPtr<IDXGIResource1> duplicate_resource1;
+  ASSERT_EQ(duplicate_texture->QueryInterface(
+                __uuidof(IDXGIResource1),
+                reinterpret_cast<void **>(duplicate_resource1.put())),
+            S_OK);
+
+  ScopedNtHandle duplicate_handle;
+  duplicate_handle.handle = reinterpret_cast<HANDLE>(uintptr_t{1});
+  EXPECT_EQ(duplicate_resource1->CreateSharedHandle(
+                nullptr, DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE,
+                shared_name_.data(), &duplicate_handle.handle),
+            DXGI_ERROR_NAME_ALREADY_EXISTS);
+  EXPECT_EQ(duplicate_handle.handle, nullptr);
+  EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
 }
 
 } // namespace
