@@ -40,6 +40,7 @@ d3d11_unit_sources = files(
   'unordered_access_view_desc_matrix_spec.cpp',
   'buffer_unordered_access_view_desc_matrix_spec.cpp',
   'texture1d_unordered_access_view_desc_matrix_spec.cpp',
+  'texture1d_single_unordered_access_view_desc_matrix_spec.cpp',
   'texture3d_unordered_access_view_desc_matrix_spec.cpp',
   'render_target_view_desc_matrix_spec.cpp',
   'buffer_render_target_view_desc_matrix_spec.cpp',
