@@ -9,9 +9,9 @@
 #include <limits>
 #include <vector>
 
-// Public D3D11.4 fence-object coverage. Each case creates an unshared fence on
-// a test-local device, so no queue ordering, event, handle, or process-global
-// state is shared between parallel scheduler workers.
+// Public D3D11.4 fence-object coverage. Each case owns its device, fence,
+// events, and handles, so no queue ordering or process-global state is shared
+// between parallel scheduler workers.
 
 namespace {
 
@@ -50,6 +50,22 @@ const dxmt::test::LogicalCaseFamilyRegistration kFenceCases(
 const dxmt::test::TestCostRegistration
     kFenceCost("D3D11FenceContractSpec.PreservesInitialValuesAndComContracts",
                dxmt::test::kResourceTestCost);
+const dxmt::test::TestCostRegistration kFenceHandleInheritanceCost(
+    "D3D11FenceContractSpec.CreatesSharedHandlesWithRequestedInheritance",
+    dxmt::test::kResourceTestCost);
+
+struct ScopedHandle {
+  ScopedHandle() = default;
+  ScopedHandle(const ScopedHandle &) = delete;
+  ScopedHandle &operator=(const ScopedHandle &) = delete;
+
+  ~ScopedHandle() {
+    if (handle)
+      CloseHandle(handle);
+  }
+
+  HANDLE handle = nullptr;
+};
 
 class D3D11FenceContractSpec : public ::testing::Test {
 protected:
@@ -170,6 +186,37 @@ TEST_F(D3D11FenceContractSpec, RejectsSharedHandleForUnsharedFence) {
   HANDLE handle = reinterpret_cast<HANDLE>(static_cast<std::uintptr_t>(1));
   EXPECT_EQ(fence->CreateSharedHandle(nullptr, GENERIC_ALL, nullptr, &handle),
             E_INVALIDARG);
+  EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
+}
+
+TEST_F(D3D11FenceContractSpec, CreatesSharedHandlesWithRequestedInheritance) {
+  ComPtr<ID3D11Fence> fence;
+  ASSERT_EQ(device5_->CreateFence(7, D3D11_FENCE_FLAG_SHARED,
+                                  __uuidof(ID3D11Fence),
+                                  reinterpret_cast<void **>(fence.put())),
+            S_OK);
+  ASSERT_TRUE(fence);
+
+  ScopedHandle default_handle;
+  ASSERT_EQ(fence->CreateSharedHandle(nullptr, GENERIC_ALL, nullptr,
+                                      &default_handle.handle),
+            S_OK);
+  ASSERT_NE(default_handle.handle, nullptr);
+  DWORD handle_flags = HANDLE_FLAG_INHERIT;
+  ASSERT_TRUE(GetHandleInformation(default_handle.handle, &handle_flags));
+  EXPECT_EQ(handle_flags & HANDLE_FLAG_INHERIT, 0u);
+
+  SECURITY_ATTRIBUTES attributes = {};
+  attributes.nLength = sizeof(attributes);
+  attributes.bInheritHandle = TRUE;
+  ScopedHandle inherited_handle;
+  ASSERT_EQ(fence->CreateSharedHandle(&attributes, GENERIC_ALL, nullptr,
+                                      &inherited_handle.handle),
+            S_OK);
+  ASSERT_NE(inherited_handle.handle, nullptr);
+  handle_flags = 0;
+  ASSERT_TRUE(GetHandleInformation(inherited_handle.handle, &handle_flags));
+  EXPECT_EQ(handle_flags & HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
   EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
 }
 

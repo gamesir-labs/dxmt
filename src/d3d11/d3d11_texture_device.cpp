@@ -589,7 +589,11 @@ public:
 
     OBJECT_ATTRIBUTES attr = {};
     attr.Length = sizeof(attr);
-    attr.SecurityDescriptor = const_cast<SECURITY_ATTRIBUTES*>(Attributes);
+    if (Attributes) {
+      attr.SecurityDescriptor = Attributes->lpSecurityDescriptor;
+      if (Attributes->bInheritHandle)
+        attr.Attributes |= OBJ_INHERIT;
+    }
 
     WCHAR buffer[MAX_PATH];
     UNICODE_STRING name_str;
@@ -604,7 +608,7 @@ public:
       name_str.Buffer = buffer;
 
       attr.ObjectName = &name_str;
-      attr.Attributes = OBJ_CASE_INSENSITIVE;
+      attr.Attributes |= OBJ_CASE_INSENSITIVE;
     }
 
     D3DKMT_HANDLE handles[3] = {local_kmt_, keyed_mutex_, sync_object_};
@@ -616,6 +620,14 @@ public:
       return DXGI_ERROR_NAME_ALREADY_EXISTS;
     if (status) {
       ERR("DeviceTexture: Failed to create shared handle");
+      return E_FAIL;
+    }
+
+    const DWORD inherit_flag =
+        Attributes && Attributes->bInheritHandle ? HANDLE_FLAG_INHERIT : 0;
+    if (!SetHandleInformation(*pNTHandle, HANDLE_FLAG_INHERIT, inherit_flag)) {
+      CloseHandle(*pNTHandle);
+      *pNTHandle = nullptr;
       return E_FAIL;
     }
 

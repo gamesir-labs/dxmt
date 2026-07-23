@@ -88,6 +88,10 @@ const dxmt::test::TestCostRegistration
     kSecondHandleCost("D3D11SharedNamedResourceContractSpec."
                       "CreatesAdditionalAnonymousHandleForSameResource",
                       dxmt::test::kResourceTestCost);
+const dxmt::test::TestCostRegistration
+    kHandleInheritanceCost("D3D11SharedNamedResourceContractSpec."
+                           "CreatesHandlesWithRequestedInheritance",
+                           dxmt::test::kResourceTestCost);
 
 std::atomic<std::uint32_t> g_next_name_id{0};
 
@@ -289,6 +293,29 @@ TEST_F(D3D11SharedNamedResourceContractSpec,
   ASSERT_TRUE(opened);
   EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
   EXPECT_EQ(second_device_->GetDeviceRemovedReason(), S_OK);
+}
+
+TEST_F(D3D11SharedNamedResourceContractSpec,
+       CreatesHandlesWithRequestedInheritance) {
+  DWORD handle_flags = HANDLE_FLAG_INHERIT;
+  ASSERT_TRUE(GetHandleInformation(shared_handle_.handle, &handle_flags));
+  EXPECT_EQ(handle_flags & HANDLE_FLAG_INHERIT, 0u);
+
+  SECURITY_ATTRIBUTES attributes = {};
+  attributes.nLength = sizeof(attributes);
+  attributes.bInheritHandle = TRUE;
+  ScopedNtHandle inherited_handle;
+  ASSERT_EQ(resource1_->CreateSharedHandle(&attributes,
+                                           DXGI_SHARED_RESOURCE_READ |
+                                               DXGI_SHARED_RESOURCE_WRITE,
+                                           nullptr, &inherited_handle.handle),
+            S_OK);
+  ASSERT_NE(inherited_handle.handle, nullptr);
+
+  handle_flags = 0;
+  ASSERT_TRUE(GetHandleInformation(inherited_handle.handle, &handle_flags));
+  EXPECT_EQ(handle_flags & HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
+  EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
 }
 
 } // namespace

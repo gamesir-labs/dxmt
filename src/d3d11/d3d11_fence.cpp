@@ -50,7 +50,11 @@ public:
 
     OBJECT_ATTRIBUTES attr = {};
     attr.Length = sizeof(attr);
-    attr.SecurityDescriptor = const_cast<SECURITY_ATTRIBUTES*>(pAttributes);
+    if (pAttributes) {
+      attr.SecurityDescriptor = pAttributes->lpSecurityDescriptor;
+      if (pAttributes->bInheritHandle)
+        attr.Attributes |= OBJ_INHERIT;
+    }
 
     WCHAR buffer[MAX_PATH];
     UNICODE_STRING name_str;
@@ -65,11 +69,19 @@ public:
       name_str.Buffer = buffer;
 
       attr.ObjectName = &name_str;
-      attr.Attributes = OBJ_CASE_INSENSITIVE;
+      attr.Attributes |= OBJ_CASE_INSENSITIVE;
     }
 
     if (D3DKMTShareObjects(1, &local_kmt, &attr, Access, pHandle)) {
       ERR("D3D11Fence: Failed to create shared handle");
+      return E_FAIL;
+    }
+
+    const DWORD inherit_flag =
+        pAttributes && pAttributes->bInheritHandle ? HANDLE_FLAG_INHERIT : 0;
+    if (!SetHandleInformation(*pHandle, HANDLE_FLAG_INHERIT, inherit_flag)) {
+      CloseHandle(*pHandle);
+      *pHandle = nullptr;
       return E_FAIL;
     }
 
