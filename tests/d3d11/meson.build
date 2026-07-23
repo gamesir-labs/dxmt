@@ -101,6 +101,7 @@ d3d11_unit_sources = files(
   'deferred_context_creation_contract_spec.cpp',
   'immediate_context_version_contract_spec.cpp',
   'annotation_contract_spec.cpp',
+  'multithread_contract_spec.cpp',
   'device_context_state_contract_spec.cpp',
   'fence_contract_spec.cpp',
   'device_removed_event_contract_spec.cpp',
