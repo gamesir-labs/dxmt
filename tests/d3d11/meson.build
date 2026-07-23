@@ -111,6 +111,7 @@ d3d11_unit_sources = files(
   'device_exception_mode_contract_spec.cpp',
   'dxgi_device_residency_contract_spec.cpp',
   'dxgi_device_object_contract_spec.cpp',
+  'dxgi_adapter_factory_object_contract_spec.cpp',
   'dxgi_resource_usage_contract_spec.cpp',
   'dxgi_resource_object_contract_spec.cpp',
   'dxgi_resource_offer_contract_spec.cpp',
