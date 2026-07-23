@@ -102,6 +102,7 @@ d3d11_unit_sources = files(
   'counter_contract_spec.cpp',
   'device_exception_mode_contract_spec.cpp',
   'fence_synchronization_contract_spec.cpp',
+  'counter_execution_contract_spec.cpp',
   'deferred_context_matrix_spec.cpp',
   'format_mip_matrix_spec.cpp',
   'map_copy_matrix_spec.cpp',
