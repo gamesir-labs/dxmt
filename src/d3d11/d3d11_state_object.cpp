@@ -665,6 +665,26 @@ HRESULT StateObjectCache<D3D11_RASTERIZER_DESC2, IMTLD3D11RasterizerState>::
   if (!pRasterizerDesc)
     return E_INVALIDARG;
 
+  switch (pRasterizerDesc->ForcedSampleCount) {
+  case 0:
+  case 1:
+  case 2:
+  case 4:
+  case 8:
+  case 16:
+    break;
+  default:
+    return E_INVALIDARG;
+  }
+
+  switch (pRasterizerDesc->ConservativeRaster) {
+  case D3D11_CONSERVATIVE_RASTERIZATION_MODE_OFF:
+  case D3D11_CONSERVATIVE_RASTERIZATION_MODE_ON:
+    break;
+  default:
+    return E_INVALIDARG;
+  }
+
   if (!ppRasterizerState)
     return S_FALSE;
 
