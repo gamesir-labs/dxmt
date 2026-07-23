@@ -355,6 +355,69 @@ TEST_F(CompiledGenerationSpec,
   EXPECT_EQ(submitted.encoder_attachment_materializations, 1u);
 }
 
+TEST_F(CompiledGenerationSpec,
+       ReusesBindingProgramAcrossRasterOnlyPipelineChanges) {
+  const D3D12_ROOT_SIGNATURE_DESC root_desc = {};
+  auto root_signature = context_.CreateRootSignature(root_desc);
+  ASSERT_TRUE(root_signature);
+  const auto pixel = dxmt::test::CompileShader(
+      "float4 main() : SV_Target { return float4(1, 1, 1, 1); }",
+      "ps_5_0");
+  ASSERT_EQ(pixel.result, S_OK) << pixel.diagnostic_text();
+  const D3D12_SHADER_BYTECODE pixel_bytecode = {
+      pixel.bytecode->GetBufferPointer(), pixel.bytecode->GetBufferSize()};
+  auto back_cull_pipeline = context_.CreateGraphicsPipeline(
+      root_signature.get(), DXGI_FORMAT_R8G8B8A8_UNORM, pixel_bytecode,
+      D3D12_CULL_MODE_BACK);
+  auto no_cull_pipeline = context_.CreateGraphicsPipeline(
+      root_signature.get(), DXGI_FORMAT_R8G8B8A8_UNORM, pixel_bytecode,
+      D3D12_CULL_MODE_NONE);
+  ASSERT_TRUE(back_cull_pipeline);
+  ASSERT_TRUE(no_cull_pipeline);
+
+  auto target = context_.CreateTexture2D(
+      8, 8, 1, DXGI_FORMAT_R8G8B8A8_UNORM,
+      D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+      D3D12_RESOURCE_STATE_RENDER_TARGET);
+  auto heap = context_.CreateDescriptorHeap(D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1,
+                                            false);
+  ASSERT_TRUE(target);
+  ASSERT_TRUE(heap);
+  const auto rtv = heap->GetCPUDescriptorHandleForHeapStart();
+  context_.device()->CreateRenderTargetView(target.get(), nullptr, rtv);
+
+  EnableStats(context_.list());
+  context_.list()->SetGraphicsRootSignature(root_signature.get());
+  context_.list()->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+  const D3D12_VIEWPORT viewport = {0, 0, 8, 8, 0, 1};
+  const D3D12_RECT scissor = {0, 0, 8, 8};
+  context_.list()->RSSetViewports(1, &viewport);
+  context_.list()->RSSetScissorRects(1, &scissor);
+  context_.list()->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+  context_.list()->SetPipelineState(back_cull_pipeline.get());
+  context_.list()->DrawInstanced(3, 1, 0, 0);
+  context_.list()->SetPipelineState(no_cull_pipeline.get());
+  context_.list()->DrawInstanced(3, 1, 0, 0);
+  ASSERT_EQ(context_.list()->Close(), S_OK);
+
+  const auto closed = ReadStats(context_.list());
+  EXPECT_EQ(closed.graphics_encoder_node_count, 1u);
+  EXPECT_EQ(closed.close_binding_programs, 1u);
+  EXPECT_EQ(closed.close_binding_program_reuses, 1u);
+  EXPECT_EQ(closed.close_full_binding_programs, 1u);
+  EXPECT_EQ(closed.close_delta_binding_programs, 0u);
+
+  ID3D12CommandList *lists[] = {context_.list()};
+  context_.queue()->ExecuteCommandLists(1, lists);
+  ASSERT_EQ(context_.SignalAndWait(), S_OK);
+  const auto submitted = ReadStats(context_.list());
+  EXPECT_EQ(submitted.legacy_replay_records, 0u);
+  // SM5 shaders intentionally use the compatibility packet encoder. The
+  // Close-time assertions above cover the PSO-independent program identity;
+  // native Encoder full/delta behavior is covered by the native path tests.
+  EXPECT_EQ(submitted.replayed_compiled_packet_fallbacks, 2u);
+}
+
 TEST_F(CompiledGenerationSpec, SplitsGraphicsEncodersForDifferentAttachments) {
   const D3D12_ROOT_SIGNATURE_DESC root_desc = {};
   auto root_signature = context_.CreateRootSignature(root_desc);

@@ -701,6 +701,11 @@ struct CompiledCommandPipelineMetadata {
   PipelineState *pipeline = nullptr;
   const PipelineMetalGraphicsState *metal_graphics = nullptr;
   const PipelineMetalComputeState *metal_compute = nullptr;
+  // Binding identity follows the shader-visible layout rather than the PSO
+  // object. Raster/depth/blend-only PSO changes must not invalidate root
+  // arguments that the next pipeline consumes through the same ABI layout.
+  std::uint64_t binding_layout_fingerprint = 0;
+  std::uint64_t vertex_layout_fingerprint = 0;
   PipelineStateType type = PipelineStateType::Graphics;
   DXMT12_MTL4_SHADER_ABI_VERSION shader_abi_version =
       DXMT12_MTL4_SHADER_ABI_BINDLESS_MIRROR;
@@ -855,6 +860,8 @@ struct CompiledNativeStageBinding {
   uint64_t resource_root_base_offset = 0;
   uint32_t cbuffer_root_base_count = 0;
   uint32_t resource_root_base_count = 0;
+  std::uint64_t cbuffer_root_table_mask = 0;
+  std::uint64_t resource_root_table_mask = 0;
   // CPU copies are retained for bounded diagnostics. The GPU consumes the
   // packed native_root_base_buffer; keeping the source words lets a hang log
   // identify the exact descriptor-table bases without a synchronizing GPU
@@ -1084,6 +1091,8 @@ struct CompiledCommandTestTelemetry {
   std::atomic<UINT> encoder_full_binding_programs = 0;
   std::atomic<UINT> encoder_delta_binding_programs = 0;
   std::atomic<UINT> encoder_binding_program_hits = 0;
+  std::atomic<UINT> encoder_native_binding_ops = 0;
+  std::atomic<UINT> encoder_native_binding_ops_skipped = 0;
   std::atomic<UINT> encoder_resource_plan_publications = 0;
   std::atomic<UINT> encoder_resource_plan_reuses = 0;
   std::atomic<UINT> submitted_generation_shares = 0;
@@ -1091,6 +1100,8 @@ struct CompiledCommandTestTelemetry {
   std::atomic<UINT> encoder_attachment_materializations = 0;
   std::atomic<UINT> submitted_root_table_fast_patches = 0;
   std::atomic<UINT> submitted_root_table_full_materializations = 0;
+  std::atomic<UINT> submitted_native_binding_plan_reuses = 0;
+  std::atomic<UINT> submitted_native_binding_recipe_reuses = 0;
 };
 
 struct CompiledCommandList {

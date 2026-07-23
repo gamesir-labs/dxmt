@@ -391,7 +391,7 @@ ComPtr<ID3D12PipelineState> D3D12TestContext::CreateComputePipeline(
 
 ComPtr<ID3D12PipelineState> D3D12TestContext::CreateGraphicsPipeline(
     ID3D12RootSignature *root_signature, DXGI_FORMAT render_target_format,
-    D3D12_SHADER_BYTECODE pixel_shader) const {
+    D3D12_SHADER_BYTECODE pixel_shader, D3D12_CULL_MODE cull_mode) const {
   D3D12_GRAPHICS_PIPELINE_STATE_DESC desc = {};
   desc.pRootSignature = root_signature;
   desc.VS = FullscreenVertexShader();
@@ -399,7 +399,7 @@ ComPtr<ID3D12PipelineState> D3D12TestContext::CreateGraphicsPipeline(
   desc.BlendState.RenderTarget[0].RenderTargetWriteMask =
       D3D12_COLOR_WRITE_ENABLE_ALL;
   desc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
-  desc.RasterizerState.CullMode = D3D12_CULL_MODE_BACK;
+  desc.RasterizerState.CullMode = cull_mode;
   desc.SampleMask = std::numeric_limits<UINT>::max();
   desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
   desc.NumRenderTargets = 1;

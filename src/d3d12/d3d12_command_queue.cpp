@@ -6388,6 +6388,7 @@ private:
     // constants). Used to prevent reuse across draws that share table bases
     // but differ in root descriptor addresses or constants.
     uint64_t compiled_binding_identity_hash = 0;
+    const void *compiled_binding_program_identity = nullptr;
     const void *compiled_root_tables_identity = nullptr;
     const void *compiled_root_descriptors_identity = nullptr;
     const void *compiled_root_constants_identity = nullptr;
@@ -6675,6 +6676,8 @@ private:
       WMT::Reference<WMT::Buffer> buffer;
       uint64_t offset = 0;
       uint32_t index = 0;
+      uint32_t required_dirty_fields = UINT32_MAX;
+      uint64_t root_table_mask = 0;
       bool compute = false;
       WMTRenderStages render_stages = {};
     };
@@ -9065,8 +9068,15 @@ private:
     };
     uint64_t hash = 1469598103934665603ull;
     hash = mix(hash, compute);
-    hash = mix(hash,
-               reinterpret_cast<uintptr_t>(packet.pipeline.pipeline_state.ptr()));
+    if (packet.binding_program) {
+      hash = mix(hash,
+                 reinterpret_cast<uintptr_t>(packet.binding_program.get()));
+    } else {
+      hash = mix(hash, packet.pipeline.metadata.binding_layout_fingerprint);
+      hash = mix(
+          hash,
+          static_cast<uint32_t>(packet.pipeline.metadata.shader_abi_version));
+    }
     hash = mix(hash,
                reinterpret_cast<uintptr_t>(packet.pipeline.root_signature.ptr()));
     hash = mix(hash, reinterpret_cast<uintptr_t>(
@@ -9088,7 +9098,8 @@ private:
     if (snapshot.compiled_compute != compute ||
         snapshot.compiled_binding_identity_hash !=
             HashCompiledDescriptorBindingIdentity(packet, compute) ||
-        snapshot.pipeline_state.ptr() != packet.pipeline.pipeline_state.ptr() ||
+        snapshot.compiled_binding_program_identity !=
+            packet.binding_program.get() ||
         snapshot.root_signature.ptr() != packet.pipeline.root_signature.ptr() ||
         snapshot.cbv_srv_uav_heap.ptr() !=
             packet.descriptor_heaps.cbv_srv_uav.ptr() ||
@@ -9444,14 +9455,16 @@ private:
     snapshot->sampler_heap = packet.descriptor_heaps.sampler;
     HashGraphicsBindingPointer(snapshot->resource_access_fingerprint,
                                snapshot->root_signature.ptr());
-    HashGraphicsBindingPointer(snapshot->resource_access_fingerprint,
-                               snapshot->pipeline_state.ptr());
+    HashGraphicsBindingValue(
+        snapshot->resource_access_fingerprint,
+        packet.pipeline.metadata.binding_layout_fingerprint);
     snapshot->native =
         packet.pipeline.metadata.uses_native_descriptor_table_abi;
     snapshot->bindless = !snapshot->native;
     snapshot->compiled_compute = compute;
     snapshot->compiled_binding_identity_hash =
         HashCompiledDescriptorBindingIdentity(packet, compute);
+    snapshot->compiled_binding_program_identity = packet.binding_program.get();
     snapshot->compiled_root_tables_identity = packet.root_tables.identity();
     snapshot->compiled_root_descriptors_identity =
         packet.root_descriptors.identity();
@@ -9678,18 +9691,26 @@ private:
         std::unique(submission_mirrors.begin(), submission_mirrors.end()),
         submission_mirrors.end());
     struct RecipeKey {
-      PipelineState *pipeline = nullptr;
+      uint64_t binding_layout_fingerprint = 0;
+      DXMT12_MTL4_SHADER_ABI_VERSION shader_abi_version =
+          DXMT12_MTL4_SHADER_ABI_BINDLESS_MIRROR;
       RootSignature *root = nullptr;
       bool compute = false;
 
       bool operator==(const RecipeKey &other) const {
-        return pipeline == other.pipeline && root == other.root &&
-               compute == other.compute;
+        return binding_layout_fingerprint ==
+                   other.binding_layout_fingerprint &&
+               shader_abi_version == other.shader_abi_version &&
+               root == other.root && compute == other.compute;
       }
     };
     struct RecipeKeyHash {
       size_t operator()(const RecipeKey &key) const {
-        auto hash = std::hash<PipelineState *>{}(key.pipeline);
+        auto hash =
+            std::hash<uint64_t>{}(key.binding_layout_fingerprint);
+        hash ^= std::hash<uint32_t>{}(
+                    static_cast<uint32_t>(key.shader_abi_version)) +
+                0x9e3779b9u + (hash << 6) + (hash >> 2);
         hash ^= std::hash<RootSignature *>{}(key.root) + 0x9e3779b9u +
                 (hash << 6) + (hash >> 2);
         hash ^= size_t(key.compute) + 0x9e3779b9u + (hash << 6) +
@@ -9703,9 +9724,12 @@ private:
     const auto packet_count = compiled.graphics_packets.size() +
                               compiled.compute_packets.size();
     recipe_cache.reserve(std::min<size_t>(packet_count, 128));
-    auto get_recipe = [&](PipelineState &pipeline, RootSignature &root,
-                          bool compute) -> const DescriptorTableBindingRecipe & {
-      const RecipeKey key = {&pipeline, &root, compute};
+    auto get_recipe =
+        [&](PipelineState &pipeline, RootSignature &root, bool compute,
+            const CompiledCommandPipelineMetadata &metadata)
+        -> const DescriptorTableBindingRecipe & {
+      const RecipeKey key = {metadata.binding_layout_fingerprint,
+                             metadata.shader_abi_version, &root, compute};
       auto it = recipe_cache.find(key);
       if (it == recipe_cache.end())
         it = recipe_cache
@@ -9730,7 +9754,8 @@ private:
           (pipeline->UsesBindlessMirror() ||
            packet.pipeline.metadata.uses_native_descriptor_table_abi))
         descriptor_capture_capacity +=
-            get_recipe(*pipeline, *root, false).entries.size();
+            get_recipe(*pipeline, *root, false, packet.pipeline.metadata)
+                .entries.size();
     }
     for (const auto &packet : compiled.compute_packets) {
       if (packet.compatibility_reason !=
@@ -9744,7 +9769,8 @@ private:
           (pipeline->UsesBindlessMirror() ||
            packet.pipeline.metadata.uses_native_descriptor_table_abi))
         descriptor_capture_capacity +=
-            get_recipe(*pipeline, *root, true).entries.size();
+            get_recipe(*pipeline, *root, true, packet.pipeline.metadata)
+                .entries.size();
     }
     cache.compiled_binding_snapshots.reserve(compiled.graphics_packets.size() +
                                              compiled.compute_packets.size());
@@ -9780,7 +9806,8 @@ private:
         continue;
       snapshots.graphics[i] = GetOrCaptureCompiledDescriptorBindingSnapshot(
           cache, packet, *pipeline, root, false,
-          &get_recipe(*pipeline, *root, false), descriptor_records,
+          &get_recipe(*pipeline, *root, false, packet.pipeline.metadata),
+          descriptor_records,
           snapshot_arena, false, true, native_span_store.get());
       if (snapshots.graphics[i] && compiled.test_telemetry) {
         compiled.test_telemetry->submitted_descriptor_snapshots.fetch_add(
@@ -9806,7 +9833,8 @@ private:
         continue;
       snapshots.compute[i] = GetOrCaptureCompiledDescriptorBindingSnapshot(
           cache, packet, *pipeline, root, true,
-          &get_recipe(*pipeline, *root, true), descriptor_records,
+          &get_recipe(*pipeline, *root, true, packet.pipeline.metadata),
+          descriptor_records,
           snapshot_arena, false, true, native_span_store.get());
       if (snapshots.compute[i] && compiled.test_telemetry) {
         compiled.test_telemetry->submitted_descriptor_snapshots.fetch_add(
@@ -10136,6 +10164,31 @@ private:
       state.compiled_fallback_reason = previous_fallback_reason;
     };
 
+    struct NativeBindingRecipeKey {
+      const CompiledBindingProgram *program = nullptr;
+      const GraphicsBindingSnapshot *snapshot = nullptr;
+
+      bool operator==(const NativeBindingRecipeKey &) const = default;
+    };
+    struct NativeBindingRecipeKeyHash {
+      size_t operator()(const NativeBindingRecipeKey &key) const {
+        auto hash = std::hash<const void *>{}(key.program);
+        hash ^= std::hash<const void *>{}(key.snapshot) +
+                0x9e3779b97f4a7c15ull + (hash << 6) + (hash >> 2);
+        return hash;
+      }
+    };
+    std::unordered_map<
+        NativeBindingRecipeKey,
+        std::shared_ptr<const CompiledNativeBindingRecipe>,
+        NativeBindingRecipeKeyHash>
+        graphics_native_binding_recipes;
+    std::unordered_map<
+        NativeBindingRecipeKey,
+        std::shared_ptr<const CompiledNativeBindingRecipe>,
+        NativeBindingRecipeKeyHash>
+        compute_native_binding_recipes;
+
     auto queue_compiled_graphics_packet =
         [&](const CompiledGraphicsPacket &packet,
             const SubmittedCompiledGraphicsPacket &prepared,
@@ -10393,11 +10446,24 @@ private:
             const WMT::Buffer native_root_base_buffer =
                 frozen_native ? frozen_native->root_base_buffer
                               : submitted->native_root_base_buffer;
-            native_binding_recipe = BuildCompiledNativeBindingRecipe(
-                submitted_root_tables, *pipeline, false,
-                frozen_native.get(), native_root_base_buffer,
-                {{PipelineStage::Vertex, &native_vertex},
-                 {PipelineStage::Pixel, &native_pixel}});
+            const NativeBindingRecipeKey recipe_key = {
+                packet.binding_program.get(), submitted_snapshot.get()};
+            if (const auto cached =
+                    graphics_native_binding_recipes.find(recipe_key);
+                cached != graphics_native_binding_recipes.end()) {
+              native_binding_recipe = cached->second;
+              if (test_telemetry)
+                test_telemetry->submitted_native_binding_recipe_reuses
+                    .fetch_add(1, std::memory_order_relaxed);
+            } else {
+              native_binding_recipe = BuildCompiledNativeBindingRecipe(
+                  submitted_root_tables, *pipeline, false,
+                  frozen_native.get(), native_root_base_buffer,
+                  {{PipelineStage::Vertex, &native_vertex},
+                   {PipelineStage::Pixel, &native_pixel}});
+              graphics_native_binding_recipes.emplace(
+                  recipe_key, native_binding_recipe);
+            }
           }
           const uint64_t binding_fingerprint =
               BuildCompiledDirectGraphicsBindingFingerprint(
@@ -10942,10 +11008,23 @@ private:
             const WMT::Buffer native_root_base_buffer =
                 frozen_native ? frozen_native->root_base_buffer
                               : submitted->native_root_base_buffer;
-            native_binding_recipe = BuildCompiledNativeBindingRecipe(
-                submitted_root_tables, *pipeline, true,
-                frozen_native.get(), native_root_base_buffer,
-                {{PipelineStage::Compute, &native_compute}});
+            const NativeBindingRecipeKey recipe_key = {
+                packet.binding_program.get(), submitted_snapshot.get()};
+            if (const auto cached =
+                    compute_native_binding_recipes.find(recipe_key);
+                cached != compute_native_binding_recipes.end()) {
+              native_binding_recipe = cached->second;
+              if (test_telemetry)
+                test_telemetry->submitted_native_binding_recipe_reuses
+                    .fetch_add(1, std::memory_order_relaxed);
+            } else {
+              native_binding_recipe = BuildCompiledNativeBindingRecipe(
+                  submitted_root_tables, *pipeline, true,
+                  frozen_native.get(), native_root_base_buffer,
+                  {{PipelineStage::Compute, &native_compute}});
+              compute_native_binding_recipes.emplace(recipe_key,
+                                                      native_binding_recipe);
+            }
           }
           ReplayDispatchPacket dispatch_packet = {};
           dispatch_packet.metal_pso = metal->pso;
@@ -19152,6 +19231,13 @@ private:
       return store.appendRootWords(words);
     };
 
+    for (const auto &entry : plan->entries) {
+      if (entry.root_index >= 64)
+        continue;
+      auto &mask = entry.cbuffer ? out.cbuffer_root_table_mask
+                                 : out.resource_root_table_mask;
+      mask |= uint64_t{1} << entry.root_index;
+    }
     std::tie(out.cbuffer_root_base_offset, out.cbuffer_root_base_count) =
         build_words(true, plan->max_cbuffer_key_plus_one);
     std::tie(out.resource_root_base_offset, out.resource_root_base_count) =
@@ -21735,13 +21821,15 @@ private:
     auto recipe = std::make_shared<CompiledNativeBindingRecipe>();
     auto add_argument_buffer = [&](WMT::Buffer buffer, uint64_t offset,
                                    uint32_t index,
-                                   WMTRenderStages render_stages) {
+                                   WMTRenderStages render_stages,
+                                   uint32_t required_dirty_fields,
+                                   uint64_t root_table_mask = 0) {
       if (!buffer)
         return;
       recipe->ops.push_back(CompiledNativeBindingRecipe::Op{
           CompiledNativeBindingOpKind::ArgumentBuffer,
-          WMT::Reference<WMT::Buffer>(buffer), offset, index, compute,
-          render_stages});
+          WMT::Reference<WMT::Buffer>(buffer), offset, index,
+          required_dirty_fields, root_table_mask, compute, render_stages});
     };
 
     const WMTRenderStages all_render_stages =
@@ -21751,21 +21839,23 @@ private:
       add_argument_buffer(
           frozen->descriptor_table_buffer,
           frozen->descriptor_table_buffer_offset,
-          DXMT12_MTL4_NATIVE_DESCRIPTOR_HEAP_BIND_INDEX, all_render_stages);
+          DXMT12_MTL4_NATIVE_DESCRIPTOR_HEAP_BIND_INDEX, all_render_stages,
+          CompiledBindingDirtyResourceHeap);
       add_argument_buffer(
           frozen->descriptor_table_buffer,
           frozen->descriptor_table_buffer_offset,
-          DXMT12_MTL4_NATIVE_SAMPLER_HEAP_BIND_INDEX, all_render_stages);
+          DXMT12_MTL4_NATIVE_SAMPLER_HEAP_BIND_INDEX, all_render_stages,
+          CompiledBindingDirtySamplerHeap);
       add_argument_buffer(
           frozen->buffer_resource_table_buffer,
           frozen->buffer_resource_table_buffer_offset,
           DXMT12_MTL4_NATIVE_BUFFER_RESOURCE_TABLE_BIND_INDEX,
-          all_render_stages);
+          all_render_stages, CompiledBindingDirtyResourceHeap);
       add_argument_buffer(
           frozen->buffer_record_buffer,
           frozen->buffer_record_buffer_offset,
           DXMT12_MTL4_NATIVE_BUFFER_DESCRIPTOR_RECORD_BIND_INDEX,
-          all_render_stages);
+          all_render_stages, CompiledBindingDirtyResourceHeap);
     } else {
       ForEachCompiledDescriptorMirror(tables, [&](DescriptorHeapMirror &mirror) {
         if (!mirror.descriptorTableBackendReady())
@@ -21775,17 +21865,19 @@ private:
             mirror.isSamplerHeap()
                 ? DXMT12_MTL4_NATIVE_SAMPLER_HEAP_BIND_INDEX
                 : DXMT12_MTL4_NATIVE_DESCRIPTOR_HEAP_BIND_INDEX,
-            all_render_stages);
+            all_render_stages,
+            mirror.isSamplerHeap() ? CompiledBindingDirtySamplerHeap
+                                   : CompiledBindingDirtyResourceHeap);
         if (mirror.isSamplerHeap())
           return;
         add_argument_buffer(
             mirror.bufferResourceTableBuffer(), 0,
             DXMT12_MTL4_NATIVE_BUFFER_RESOURCE_TABLE_BIND_INDEX,
-            all_render_stages);
+            all_render_stages, CompiledBindingDirtyResourceHeap);
         add_argument_buffer(
             mirror.bufferDescriptorRecordBuffer(), 0,
             DXMT12_MTL4_NATIVE_BUFFER_DESCRIPTOR_RECORD_BIND_INDEX,
-            all_render_stages);
+            all_render_stages, CompiledBindingDirtyResourceHeap);
       });
     }
 
@@ -21805,23 +21897,29 @@ private:
       if (shader->reflection().NumConstantBuffers) {
         recipe->ops.push_back(CompiledNativeBindingRecipe::Op{
             CompiledNativeBindingOpKind::NullConstantBuffer, {}, 0, 0,
-            compute, render_stages});
+            CompiledBindingDirtyPipelineLayout, 0, compute, render_stages});
       }
       if (NativeShaderUsesBufferSrv(*shader)) {
         recipe->ops.push_back(CompiledNativeBindingRecipe::Op{
-            CompiledNativeBindingOpKind::NullBuffer, {}, 0, 0, compute,
-            render_stages});
+            CompiledNativeBindingOpKind::NullBuffer, {}, 0, 0,
+            CompiledBindingDirtyPipelineLayout, 0, compute, render_stages});
       }
       if (binding->cbuffer_root_base_count) {
         add_argument_buffer(
             native_root_base_buffer, binding->cbuffer_root_base_offset,
             DXMT12_MTL4_NATIVE_CBUFFER_ROOT_TABLE_BASE_BIND_INDEX,
-            render_stages);
+            render_stages,
+            CompiledBindingDirtyPipelineLayout |
+                CompiledBindingDirtyRootTables,
+            binding->cbuffer_root_table_mask);
       }
       if (binding->resource_root_base_count) {
         add_argument_buffer(
             native_root_base_buffer, binding->resource_root_base_offset,
-            DXMT12_MTL4_NATIVE_ROOT_TABLE_BASE_BIND_INDEX, render_stages);
+            DXMT12_MTL4_NATIVE_ROOT_TABLE_BASE_BIND_INDEX, render_stages,
+            CompiledBindingDirtyPipelineLayout |
+                CompiledBindingDirtyRootTables,
+            binding->resource_root_table_mask);
       }
     }
     return recipe;
@@ -21829,8 +21927,27 @@ private:
 
   static void EncodeCompiledNativeBindingRecipe(
       ArgumentEncodingContext &enc,
-      const CompiledNativeBindingRecipe &recipe) {
+      const CompiledNativeBindingRecipe &recipe, uint32_t dirty_fields,
+      uint64_t root_table_dirty_mask,
+      CompiledCommandTestTelemetry *test_telemetry = nullptr) {
     for (const auto &op : recipe.ops) {
+      const auto matching_fields =
+          op.required_dirty_fields & dirty_fields;
+      const bool non_root_dirty =
+          matching_fields & ~CompiledBindingDirtyRootTables;
+      const bool root_dirty =
+          (matching_fields & CompiledBindingDirtyRootTables) &&
+          (!op.root_table_mask || root_table_dirty_mask == UINT64_MAX ||
+           (op.root_table_mask & root_table_dirty_mask));
+      if (!non_root_dirty && !root_dirty) {
+        if (test_telemetry)
+          test_telemetry->encoder_native_binding_ops_skipped.fetch_add(
+              1, std::memory_order_relaxed);
+        continue;
+      }
+      if (test_telemetry)
+        test_telemetry->encoder_native_binding_ops.fetch_add(
+            1, std::memory_order_relaxed);
       switch (op.kind) {
       case CompiledNativeBindingOpKind::ArgumentBuffer:
         enc.bindNativeArgumentBuffer(op.buffer, op.offset, op.index,
@@ -22564,7 +22681,8 @@ private:
       uint64_t &argbuf_offset,
       bool descriptor_accesses_precompiled,
       const CompiledBindingDelta *binding_delta = nullptr,
-      BindlessMirrorDrawDiag *draw_diag = nullptr) {
+      BindlessMirrorDrawDiag *draw_diag = nullptr,
+      CompiledCommandTestTelemetry *test_telemetry = nullptr) {
     assert(payload.root_tables);
     const auto &root_tables = *payload.root_tables;
     BindlessMirrorDrawDiag local_diag = {};
@@ -22585,7 +22703,13 @@ private:
     if (native && tables_dirty) {
       if (payload.native_binding_recipe) {
         EncodeCompiledNativeBindingRecipe(enc,
-                                          *payload.native_binding_recipe);
+                                          *payload.native_binding_recipe,
+                                          dirty_fields,
+                                          binding_delta
+                                              ? binding_delta
+                                                    ->root_table_dirty_mask
+                                          : UINT64_MAX,
+                                          test_telemetry);
       } else {
         EncodeCompiledNativeArgumentTables(
             enc, root_tables, false,
@@ -22944,7 +23068,8 @@ private:
       const SubmittedFrozenNativeDescriptorStore *frozen_native,
       bool descriptor_accesses_precompiled,
       const CompiledNativeBindingRecipe *native_binding_recipe,
-      const CompiledBindingDelta *binding_delta = nullptr) {
+      const CompiledBindingDelta *binding_delta = nullptr,
+      CompiledCommandTestTelemetry *test_telemetry = nullptr) {
     const bool native = pipeline.GetShaderAbiVersion() ==
                         DXMT12_MTL4_SHADER_ABI_NATIVE_DESCRIPTOR_TABLE;
     const uint32_t dirty_fields = binding_delta
@@ -22957,7 +23082,11 @@ private:
                         CompiledBindingDirtyRootTables);
     if (native && tables_dirty) {
       if (native_binding_recipe)
-        EncodeCompiledNativeBindingRecipe(enc, *native_binding_recipe);
+        EncodeCompiledNativeBindingRecipe(
+            enc, *native_binding_recipe, dirty_fields,
+            binding_delta ? binding_delta->root_table_dirty_mask
+                          : UINT64_MAX,
+            test_telemetry);
       else
         EncodeCompiledNativeArgumentTables(
             enc, root_tables, true, {}, frozen_native);
@@ -23047,7 +23176,8 @@ private:
             payload.bindless_snapshot, payload.frozen_native.get(),
             payload.direct_access.descriptor_accesses_precompiled,
             payload.native_binding_recipe.get(),
-            delta_applicable ? &delta : nullptr);
+            delta_applicable ? &delta : nullptr,
+            payload.test_telemetry.get());
         encoder_cache.binding_program = program;
         encoder_cache.descriptor_content_revision =
             payload.descriptor_content_revision;
@@ -25221,7 +25351,7 @@ private:
                                    common.compiled_direct_access
                                        .descriptor_accesses_precompiled,
                                    binding_delta,
-                                   &diag);
+                                   &diag, common.test_telemetry.get());
     diag.path = "compiled-direct";
     common.bindless_diag = diag;
   }

@@ -58,7 +58,9 @@ public:
   ComPtr<ID3D12PipelineState>
   CreateGraphicsPipeline(ID3D12RootSignature *root_signature,
                          DXGI_FORMAT render_target_format,
-                         D3D12_SHADER_BYTECODE pixel_shader) const;
+                         D3D12_SHADER_BYTECODE pixel_shader,
+                         D3D12_CULL_MODE cull_mode =
+                             D3D12_CULL_MODE_BACK) const;
 
   HRESULT UploadTextureAndReset(ID3D12Resource *texture, const void *data,
                                 UINT64 row_pitch, UINT64 slice_pitch,

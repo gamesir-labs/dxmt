@@ -746,6 +746,76 @@ CompiledPipelineFallbackReasonFromMetadata(
   return CompiledCommandFallbackReason::None;
 }
 
+static void HashCompiledBindingLayoutValue(std::uint64_t &hash,
+                                           std::uint64_t value) {
+  hash ^= value + 0x9e3779b97f4a7c15ull + (hash << 6) + (hash >> 2);
+}
+
+static void HashCompiledShaderArgumentLayout(
+    std::uint64_t &hash, const DXMT12_MTL4_SHADER_ARGUMENT *arguments,
+    std::uint32_t count) {
+  HashCompiledBindingLayoutValue(hash, count);
+  for (std::uint32_t index = 0; arguments && index < count; ++index) {
+    const auto &argument = arguments[index];
+    HashCompiledBindingLayoutValue(hash,
+                                   static_cast<std::uint32_t>(argument.Type));
+    HashCompiledBindingLayoutValue(hash, argument.SM50BindingSlot);
+    HashCompiledBindingLayoutValue(hash,
+                                   static_cast<std::uint32_t>(argument.Flags));
+    HashCompiledBindingLayoutValue(hash, argument.StructurePtrOffset);
+    HashCompiledBindingLayoutValue(hash, argument.RegisterSpace);
+    HashCompiledBindingLayoutValue(hash, argument.RegisterLowerBound);
+    HashCompiledBindingLayoutValue(hash, argument.RegisterCount);
+    HashCompiledBindingLayoutValue(hash, argument.CBufferSizeInVec4);
+  }
+}
+
+static std::uint64_t
+CompiledPipelineBindingLayoutFingerprint(const PipelineState &pipeline) {
+  std::uint64_t hash = 1469598103934665603ull;
+  HashCompiledBindingLayoutValue(
+      hash, static_cast<std::uint32_t>(pipeline.GetShaderAbiVersion()));
+  for (const auto &shader : pipeline.GetDxilShaders()) {
+    const auto &reflection = shader.reflection();
+    HashCompiledBindingLayoutValue(hash,
+                                   static_cast<std::uint32_t>(shader.stage));
+    HashCompiledBindingLayoutValue(hash,
+                                   reflection.ConstanttBufferTableBindIndex);
+    HashCompiledBindingLayoutValue(hash, reflection.ArgumentBufferBindIndex);
+    HashCompiledBindingLayoutValue(hash, reflection.ConstantBufferSlotMask);
+    HashCompiledBindingLayoutValue(hash, reflection.SamplerSlotMask);
+    HashCompiledBindingLayoutValue(hash, reflection.UAVSlotMask);
+    HashCompiledBindingLayoutValue(hash, reflection.SRVSlotMaskLo);
+    HashCompiledBindingLayoutValue(hash, reflection.SRVSlotMaskHi);
+    HashCompiledBindingLayoutValue(hash, reflection.ArgumentTableQwords);
+    HashCompiledShaderArgumentLayout(hash, shader.constantBufferInfo(),
+                                     reflection.NumConstantBuffers);
+    HashCompiledShaderArgumentLayout(hash, shader.resourceArgumentInfo(),
+                                     reflection.NumArguments);
+  }
+  return hash;
+}
+
+static std::uint64_t
+CompiledPipelineVertexLayoutFingerprint(const PipelineState &pipeline) {
+  std::uint64_t hash = 1469598103934665603ull;
+  const auto *graphics = pipeline.GetGraphicsState();
+  if (!graphics)
+    return hash;
+  HashCompiledBindingLayoutValue(hash, graphics->input_elements.size());
+  for (const auto &element : graphics->input_elements) {
+    HashCompiledBindingLayoutValue(hash, element.SemanticIndex);
+    HashCompiledBindingLayoutValue(hash, static_cast<std::uint32_t>(
+                                             element.Format));
+    HashCompiledBindingLayoutValue(hash, element.InputSlot);
+    HashCompiledBindingLayoutValue(hash, element.AlignedByteOffset);
+    HashCompiledBindingLayoutValue(
+        hash, static_cast<std::uint32_t>(element.InputSlotClass));
+    HashCompiledBindingLayoutValue(hash, element.InstanceDataStepRate);
+  }
+  return hash;
+}
+
 static CompiledCommandPipelineMetadata
 BuildCompiledPipelineMetadata(const CompiledCommandBuildState &state,
                               bool compute) {
@@ -769,6 +839,10 @@ BuildCompiledPipelineMetadata(const CompiledCommandBuildState &state,
   }
 
   metadata.type = pipeline->GetType();
+  metadata.binding_layout_fingerprint =
+      CompiledPipelineBindingLayoutFingerprint(*pipeline);
+  metadata.vertex_layout_fingerprint =
+      CompiledPipelineVertexLayoutFingerprint(*pipeline);
   metadata.shader_abi_version = pipeline->GetShaderAbiVersion();
   // The shader ABI is selected when the PSO is created, against the PSO's
   // root signature. A command list may bind a distinct but compatible root
@@ -1378,8 +1452,10 @@ BuildCompiledNativeRootBasesForArguments(
     const std::vector<CompiledCommandRootDescriptorTable> &tables,
     const RootSignature &root, PipelineShaderStage stage,
     const DXMT12_MTL4_SHADER_ARGUMENT *arguments, uint32_t argument_count,
-    std::vector<uint32_t> &out) {
+    std::vector<uint32_t> &out, std::uint64_t *root_table_mask = nullptr) {
   out.clear();
+  if (root_table_mask)
+    *root_table_mask = 0;
   if (!arguments || !argument_count)
     return CompiledCommandFallbackReason::None;
 
@@ -1452,6 +1528,8 @@ BuildCompiledNativeRootBasesForArguments(
                 table->heap_index, table->heap_count, range_offset, local,
                 count, &resolved_base))
           return CompiledCommandFallbackReason::NativeDescriptorHeapTail;
+        if (root_table_mask && root_index < 64)
+          *root_table_mask |= std::uint64_t{1} << root_index;
         matches++;
       }
     }
@@ -1497,14 +1575,16 @@ BuildCompiledNativeStageBinding(
   std::vector<uint32_t> cbuffer_bases;
   auto reason = BuildCompiledNativeRootBasesForArguments(
       tables, root, stage, shader->constantBufferInfo(),
-      shader->reflection().NumConstantBuffers, cbuffer_bases);
+      shader->reflection().NumConstantBuffers, cbuffer_bases,
+      &out.cbuffer_root_table_mask);
   if (reason != CompiledCommandFallbackReason::None)
     return reason;
 
   std::vector<uint32_t> resource_bases;
   reason = BuildCompiledNativeRootBasesForArguments(
       tables, root, stage, shader->resourceArgumentInfo(),
-      shader->reflection().NumArguments, resource_bases);
+      shader->reflection().NumArguments, resource_bases,
+      &out.resource_root_table_mask);
   if (reason != CompiledCommandFallbackReason::None)
     return reason;
 
@@ -2483,7 +2563,8 @@ static void BuildCompiledVertexBindingRecipes(CompiledCommandList &compiled) {
   for (auto &packet : compiled.graphics_packets.mutableView()) {
     const bool can_reuse =
         previous &&
-        previous->pipeline.metadata.pipeline == packet.pipeline.metadata.pipeline &&
+        previous->pipeline.metadata.vertex_layout_fingerprint ==
+            packet.pipeline.metadata.vertex_layout_fingerprint &&
         previous->input_assembler.vertex_buffers.identity() ==
             packet.input_assembler.vertex_buffers.identity() &&
         previous->input_assembler.vertex_buffer_dirty_mask ==
@@ -2507,11 +2588,12 @@ static bool CompiledBindingProgramMatchesPacket(
     const CompiledBindingProgram &program, const Packet &packet,
     bool compute) {
   if (program.compute != compute ||
-      program.pipeline.pipeline_state.ptr() !=
-          packet.pipeline.pipeline_state.ptr() ||
       program.pipeline.root_signature.ptr() !=
           packet.pipeline.root_signature.ptr() ||
-      program.pipeline.metadata.pipeline != packet.pipeline.metadata.pipeline ||
+      program.pipeline.metadata.shader_abi_version !=
+          packet.pipeline.metadata.shader_abi_version ||
+      program.pipeline.metadata.binding_layout_fingerprint !=
+          packet.pipeline.metadata.binding_layout_fingerprint ||
       program.descriptor_heaps.cbv_srv_uav.ptr() !=
           packet.descriptor_heaps.cbv_srv_uav.ptr() ||
       program.descriptor_heaps.sampler.ptr() !=
@@ -2534,7 +2616,10 @@ static CompiledBindingDelta BuildCompiledBindingDelta(
   CompiledBindingDelta delta = {};
   const bool layout_changed =
       !previous || previous->compute != compute ||
-      previous->pipeline.metadata.pipeline != packet.pipeline.metadata.pipeline ||
+      previous->pipeline.metadata.shader_abi_version !=
+          packet.pipeline.metadata.shader_abi_version ||
+      previous->pipeline.metadata.binding_layout_fingerprint !=
+          packet.pipeline.metadata.binding_layout_fingerprint ||
       previous->pipeline.root_signature.ptr() !=
           packet.pipeline.root_signature.ptr();
   delta.full_bind = layout_changed;
@@ -3761,6 +3846,23 @@ PrepareSubmittedCompiledCommandListImpl(
   };
   plan->graphics_packets.reserve(plan->generation->graphics_packets.size());
   plan->compute_packets.reserve(plan->generation->compute_packets.size());
+  struct GraphicsNativeBindingPlan {
+    CompiledNativeStageBinding vertex;
+    CompiledNativeStageBinding pixel;
+    CompiledCommandFallbackReason reason =
+        CompiledCommandFallbackReason::None;
+  };
+  struct ComputeNativeBindingPlan {
+    CompiledNativeStageBinding compute;
+    CompiledCommandFallbackReason reason =
+        CompiledCommandFallbackReason::None;
+  };
+  std::unordered_map<const CompiledBindingProgram *,
+                     GraphicsNativeBindingPlan>
+      graphics_native_binding_cache;
+  std::unordered_map<const CompiledBindingProgram *,
+                     ComputeNativeBindingPlan>
+      compute_native_binding_cache;
 
   for (const auto &packet : plan->generation->graphics_packets) {
     SubmittedCompiledGraphicsPacket submitted = {};
@@ -3775,10 +3877,30 @@ PrepareSubmittedCompiledCommandListImpl(
     submitted.root_tables = materialized.tables;
     auto reason = materialized.reason;
     if (reason == CompiledCommandFallbackReason::None &&
-        !defer_native_binding_payload)
-      reason = BuildCompiledGraphicsNativeBindings(
-          packet.pipeline, *submitted.root_tables, submitted.native_vertex,
-          submitted.native_pixel, native_payloads);
+        !defer_native_binding_payload) {
+      const auto *program = packet.binding_program.get();
+      const auto cached =
+          program ? graphics_native_binding_cache.find(program)
+                  : graphics_native_binding_cache.end();
+      if (cached != graphics_native_binding_cache.end()) {
+        submitted.native_vertex = cached->second.vertex;
+        submitted.native_pixel = cached->second.pixel;
+        reason = cached->second.reason;
+        if (plan->generation->test_telemetry)
+          plan->generation->test_telemetry
+              ->submitted_native_binding_plan_reuses.fetch_add(
+                  1, std::memory_order_relaxed);
+      } else {
+        reason = BuildCompiledGraphicsNativeBindings(
+            packet.pipeline, *submitted.root_tables, submitted.native_vertex,
+            submitted.native_pixel, native_payloads);
+        if (program)
+          graphics_native_binding_cache.emplace(
+              program,
+              GraphicsNativeBindingPlan{submitted.native_vertex,
+                                        submitted.native_pixel, reason});
+      }
+    }
     submitted.prepare_reason = reason;
     plan->graphics_packets.push_back(std::move(submitted));
     if (plan->generation->test_telemetry) {
@@ -3803,10 +3925,28 @@ PrepareSubmittedCompiledCommandListImpl(
     submitted.root_tables = materialized.tables;
     auto reason = materialized.reason;
     if (reason == CompiledCommandFallbackReason::None &&
-        !defer_native_binding_payload)
-      reason = BuildCompiledComputeNativeBindings(
-          packet.pipeline, *submitted.root_tables, submitted.native_compute,
-          native_payloads);
+        !defer_native_binding_payload) {
+      const auto *program = packet.binding_program.get();
+      const auto cached =
+          program ? compute_native_binding_cache.find(program)
+                  : compute_native_binding_cache.end();
+      if (cached != compute_native_binding_cache.end()) {
+        submitted.native_compute = cached->second.compute;
+        reason = cached->second.reason;
+        if (plan->generation->test_telemetry)
+          plan->generation->test_telemetry
+              ->submitted_native_binding_plan_reuses.fetch_add(
+                  1, std::memory_order_relaxed);
+      } else {
+        reason = BuildCompiledComputeNativeBindings(
+            packet.pipeline, *submitted.root_tables, submitted.native_compute,
+            native_payloads);
+        if (program)
+          compute_native_binding_cache.emplace(
+              program,
+              ComputeNativeBindingPlan{submitted.native_compute, reason});
+      }
+    }
     submitted.prepare_reason = reason;
     plan->compute_packets.push_back(std::move(submitted));
     if (plan->generation->test_telemetry) {
@@ -4129,6 +4269,12 @@ BuildExecutionPathTestStats(const CompiledCommandList &compiled) {
     stats.submitted_root_table_full_materializations =
         telemetry.submitted_root_table_full_materializations.load(
             std::memory_order_acquire);
+    stats.submitted_native_binding_plan_reuses =
+        telemetry.submitted_native_binding_plan_reuses.load(
+            std::memory_order_acquire);
+    stats.submitted_native_binding_recipe_reuses =
+        telemetry.submitted_native_binding_recipe_reuses.load(
+            std::memory_order_acquire);
     stats.replayed_fallback_ranges =
         telemetry.replayed_fallback_ranges.load(std::memory_order_acquire);
     stats.replayed_fallback_records =
@@ -4152,6 +4298,11 @@ BuildExecutionPathTestStats(const CompiledCommandList &compiled) {
             std::memory_order_acquire);
     stats.encoder_binding_program_hits =
         telemetry.encoder_binding_program_hits.load(
+            std::memory_order_acquire);
+    stats.encoder_native_binding_ops =
+        telemetry.encoder_native_binding_ops.load(std::memory_order_acquire);
+    stats.encoder_native_binding_ops_skipped =
+        telemetry.encoder_native_binding_ops_skipped.load(
             std::memory_order_acquire);
     stats.encoder_resource_plan_publications =
         telemetry.encoder_resource_plan_publications.load(

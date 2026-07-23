@@ -109,6 +109,8 @@ struct ExecutionPathStats {
   std::uint32_t encoder_full_binding_programs = 0;
   std::uint32_t encoder_delta_binding_programs = 0;
   std::uint32_t encoder_binding_program_hits = 0;
+  std::uint32_t encoder_native_binding_ops = 0;
+  std::uint32_t encoder_native_binding_ops_skipped = 0;
   std::uint32_t encoder_resource_plan_publications = 0;
   std::uint32_t encoder_resource_plan_reuses = 0;
   std::uint32_t encoder_graph_node_count = 0;
@@ -121,6 +123,8 @@ struct ExecutionPathStats {
   std::uint32_t close_materialized_root_table_sets = 0;
   std::uint32_t submitted_root_table_fast_patches = 0;
   std::uint32_t submitted_root_table_full_materializations = 0;
+  std::uint32_t submitted_native_binding_plan_reuses = 0;
+  std::uint32_t submitted_native_binding_recipe_reuses = 0;
   std::uint32_t close_dynamic_render_state_recipes = 0;
   std::uint32_t close_vertex_binding_recipes = 0;
   std::uint32_t close_direct_access_plans = 0;
