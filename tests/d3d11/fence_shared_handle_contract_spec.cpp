@@ -132,9 +132,10 @@ const dxmt::test::TestCostRegistration kOpenInterfaceCost(
 const dxmt::test::TestCostRegistration kCreateOutputCost(
     "D3D11FenceSharedHandleContractSpec.RejectsNullSharedHandleOutput",
     dxmt::test::kResourceTestCost);
-const dxmt::test::TestCostRegistration kDuplicateNameCost(
-    "D3D11FenceSharedHandleContractSpec.RejectsDuplicateLiveName",
-    dxmt::test::kResourceTestCost);
+const dxmt::test::TestCostRegistration
+    kDuplicateNameCost("D3D11FenceSharedHandleContractSpec."
+                       "RejectsDuplicateLiveNamesCaseInsensitively",
+                       dxmt::test::kResourceTestCost);
 
 struct ScopedHandle {
   ScopedHandle() = default;
@@ -341,11 +342,14 @@ TEST_F(D3D11FenceSharedHandleContractSpec, RejectsNullSharedHandleOutput) {
   EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
 }
 
-TEST_F(D3D11FenceSharedHandleContractSpec, RejectsDuplicateLiveName) {
+TEST_F(D3D11FenceSharedHandleContractSpec,
+       RejectsDuplicateLiveNamesCaseInsensitively) {
   ComPtr<ID3D11Fence> first_fence = CreateSharedFence();
   ComPtr<ID3D11Fence> second_fence = CreateSharedFence();
+  ComPtr<ID3D11Fence> variant_fence = CreateSharedFence();
   ASSERT_TRUE(first_fence);
   ASSERT_TRUE(second_fence);
+  ASSERT_TRUE(variant_fence);
 
   std::array<wchar_t, MAX_PATH> shared_name = {};
   const auto name_id = static_cast<unsigned long long>(
@@ -371,7 +375,21 @@ TEST_F(D3D11FenceSharedHandleContractSpec, RejectsDuplicateLiveName) {
             DXGI_ERROR_NAME_ALREADY_EXISTS);
   EXPECT_EQ(duplicate_handle.handle,
             reinterpret_cast<HANDLE>(std::uintptr_t{1}));
-  duplicate_handle.handle = nullptr;
+  if (duplicate_handle.handle == reinterpret_cast<HANDLE>(std::uintptr_t{1}))
+    duplicate_handle.handle = nullptr;
+
+  std::array<wchar_t, MAX_PATH> case_variant_name = shared_name;
+  ASSERT_EQ(case_variant_name[0], L'D');
+  case_variant_name[0] = L'd';
+  ScopedHandle variant_handle;
+  variant_handle.handle = reinterpret_cast<HANDLE>(std::uintptr_t{1});
+  EXPECT_EQ(variant_fence->CreateSharedHandle(nullptr, GENERIC_ALL,
+                                              case_variant_name.data(),
+                                              &variant_handle.handle),
+            DXGI_ERROR_NAME_ALREADY_EXISTS);
+  EXPECT_EQ(variant_handle.handle, reinterpret_cast<HANDLE>(std::uintptr_t{1}));
+  if (variant_handle.handle == reinterpret_cast<HANDLE>(std::uintptr_t{1}))
+    variant_handle.handle = nullptr;
   EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
 }
 
