@@ -10332,6 +10332,10 @@ private:
                 {{PipelineStage::Vertex, &native_vertex},
                  {PipelineStage::Pixel, &native_pixel}});
           }
+          const uint64_t binding_fingerprint =
+              BuildCompiledDirectGraphicsBindingFingerprint(
+                  packet, prepared, pipeline, root,
+                  vertex_binding_recipe.get(), bindless_snapshot.get());
           if (packet.draw) {
             RecordGraphicsPipelineResourceAccess(
                 chunk, state, *pipeline, nullptr, submitted_snapshot.get());
@@ -10340,7 +10344,9 @@ private:
             replay_packet.common.depth_stencil = metal->depth_stencil;
             replay_packet.common.rasterizer = metal->rasterizer;
             replay_packet.common.pipeline = pipeline;
-            replay_packet.common.binding_generation = packet.record_index + 1;
+            replay_packet.common.binding_generation = binding_fingerprint;
+            replay_packet.common.binding_content_fingerprint =
+                binding_fingerprint;
             replay_packet.common.descriptor_content_revision =
                 GetDescriptorContentRevision();
             replay_packet.common.pixel_shader_demote_msaa_srv_mask_lo =
@@ -10415,7 +10421,9 @@ private:
             replay_packet.common.depth_stencil = metal->depth_stencil;
             replay_packet.common.rasterizer = metal->rasterizer;
             replay_packet.common.pipeline = pipeline;
-            replay_packet.common.binding_generation = packet.record_index + 1;
+            replay_packet.common.binding_generation = binding_fingerprint;
+            replay_packet.common.binding_content_fingerprint =
+                binding_fingerprint;
             replay_packet.common.descriptor_content_revision =
                 GetDescriptorContentRevision();
             replay_packet.common.pixel_shader_demote_msaa_srv_mask_lo =
@@ -22104,6 +22112,36 @@ private:
       slot->valid = true;
       slot->address = entry.address;
     }
+  }
+
+  static uint64_t BuildCompiledDirectGraphicsBindingFingerprint(
+      const CompiledGraphicsPacket &packet,
+      const SubmittedCompiledGraphicsPacket &prepared,
+      const PipelineState *pipeline, const RootSignature *root,
+      const CompiledVertexBindingRecipe *vertex_binding_recipe,
+      const GraphicsBindingSnapshot *bindless_snapshot) {
+    uint64_t fingerprint = kGraphicsBindingFingerprintOffset;
+    HashGraphicsBindingPointer(fingerprint, pipeline);
+    HashGraphicsBindingPointer(fingerprint, root);
+    HashGraphicsBindingPointer(fingerprint, prepared.root_tables.get());
+    HashGraphicsBindingPointer(fingerprint,
+                               packet.descriptor_heaps.cbv_srv_uav.ptr());
+    HashGraphicsBindingPointer(fingerprint,
+                               packet.descriptor_heaps.sampler.ptr());
+    HashGraphicsBindingPointer(fingerprint, packet.root_constants.identity());
+    HashGraphicsBindingPointer(fingerprint,
+                               packet.root_descriptors.identity());
+    HashGraphicsBindingPointer(fingerprint, vertex_binding_recipe);
+    if (!vertex_binding_recipe) {
+      HashGraphicsBindingPointer(
+          fingerprint, packet.input_assembler.vertex_buffers.identity());
+      HashGraphicsBindingValue(
+          fingerprint, packet.input_assembler.vertex_buffer_dirty_mask);
+    }
+    if (bindless_snapshot)
+      HashGraphicsBindingValue(fingerprint,
+                               bindless_snapshot->content_fingerprint);
+    return fingerprint;
   }
 
   static void AddCompiledDirectEncoderAccess(
