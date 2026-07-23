@@ -505,7 +505,7 @@ public:
     const auto *metadata =
         FindDeviceCounterMetadata(counters_, pCounterDesc->Counter);
     if (!metadata)
-      return DXGI_ERROR_UNSUPPORTED;
+      return E_INVALIDARG;
 
     return CreateDeviceCounter(this, *metadata, ppCounter);
   }
@@ -657,7 +657,7 @@ public:
     const auto *metadata =
         FindDeviceCounterMetadata(counters_, pDesc->Counter);
     if (!metadata)
-      return DXGI_ERROR_UNSUPPORTED;
+      return E_INVALIDARG;
 
     return CopyDeviceCounterMetadata(
         *metadata, pType, pActiveCounters, szName, pNameLength, szUnits,
