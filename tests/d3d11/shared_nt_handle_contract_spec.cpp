@@ -25,6 +25,15 @@ const dxmt::test::TestCostRegistration
 const dxmt::test::TestCostRegistration kKeyOwnershipCost(
     "D3D11SharedNtHandleContractSpec.TransfersKeyOwnershipBetweenDevices",
     dxmt::test::kResourceTestCost);
+const dxmt::test::TestCostRegistration kInitialKeyCost(
+    "D3D11SharedNtHandleContractSpec.InitialStateAcceptsOnlyKeyZero",
+    dxmt::test::kResourceTestCost);
+const dxmt::test::TestCostRegistration kExactReleasedKeyCost(
+    "D3D11SharedNtHandleContractSpec.ReleasedStateRequiresExactKey",
+    dxmt::test::kResourceTestCost);
+const dxmt::test::TestCostRegistration
+    kNonOwnerReleaseCost("D3D11SharedNtHandleContractSpec.NonOwnerReleaseFails",
+                         dxmt::test::kResourceTestCost);
 
 struct ScopedNtHandle {
   ScopedNtHandle() = default;
@@ -177,6 +186,34 @@ TEST_F(D3D11SharedNtHandleContractSpec, TransfersKeyOwnershipBetweenDevices) {
   ASSERT_EQ(opened_mutex_->ReleaseSync(13), S_OK);
 
   ASSERT_EQ(creator_mutex_->AcquireSync(13, 0), S_OK);
+  ASSERT_EQ(creator_mutex_->ReleaseSync(0), S_OK);
+  EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
+  EXPECT_EQ(second_device_->GetDeviceRemovedReason(), S_OK);
+}
+
+TEST_F(D3D11SharedNtHandleContractSpec, InitialStateAcceptsOnlyKeyZero) {
+  EXPECT_EQ(creator_mutex_->AcquireSync(1, 0),
+            static_cast<HRESULT>(WAIT_TIMEOUT));
+  ASSERT_EQ(opened_mutex_->AcquireSync(0, 0), S_OK);
+  ASSERT_EQ(opened_mutex_->ReleaseSync(0), S_OK);
+  EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
+  EXPECT_EQ(second_device_->GetDeviceRemovedReason(), S_OK);
+}
+
+TEST_F(D3D11SharedNtHandleContractSpec, ReleasedStateRequiresExactKey) {
+  ASSERT_EQ(creator_mutex_->AcquireSync(0, 0), S_OK);
+  ASSERT_EQ(creator_mutex_->ReleaseSync(9), S_OK);
+  EXPECT_EQ(opened_mutex_->AcquireSync(8, 0),
+            static_cast<HRESULT>(WAIT_TIMEOUT));
+  ASSERT_EQ(opened_mutex_->AcquireSync(9, 0), S_OK);
+  ASSERT_EQ(opened_mutex_->ReleaseSync(0), S_OK);
+  EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
+  EXPECT_EQ(second_device_->GetDeviceRemovedReason(), S_OK);
+}
+
+TEST_F(D3D11SharedNtHandleContractSpec, NonOwnerReleaseFails) {
+  EXPECT_EQ(opened_mutex_->ReleaseSync(5), E_FAIL);
+  ASSERT_EQ(creator_mutex_->AcquireSync(0, 0), S_OK);
   ASSERT_EQ(creator_mutex_->ReleaseSync(0), S_OK);
   EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
   EXPECT_EQ(second_device_->GetDeviceRemovedReason(), S_OK);
