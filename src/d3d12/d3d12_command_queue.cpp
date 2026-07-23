@@ -7063,6 +7063,8 @@ private:
     std::shared_ptr<GraphicsBindingSnapshot> bindless_snapshot;
     std::shared_ptr<SubmittedFrozenNativeDescriptorStore> frozen_native;
     std::shared_ptr<const CompiledNativeBindingRecipe> native_binding_recipe;
+    dxmt::DescriptorContentRevision descriptor_content_revision = {};
+    uint64_t binding_content_fingerprint = 0;
   };
 
   struct ReplayDispatchPacket {
@@ -10381,6 +10383,8 @@ private:
             replay_packet.common.depth_stencil = metal->depth_stencil;
             replay_packet.common.rasterizer = metal->rasterizer;
             replay_packet.common.pipeline = pipeline;
+            replay_packet.common.binding_program = packet.binding_program;
+            replay_packet.common.binding_delta = packet.binding_delta;
             replay_packet.common.binding_generation = binding_fingerprint;
             replay_packet.common.binding_content_fingerprint =
                 binding_fingerprint;
@@ -10458,6 +10462,8 @@ private:
             replay_packet.common.depth_stencil = metal->depth_stencil;
             replay_packet.common.rasterizer = metal->rasterizer;
             replay_packet.common.pipeline = pipeline;
+            replay_packet.common.binding_program = packet.binding_program;
+            replay_packet.common.binding_delta = packet.binding_delta;
             replay_packet.common.binding_generation = binding_fingerprint;
             replay_packet.common.binding_content_fingerprint =
                 binding_fingerprint;
@@ -10710,6 +10716,24 @@ private:
           binding_payload.frozen_native = frozen_native;
           binding_payload.native_binding_recipe = native_binding_recipe;
           binding_payload.root = root;
+          binding_payload.descriptor_content_revision =
+              submitted_snapshot
+                  ? submitted_snapshot->descriptor_content_revision
+                  : dxmt::DescriptorContentRevision{
+                        reinterpret_cast<uintptr_t>(packet.binding_program.get()),
+                        reinterpret_cast<uintptr_t>(prepared.root_tables.get())};
+          binding_payload.binding_content_fingerprint =
+              kGraphicsBindingFingerprintOffset;
+          HashGraphicsBindingPointer(
+              binding_payload.binding_content_fingerprint,
+              packet.binding_program.get());
+          HashGraphicsBindingPointer(
+              binding_payload.binding_content_fingerprint,
+              prepared.root_tables.get());
+          if (submitted_snapshot)
+            HashGraphicsBindingValue(
+                binding_payload.binding_content_fingerprint,
+                submitted_snapshot->content_fingerprint);
           if (!native_packet) {
             binding_payload.bindless_snapshot =
                 submitted_snapshot
@@ -21892,23 +21916,37 @@ private:
   void EncodeCompiledRootPayloads(ArgumentEncodingContext &enc,
                                   const CompiledPacketBindingState &binding_state,
                                   const PipelineState &pipeline,
-                                  const RootSignature &root, bool compute) {
+                                  const RootSignature &root, bool compute,
+                                  uint64_t constant_dirty_mask = UINT64_MAX,
+                                  uint64_t descriptor_dirty_mask = UINT64_MAX) {
     const auto parameters = root.GetParameters();
     for (UINT root_index = 0; root_index < parameters.size(); root_index++) {
       const auto &parameter = parameters[root_index];
       if (parameter.parameter_type ==
           D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS) {
+        if (root_index < 64 &&
+            !(constant_dirty_mask & (uint64_t(1) << root_index)))
+          continue;
         BindCompiledRootConstants(enc, binding_state, pipeline, compute,
                                   root_index, parameter);
       } else if (parameter.parameter_type == D3D12_ROOT_PARAMETER_TYPE_CBV) {
+        if (root_index < 64 &&
+            !(descriptor_dirty_mask & (uint64_t(1) << root_index)))
+          continue;
         BindCompiledRootDescriptor(enc, binding_state, pipeline, compute,
                                    root_index, parameter,
                                    DescriptorRecordType::ConstantBufferView);
       } else if (parameter.parameter_type == D3D12_ROOT_PARAMETER_TYPE_SRV) {
+        if (root_index < 64 &&
+            !(descriptor_dirty_mask & (uint64_t(1) << root_index)))
+          continue;
         BindCompiledRootDescriptor(enc, binding_state, pipeline, compute,
                                    root_index, parameter,
                                    DescriptorRecordType::ShaderResourceView);
       } else if (parameter.parameter_type == D3D12_ROOT_PARAMETER_TYPE_UAV) {
+        if (root_index < 64 &&
+            !(descriptor_dirty_mask & (uint64_t(1) << root_index)))
+          continue;
         BindCompiledRootDescriptor(enc, binding_state, pipeline, compute,
                                    root_index, parameter,
                                    DescriptorRecordType::UnorderedAccessView);
@@ -22057,12 +22095,14 @@ private:
   void EncodeCompiledVertexBindingRecipe(
       ArgumentEncodingContext &enc,
       const CompiledVertexBindingRecipe &recipe,
-      uint64_t &argbuf_offset) {
+      uint64_t &argbuf_offset, uint32_t dirty_mask = UINT32_MAX) {
     for (UINT slot = 0; slot < 32; ++slot) {
-      if (recipe.cleared_slot_mask & (1u << slot))
+      if ((dirty_mask & recipe.cleared_slot_mask) & (1u << slot))
         enc.bindVertexBuffer(slot, 0, 0, Rc<Buffer>());
     }
     for (const auto &binding : recipe.bindings) {
+      if (binding.slot < 32 && !(dirty_mask & (1u << binding.slot)))
+        continue;
       enc.bindVertexBuffer(binding.slot, binding.offset, binding.stride,
                            Rc<Buffer>(binding.buffer));
     }
@@ -22081,6 +22121,7 @@ private:
       PipelineState &pipeline, RootSignature &root,
       uint64_t &argbuf_offset,
       bool descriptor_accesses_precompiled,
+      const CompiledBindingDelta *binding_delta = nullptr,
       BindlessMirrorDrawDiag *draw_diag = nullptr) {
     assert(payload.root_tables);
     const auto &root_tables = *payload.root_tables;
@@ -22091,7 +22132,15 @@ private:
     diag.path = "compiled-direct";
     const bool native = pipeline.GetShaderAbiVersion() ==
                         DXMT12_MTL4_SHADER_ABI_NATIVE_DESCRIPTOR_TABLE;
-    if (native) {
+    const uint32_t dirty_fields = binding_delta
+                                      ? binding_delta->dirty_fields
+                                      : UINT32_MAX;
+    const bool tables_dirty =
+        dirty_fields & (CompiledBindingDirtyPipelineLayout |
+                        CompiledBindingDirtyResourceHeap |
+                        CompiledBindingDirtySamplerHeap |
+                        CompiledBindingDirtyRootTables);
+    if (native && tables_dirty) {
       if (payload.native_binding_recipe) {
         EncodeCompiledNativeBindingRecipe(enc,
                                           *payload.native_binding_recipe);
@@ -22102,10 +22151,13 @@ private:
             payload.frozen_native.get());
       }
     }
-    if (payload.vertex_binding_recipe) {
+    if ((dirty_fields & CompiledBindingDirtyVertexBuffers) &&
+        payload.vertex_binding_recipe) {
       EncodeCompiledVertexBindingRecipe(
-          enc, *payload.vertex_binding_recipe, argbuf_offset);
-    } else {
+          enc, *payload.vertex_binding_recipe, argbuf_offset,
+          binding_delta ? binding_delta->vertex_buffer_dirty_mask
+                        : UINT32_MAX);
+    } else if (dirty_fields & CompiledBindingDirtyVertexBuffers) {
       EncodeCompiledVertexBuffers(enc, payload.input_assembler,
                                   pipeline.GetGraphicsState(), argbuf_offset);
     }
@@ -22115,7 +22167,18 @@ private:
     // again on the asynchronous encoder thread.
     if (native && payload.native_binding_recipe)
       return;
-    EncodeCompiledRootPayloads(enc, binding_state, pipeline, root, false);
+    const uint64_t constant_mask =
+        binding_delta ? binding_delta->root_constant_dirty_mask : UINT64_MAX;
+    const uint64_t descriptor_mask =
+        binding_delta ? binding_delta->root_descriptor_dirty_mask : UINT64_MAX;
+    EncodeCompiledRootPayloads(enc, binding_state, pipeline, root, false,
+                               constant_mask, descriptor_mask);
+    const bool shader_bindings_dirty =
+        tables_dirty ||
+        (dirty_fields & (CompiledBindingDirtyRootConstants |
+                         CompiledBindingDirtyRootDescriptors));
+    if (!shader_bindings_dirty)
+      return;
     const auto &key = pipeline.GetShaderCacheKey();
     for (const auto &shader : pipeline.GetDxilShaders()) {
       if (shader.stage == PipelineShaderStage::Vertex) {
@@ -22373,6 +22436,29 @@ private:
       }
     };
     for (const auto &access : list.encoder_accesses) {
+      const EncoderResourcePlanKey key = {
+          reinterpret_cast<uintptr_t>(access.buffer
+                                          ? static_cast<const void *>(
+                                                access.buffer.ptr())
+                                          : static_cast<const void *>(
+                                                access.texture.ptr())),
+          access.offset,
+          access.length,
+          access.view_id,
+          static_cast<uint8_t>(access.stage),
+          static_cast<uint8_t>(access.kind)};
+      auto &published =
+          access.stage == PipelineStage::Compute
+              ? static_cast<ComputeEncoderData *>(enc.currentEncoder())
+                    ->resource_plan_accesses
+              : enc.currentRenderEncoder()->resource_plan_accesses;
+      auto [published_it, inserted] = published.try_emplace(key, access.flags);
+      if (!inserted) {
+        const int new_flags = access.flags & ~published_it->second;
+        if (!new_flags)
+          continue;
+        published_it->second |= access.flags;
+      }
       switch (access.stage) {
       case PipelineStage::Compute:
         publish.template operator()<PipelineStage::Compute>(access);
@@ -22407,10 +22493,19 @@ private:
       const std::shared_ptr<GraphicsBindingSnapshot> &bindless_snapshot,
       const SubmittedFrozenNativeDescriptorStore *frozen_native,
       bool descriptor_accesses_precompiled,
-      const CompiledNativeBindingRecipe *native_binding_recipe) {
+      const CompiledNativeBindingRecipe *native_binding_recipe,
+      const CompiledBindingDelta *binding_delta = nullptr) {
     const bool native = pipeline.GetShaderAbiVersion() ==
                         DXMT12_MTL4_SHADER_ABI_NATIVE_DESCRIPTOR_TABLE;
-    if (native) {
+    const uint32_t dirty_fields = binding_delta
+                                      ? binding_delta->dirty_fields
+                                      : UINT32_MAX;
+    const bool tables_dirty =
+        dirty_fields & (CompiledBindingDirtyPipelineLayout |
+                        CompiledBindingDirtyResourceHeap |
+                        CompiledBindingDirtySamplerHeap |
+                        CompiledBindingDirtyRootTables);
+    if (native && tables_dirty) {
       if (native_binding_recipe)
         EncodeCompiledNativeBindingRecipe(enc, *native_binding_recipe);
       else
@@ -22420,7 +22515,15 @@ private:
     RecordBindlessMirrorDiagDispatch();
     if (native && native_binding_recipe)
       return;
-    EncodeCompiledRootPayloads(enc, binding_state, pipeline, root, true);
+    EncodeCompiledRootPayloads(
+        enc, binding_state, pipeline, root, true,
+        binding_delta ? binding_delta->root_constant_dirty_mask : UINT64_MAX,
+        binding_delta ? binding_delta->root_descriptor_dirty_mask
+                      : UINT64_MAX);
+    if (!tables_dirty &&
+        !(dirty_fields & (CompiledBindingDirtyRootConstants |
+                          CompiledBindingDirtyRootDescriptors)))
+      return;
     const auto &key = pipeline.GetShaderCacheKey();
     for (const auto &shader : pipeline.GetDxilShaders()) {
       if (shader.stage != PipelineShaderStage::Compute)
@@ -22445,23 +22548,57 @@ private:
     const auto encode_begin =
         perf_enabled ? clock::now() : clock::time_point{};
 
-    auto &set_pso = enc.encodeComputeCommand<wmtcmd_compute_setpso>();
-    set_pso.type = WMTComputeCommandSetPSO;
-    set_pso.pso = packet.metal_pso;
-    set_pso.threadgroup_size = packet.threadgroup_size;
+    auto *compute_encoder =
+        static_cast<ComputeEncoderData *>(enc.currentEncoder());
+    auto &encoder_cache = compute_encoder->binding_state_cache;
+    if (!encoder_cache.pipeline_valid ||
+        encoder_cache.pso_handle != packet.metal_pso.handle ||
+        std::memcmp(&encoder_cache.threadgroup_size, &packet.threadgroup_size,
+                    sizeof(packet.threadgroup_size)) != 0) {
+      auto &set_pso = enc.encodeComputeCommand<wmtcmd_compute_setpso>();
+      set_pso.type = WMTComputeCommandSetPSO;
+      set_pso.pso = packet.metal_pso;
+      set_pso.threadgroup_size = packet.threadgroup_size;
+      encoder_cache.pso_handle = packet.metal_pso.handle;
+      encoder_cache.threadgroup_size = packet.threadgroup_size;
+      encoder_cache.pipeline_valid = true;
+    }
 
     if (compiled) {
       auto &payload = *packet.compiled_binding_payload;
       assert(payload.root_tables);
-      PublishCompiledDirectAccessListForEncode(enc, payload.direct_access);
-      EncodeCompiledComputeBindings(
-          enc, payload.packet, *payload.root_tables, payload.native_compute,
-          payload.binding_state, *packet.pipeline,
-          *payload.root, argbuf_offset, payload.native_root_base_buffer,
-          payload.bindless_snapshot, payload.frozen_native.get(),
-          payload.direct_access.descriptor_accesses_precompiled,
-          payload.native_binding_recipe.get());
+      const auto *program = payload.packet.binding_program.get();
+      const bool binding_hit =
+          encoder_cache.binding_valid &&
+          encoder_cache.binding_program == program &&
+          encoder_cache.descriptor_content_revision ==
+              payload.descriptor_content_revision &&
+          encoder_cache.content_fingerprint ==
+              payload.binding_content_fingerprint;
+      if (!binding_hit) {
+        const auto &delta = payload.packet.binding_delta;
+        const bool delta_applicable =
+            encoder_cache.binding_valid && delta.base_program &&
+            encoder_cache.binding_program == delta.base_program.get();
+        PublishCompiledDirectAccessListForEncode(enc, payload.direct_access);
+        EncodeCompiledComputeBindings(
+            enc, payload.packet, *payload.root_tables, payload.native_compute,
+            payload.binding_state, *packet.pipeline,
+            *payload.root, argbuf_offset, payload.native_root_base_buffer,
+            payload.bindless_snapshot, payload.frozen_native.get(),
+            payload.direct_access.descriptor_accesses_precompiled,
+            payload.native_binding_recipe.get(),
+            delta_applicable ? &delta : nullptr);
+        encoder_cache.binding_program = program;
+        encoder_cache.descriptor_content_revision =
+            payload.descriptor_content_revision;
+        encoder_cache.content_fingerprint =
+            payload.binding_content_fingerprint;
+        encoder_cache.binding_valid = true;
+      }
     } else {
+      encoder_cache.binding_program = nullptr;
+      encoder_cache.binding_valid = false;
       const uint64_t argbuf_base = argbuf_offset;
       EncodeComputeBindings(enc, *packet.replay_state, *packet.pipeline,
                             argbuf_offset);
@@ -24411,6 +24548,8 @@ private:
         compiled_binding_payload;
     CompiledPacketBindingState compiled_binding_state = {};
     CompiledDirectAccessList compiled_direct_access;
+    std::shared_ptr<const CompiledBindingProgram> binding_program;
+    CompiledBindingDelta binding_delta;
     uint64_t binding_generation = 0;
     dxmt::DescriptorContentRevision descriptor_content_revision = {};
     uint64_t binding_content_fingerprint = 0;
@@ -24574,7 +24713,8 @@ private:
       ArgumentEncodingContext &enc,
       const CompiledDirectGraphicsBindingPayload &payload,
       const CompiledPacketBindingState &binding_state,
-      ReplayDrawPacketCommon &common, uint64_t &argbuf_offset) {
+      ReplayDrawPacketCommon &common, uint64_t &argbuf_offset,
+      const CompiledBindingDelta *binding_delta = nullptr) {
     if (!common.pipeline)
       return;
     if (common.pipeline->GetShaderAbiVersion() !=
@@ -24591,6 +24731,7 @@ private:
                                    argbuf_offset,
                                    common.compiled_direct_access
                                        .descriptor_accesses_precompiled,
+                                   binding_delta,
                                    &diag);
     diag.path = "compiled-direct";
     common.bindless_diag = diag;
@@ -24673,8 +24814,10 @@ private:
 
     auto &binding_cache = render_encoder->binding_state_cache;
     if (packet.compiled_binding_payload) {
+      const auto *binding_program = packet.binding_program.get();
       const bool generation_hit =
           binding_cache.valid &&
+          binding_cache.binding_program == binding_program &&
           binding_cache.graphics_generation == packet.binding_generation &&
           binding_cache.descriptor_content_revision ==
               packet.descriptor_content_revision &&
@@ -24699,10 +24842,16 @@ private:
           dxmt::perf::ScopedFrameDuration binding_scope(
               perf_stats,
               &dxmt::FrameStatistics::frame_compiled_draw_binding_snapshot_interval);
+          const bool delta_applicable =
+              binding_cache.valid && packet.binding_delta.base_program &&
+              binding_cache.binding_program ==
+                  packet.binding_delta.base_program.get();
           EncodeCompiledDirectGraphicsBindings(
               enc, *packet.compiled_binding_payload,
-              packet.compiled_binding_state, packet, argbuf_offset);
+              packet.compiled_binding_state, packet, argbuf_offset,
+              delta_applicable ? &packet.binding_delta : nullptr);
         }
+        binding_cache.binding_program = binding_program;
         binding_cache.graphics_generation = packet.binding_generation;
         binding_cache.descriptor_content_revision =
             packet.descriptor_content_revision;
@@ -24721,6 +24870,14 @@ private:
                                    packet.blend_factor, packet.stencil_ref);
       }
       return;
+    }
+
+    // Interpreted binding application mutates the same Metal encoder state but
+    // has no Close-time program predecessor. Never allow a later compiled
+    // packet to consume a delta across this compatibility boundary.
+    if (binding_cache.binding_program) {
+      binding_cache.binding_program = nullptr;
+      binding_cache.valid = false;
     }
 
     bool generation_hit = false;

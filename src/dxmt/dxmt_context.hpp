@@ -320,10 +320,48 @@ struct RenderDynamicStateCache {
 };
 
 struct RenderBindingStateCache {
+  const void *binding_program = nullptr;
   uint64_t graphics_generation = 0;
   DescriptorContentRevision descriptor_content_revision = {};
   uint64_t content_fingerprint = 0;
   bool valid = false;
+};
+
+struct ComputeBindingStateCache {
+  const void *binding_program = nullptr;
+  DescriptorContentRevision descriptor_content_revision = {};
+  uint64_t content_fingerprint = 0;
+  uint64_t pso_handle = 0;
+  WMTSize threadgroup_size = {};
+  bool binding_valid = false;
+  bool pipeline_valid = false;
+};
+
+struct EncoderResourcePlanKey {
+  uintptr_t object = 0;
+  uint64_t offset = 0;
+  uint64_t length = 0;
+  uint64_t view_id = 0;
+  uint8_t stage = 0;
+  uint8_t kind = 0;
+
+  bool operator==(const EncoderResourcePlanKey &) const = default;
+};
+
+struct EncoderResourcePlanKeyHash {
+  size_t operator()(const EncoderResourcePlanKey &key) const {
+    size_t hash = std::hash<uintptr_t>{}(key.object);
+    auto mix = [&](uint64_t value) {
+      hash ^= std::hash<uint64_t>{}(value) + 0x9e3779b97f4a7c15ull +
+              (hash << 6) + (hash >> 2);
+    };
+    mix(key.offset);
+    mix(key.length);
+    mix(key.view_id);
+    mix(key.stage);
+    mix(key.kind);
+    return hash;
+  }
 };
 
 struct ComputeArgumentBufferOffsetState {
@@ -379,6 +417,9 @@ struct RenderEncoderData : EncoderData {
       native_argument_buffers_fragment = {};
   RenderDynamicStateCache dynamic_state_cache = {};
   RenderBindingStateCache binding_state_cache = {};
+  std::unordered_map<EncoderResourcePlanKey, int,
+                     EncoderResourcePlanKeyHash>
+      resource_plan_accesses;
 };
 
 struct ComputeEncoderData : EncoderData {
@@ -393,6 +434,10 @@ struct ComputeEncoderData : EncoderData {
   std::array<ComputeArgumentBufferOffsetState, 8> argument_buffer_offsets = {};
   std::array<NativeArgumentBufferBindingState, 31>
       native_argument_buffers = {};
+  ComputeBindingStateCache binding_state_cache = {};
+  std::unordered_map<EncoderResourcePlanKey, int,
+                     EncoderResourcePlanKeyHash>
+      resource_plan_accesses;
 };
 
 struct BlitEncoderData : EncoderData {

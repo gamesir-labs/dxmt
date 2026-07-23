@@ -824,7 +824,10 @@ enum CompiledBindingDirtyField : std::uint32_t {
   CompiledBindingDirtyVertexBuffers = 1u << 6,
 };
 
+struct CompiledBindingProgram;
+
 struct CompiledBindingDelta {
+  std::shared_ptr<const CompiledBindingProgram> base_program;
   std::uint32_t dirty_fields = 0;
   std::uint64_t root_table_dirty_mask = 0;
   std::uint64_t root_constant_dirty_mask = 0;

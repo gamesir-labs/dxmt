@@ -2604,6 +2604,7 @@ static void BuildCompiledBindingProgramsForPackets(
   for (auto &packet : packets) {
     packet.binding_delta = BuildCompiledBindingDelta(
         previous_program.get(), packet, compute);
+    packet.binding_delta.base_program = previous_program;
     if (previous_program &&
         CompiledBindingProgramMatchesPacket(*previous_program, packet,
                                             compute)) {
