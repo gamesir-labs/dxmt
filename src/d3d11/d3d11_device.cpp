@@ -23,6 +23,7 @@
 #include "ftl.hpp"
 #include "d3d11_resource.hpp"
 #include "dxgi_object.hpp"
+#include <atomic>
 #include <memory>
 #include "d3d11_4.h"
 #include "util_win32_compat.h"
@@ -1188,7 +1189,9 @@ public:
 
   virtual HRESULT STDMETHODCALLTYPE RegisterDeviceRemovedEvent(HANDLE Event,
                                                                DWORD *pCookie) final {
-    // no device to remove
+    if (!Event || !pCookie)
+      return E_INVALIDARG;
+    *pCookie = removed_event_cookie_.fetch_add(1, std::memory_order_relaxed);
     return S_OK;
   };
 
@@ -1224,6 +1227,7 @@ private:
 
   std::unique_ptr<MTLD3D11CommandListPoolBase> commandlist_pool_;
   std::unique_ptr<MTLD3D11PipelineCacheBase> pipeline_cache_;
+  std::atomic<DWORD> removed_event_cookie_{1};
 
   Device& device_;
   /** ensure destructor called first */
