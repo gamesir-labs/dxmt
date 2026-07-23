@@ -84,6 +84,10 @@ const dxmt::test::TestCostRegistration
 const dxmt::test::TestCostRegistration kDuplicateNameCost(
     "D3D11SharedNamedResourceContractSpec.RejectsDuplicateLiveName",
     dxmt::test::kResourceTestCost);
+const dxmt::test::TestCostRegistration
+    kSecondHandleCost("D3D11SharedNamedResourceContractSpec."
+                      "RejectsSecondHandleCreationForSameResource",
+                      dxmt::test::kResourceTestCost);
 
 std::atomic<std::uint32_t> g_next_name_id{0};
 
@@ -129,12 +133,11 @@ protected:
         context_.device()->CreateTexture2D(&desc_, nullptr, texture_.put()),
         S_OK);
 
-    ComPtr<IDXGIResource1> resource1;
     ASSERT_EQ(
         texture_->QueryInterface(__uuidof(IDXGIResource1),
-                                 reinterpret_cast<void **>(resource1.put())),
+                                 reinterpret_cast<void **>(resource1_.put())),
         S_OK);
-    ASSERT_EQ(resource1->CreateSharedHandle(
+    ASSERT_EQ(resource1_->CreateSharedHandle(
                   nullptr,
                   DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE,
                   shared_name_.data(), &shared_handle_.handle),
@@ -147,6 +150,7 @@ protected:
   ComPtr<ID3D11Device1> second_device1_;
   ComPtr<ID3D11DeviceContext> second_context_;
   ComPtr<ID3D11Texture2D> texture_;
+  ComPtr<IDXGIResource1> resource1_;
   D3D11_TEXTURE2D_DESC desc_ = {};
   std::array<wchar_t, MAX_PATH> shared_name_ = {};
   ScopedNtHandle shared_handle_;
@@ -265,6 +269,18 @@ TEST_F(D3D11SharedNamedResourceContractSpec, RejectsDuplicateLiveName) {
                 shared_name_.data(), &duplicate_handle.handle),
             DXGI_ERROR_NAME_ALREADY_EXISTS);
   EXPECT_EQ(duplicate_handle.handle, nullptr);
+  EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
+}
+
+TEST_F(D3D11SharedNamedResourceContractSpec,
+       RejectsSecondHandleCreationForSameResource) {
+  ScopedNtHandle second_handle;
+  second_handle.handle = reinterpret_cast<HANDLE>(uintptr_t{1});
+  const HRESULT create_result = resource1_->CreateSharedHandle(
+      nullptr, DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE, nullptr,
+      &second_handle.handle);
+  EXPECT_TRUE(FAILED(create_result));
+  EXPECT_EQ(second_handle.handle, nullptr);
   EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
 }
 

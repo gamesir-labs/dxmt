@@ -185,6 +185,7 @@ private:
   D3DKMT_HANDLE keyed_mutex_global_ = 0;
   D3DKMT_HANDLE sync_object_global_ = 0;
   WMT::Reference<WMT::SharedEvent> keyed_mutex_event_;
+  std::atomic_bool shared_handle_created_{false};
 
   static UINT
   DebugDescHeight(const typename tag_texture::DESC1 &desc) {
@@ -586,6 +587,9 @@ public:
       return E_INVALIDARG;
     if ((this->desc.MiscFlags & D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX) && (!keyed_mutex_ || !sync_object_))
       return E_INVALIDARG;
+    bool expected = false;
+    if (!shared_handle_created_.compare_exchange_strong(expected, true))
+      return DXGI_ERROR_INVALID_CALL;
 
     OBJECT_ATTRIBUTES attr = {};
     attr.Length = sizeof(attr);
@@ -612,9 +616,12 @@ public:
 
     const NTSTATUS status =
         D3DKMTShareObjects(count, handles, &attr, Access, pNTHandle);
-    if (status == kStatusObjectNameCollision)
+    if (status == kStatusObjectNameCollision) {
+      shared_handle_created_.store(false);
       return DXGI_ERROR_NAME_ALREADY_EXISTS;
+    }
     if (status) {
+      shared_handle_created_.store(false);
       ERR("DeviceTexture: Failed to create shared handle");
       return E_FAIL;
     }
