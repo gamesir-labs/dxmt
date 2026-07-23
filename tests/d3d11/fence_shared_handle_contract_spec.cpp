@@ -4,6 +4,7 @@
 
 #include <d3d11_4.h>
 #include <dxgi.h>
+#include <dxgi1_2.h>
 
 #include <array>
 #include <chrono>
@@ -36,6 +37,7 @@ enum class InvalidHandleKind {
   Null,
   Event,
   LegacyTexture,
+  NtTexture,
 };
 
 struct InvalidHandleCase {
@@ -47,6 +49,7 @@ constexpr std::array kInvalidHandleCases = {
     InvalidHandleCase{InvalidHandleKind::Null, "Null"},
     InvalidHandleCase{InvalidHandleKind::Event, "Event"},
     InvalidHandleCase{InvalidHandleKind::LegacyTexture, "LegacyTexture"},
+    InvalidHandleCase{InvalidHandleKind::NtTexture, "NtTexture"},
 };
 
 const dxmt::test::LogicalCaseFamilyRegistration kFenceAccessRegistration(
@@ -73,12 +76,13 @@ const dxmt::test::LogicalCaseFamilyRegistration kInvalidHandleRegistration(
      dxmt::test::ExecutionPath::Auto,
      {"11_0", "None", "Device",
       "ID3D11Device5,OpenSharedFence,HANDLE,CreateEventW,"
-      "D3D11_RESOURCE_MISC_SHARED,IDXGIResource,GetSharedHandle"},
+      "D3D11_RESOURCE_MISC_SHARED,D3D11_RESOURCE_MISC_SHARED_NTHANDLE,"
+      "IDXGIResource,IDXGIResource1,GetSharedHandle,CreateSharedHandle"},
      dxmt::test::kResourceTestCost,
      "one test-local D3D11 device and, when selected, one scoped event or "
-     "legacy shared texture",
-     "call OpenSharedFence with a null handle, an event handle, and a legacy "
-     "shared-texture KMT handle",
+     "shared texture handle",
+     "call OpenSharedFence with a null handle, an event handle, a legacy "
+     "shared-texture KMT handle, and a shared-texture NT handle",
      "every non-fence handle returns E_INVALIDARG and clears the output",
      "logical ID, handle kind and value, HRESULT, output value, device "
      "health, and exact replay argument"});
@@ -184,13 +188,15 @@ TEST_F(D3D11FenceSharedHandleContractSpec, RejectsNonFenceHandles) {
                  << " Replay: --dxmt-case-id=" << case_id);
 
     ScopedHandle event;
+    ScopedHandle nt_texture_handle;
     ComPtr<ID3D11Texture2D> texture;
     HANDLE handle = nullptr;
     if (test_case.kind == InvalidHandleKind::Event) {
       event.handle = CreateEventW(nullptr, FALSE, FALSE, nullptr);
       ASSERT_NE(event.handle, nullptr);
       handle = event.handle;
-    } else if (test_case.kind == InvalidHandleKind::LegacyTexture) {
+    } else if (test_case.kind == InvalidHandleKind::LegacyTexture ||
+               test_case.kind == InvalidHandleKind::NtTexture) {
       D3D11_TEXTURE2D_DESC desc = {};
       desc.Width = 16;
       desc.Height = 8;
@@ -200,16 +206,33 @@ TEST_F(D3D11FenceSharedHandleContractSpec, RejectsNonFenceHandles) {
       desc.SampleDesc.Count = 1;
       desc.Usage = D3D11_USAGE_DEFAULT;
       desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-      desc.MiscFlags = D3D11_RESOURCE_MISC_SHARED;
+      desc.MiscFlags = test_case.kind == InvalidHandleKind::LegacyTexture
+                           ? D3D11_RESOURCE_MISC_SHARED
+                           : D3D11_RESOURCE_MISC_SHARED_NTHANDLE |
+                                 D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX;
       ASSERT_EQ(
           context_.device()->CreateTexture2D(&desc, nullptr, texture.put()),
           S_OK);
-      ComPtr<IDXGIResource> resource;
-      ASSERT_EQ(
-          texture->QueryInterface(__uuidof(IDXGIResource),
-                                  reinterpret_cast<void **>(resource.put())),
-          S_OK);
-      ASSERT_EQ(resource->GetSharedHandle(&handle), S_OK);
+      if (test_case.kind == InvalidHandleKind::LegacyTexture) {
+        ComPtr<IDXGIResource> resource;
+        ASSERT_EQ(
+            texture->QueryInterface(__uuidof(IDXGIResource),
+                                    reinterpret_cast<void **>(resource.put())),
+            S_OK);
+        ASSERT_EQ(resource->GetSharedHandle(&handle), S_OK);
+      } else {
+        ComPtr<IDXGIResource1> resource;
+        ASSERT_EQ(
+            texture->QueryInterface(__uuidof(IDXGIResource1),
+                                    reinterpret_cast<void **>(resource.put())),
+            S_OK);
+        ASSERT_EQ(resource->CreateSharedHandle(
+                      nullptr,
+                      DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE,
+                      nullptr, &nt_texture_handle.handle),
+                  S_OK);
+        handle = nt_texture_handle.handle;
+      }
       ASSERT_NE(handle, nullptr);
     }
 

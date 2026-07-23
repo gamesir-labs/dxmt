@@ -3,6 +3,7 @@
 #include "d3d11_test_context.hpp"
 
 #include <d3d11_1.h>
+#include <d3d11_4.h>
 #include <dxgi1_2.h>
 
 #include <array>
@@ -83,6 +84,9 @@ const dxmt::test::TestCostRegistration kTextureContentsCost(
     dxmt::test::kResourceTestCost);
 const dxmt::test::TestCostRegistration kNtHandleTypeCost(
     "D3D11SharedNtHandleContractSpec.RejectsNtHandleInLegacyOpenMethod",
+    dxmt::test::kResourceTestCost);
+const dxmt::test::TestCostRegistration kFenceHandleTypeCost(
+    "D3D11SharedNtHandleContractSpec.RejectsFenceHandleAsNtResource",
     dxmt::test::kResourceTestCost);
 const dxmt::test::TestCostRegistration
     kDuplicateHandleCost("D3D11SharedNtHandleContractSpec."
@@ -403,6 +407,32 @@ TEST_F(D3D11SharedNtHandleContractSpec, RejectsNtHandleInLegacyOpenMethod) {
                 reinterpret_cast<void **>(opened.put())),
             E_INVALIDARG);
   EXPECT_EQ(opened.get(), nullptr);
+  EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
+  EXPECT_EQ(second_device_->GetDeviceRemovedReason(), S_OK);
+}
+
+TEST_F(D3D11SharedNtHandleContractSpec, RejectsFenceHandleAsNtResource) {
+  ComPtr<ID3D11Device5> device5;
+  ASSERT_EQ(
+      context_.device()->QueryInterface(
+          __uuidof(ID3D11Device5), reinterpret_cast<void **>(device5.put())),
+      S_OK);
+  ComPtr<ID3D11Fence> fence;
+  ASSERT_EQ(device5->CreateFence(0, D3D11_FENCE_FLAG_SHARED,
+                                 __uuidof(ID3D11Fence),
+                                 reinterpret_cast<void **>(fence.put())),
+            S_OK);
+  ScopedNtHandle fence_handle;
+  ASSERT_EQ(fence->CreateSharedHandle(nullptr, GENERIC_ALL, nullptr,
+                                      &fence_handle.handle),
+            S_OK);
+  ASSERT_NE(fence_handle.handle, nullptr);
+
+  void *opened = reinterpret_cast<void *>(std::uintptr_t{1});
+  EXPECT_EQ(second_device1_->OpenSharedResource1(
+                fence_handle.handle, __uuidof(ID3D11Texture2D), &opened),
+            E_INVALIDARG);
+  EXPECT_EQ(opened, nullptr);
   EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
   EXPECT_EQ(second_device_->GetDeviceRemovedReason(), S_OK);
 }
