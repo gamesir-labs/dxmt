@@ -7073,6 +7073,9 @@ private:
     WMTSize threadgroup_size = {};
     PipelineState *pipeline = nullptr;
     DispatchRecord dispatch = {};
+    Rc<Buffer> indirect_argument_buffer;
+    UINT64 indirect_argument_offset = 0;
+    UINT indirect_argument_size = 0;
     uint64_t argument_buffer_size = 0;
     std::optional<ReplayState> replay_state;
     std::optional<CompiledDirectComputeBindingPayload>
@@ -10164,7 +10167,7 @@ private:
           if (indirect) {
             auto *signature = dynamic_cast<CommandSignature *>(
                 indirect->command_signature.ptr());
-            if (!signature || indirect->count_buffer)
+            if (!signature)
               return CompiledCommandFallbackReason::
                   NativeUnsupportedExecuteIndirect;
             const auto &arguments = signature->GetArguments();
@@ -10425,10 +10428,84 @@ private:
                                      "compiled indirect argument buffer"))
               return CompiledCommandFallbackReason::
                   NativeUnsupportedExecuteIndirect;
-            auto argument_buffer = argument_resource->GetBuffer();
-            const UINT64 argument_base_offset =
+            Rc<Buffer> argument_buffer = argument_resource->GetBuffer();
+            UINT64 argument_base_offset =
                 argument_resource->GetHeapOffset() +
                 indirect->arg_buffer_offset;
+            UINT argument_stride = indirect_desc->ByteStride;
+            if (indirect->count_buffer) {
+              auto *count_resource =
+                  GetResource(indirect->count_buffer.ptr());
+              if (!ValidateBufferRange(
+                      count_resource, indirect->count_buffer_offset,
+                      sizeof(UINT), "compiled indirect count buffer"))
+                return CompiledCommandFallbackReason::
+                    NativeUnsupportedExecuteIndirect;
+              auto count_buffer = count_resource->GetBuffer();
+              const UINT64 count_offset =
+                  count_resource->GetHeapOffset() +
+                  indirect->count_buffer_offset;
+              Rc<Buffer> counted_arguments = new Buffer(
+                  UINT64(indirect->max_command_count) * argument_size,
+                  device_->GetDXMTDevice().device());
+              auto counted_allocation = counted_arguments->allocate(
+                  BufferAllocationFlag::CpuInvisible |
+                  BufferAllocationFlag::GpuPrivate);
+              if (!counted_allocation)
+                return CompiledCommandFallbackReason::
+                    NativeUnsupportedExecuteIndirect;
+              counted_arguments->rename(std::move(counted_allocation));
+
+              // Count expansion is the dependency node of the compiled
+              // graphics work. It runs once for the entire command range;
+              // each subsequent render command consumes its compact slot.
+              FlushPassBatches(chunk, state);
+              const UINT64 source_length =
+                  UINT64(indirect->max_command_count - 1) *
+                      indirect_desc->ByteStride +
+                  argument_size;
+              const UINT64 destination_length =
+                  UINT64(indirect->max_command_count) * argument_size;
+              chunk->emitcc(
+                  [argument_buffer, argument_base_offset, source_length,
+                   count_buffer, count_offset, counted_arguments,
+                   destination_length,
+                   command_count = indirect->max_command_count,
+                   source_stride = indirect_desc->ByteStride,
+                   argument_size](ArgumentEncodingContext &enc) mutable {
+                    enc.startComputePass(0);
+                    auto [source_allocation, source_sub_offset] =
+                        enc.access<PipelineStage::Compute>(
+                            argument_buffer, argument_base_offset,
+                            source_length, ResourceAccess::Read);
+                    auto [count_allocation, count_sub_offset] =
+                        enc.access<PipelineStage::Compute>(
+                            count_buffer, count_offset, sizeof(UINT),
+                            ResourceAccess::Read);
+                    auto [destination_allocation,
+                          destination_sub_offset] =
+                        enc.access<PipelineStage::Compute>(
+                            counted_arguments, 0, destination_length,
+                            ResourceAccess::Write);
+                    for (UINT command_index = 0;
+                         command_index < command_count; ++command_index) {
+                      enc.emulated_cmd.PrepareCountedIndirectArguments(
+                          count_allocation->buffer(),
+                          count_sub_offset + count_offset,
+                          source_allocation->buffer(),
+                          source_sub_offset + argument_base_offset +
+                              UINT64(command_index) * source_stride,
+                          destination_allocation->buffer(),
+                          destination_sub_offset +
+                              UINT64(command_index) * argument_size,
+                          argument_size, command_index);
+                    }
+                    enc.endPass();
+                  });
+              argument_buffer = counted_arguments;
+              argument_base_offset = 0;
+              argument_stride = argument_size;
+            }
 
             Rc<BufferAllocation> index_allocation;
             WMTIndexType index_type = WMTIndexTypeUInt16;
@@ -10516,7 +10593,7 @@ private:
               replay_packet.argument_buffer = argument_buffer;
               replay_packet.argument_offset =
                   argument_base_offset +
-                  UINT64(command_index) * indirect_desc->ByteStride;
+                  UINT64(command_index) * argument_stride;
               replay_packet.argument_size = argument_size;
               replay_packet.index_allocation = index_allocation;
               replay_packet.index_type = index_type;
@@ -10716,7 +10793,8 @@ private:
     auto queue_compiled_compute_packet =
         [&](const CompiledComputePacket &packet,
             const SubmittedCompiledComputePacket &prepared,
-            std::shared_ptr<GraphicsBindingSnapshot> submitted_snapshot)
+            std::shared_ptr<GraphicsBindingSnapshot> submitted_snapshot,
+            const ExecuteIndirectRecord *indirect = nullptr)
             -> CompiledCommandFallbackReason {
           if (packet.compatibility_reason !=
               CompiledCommandFallbackReason::None)
@@ -10726,7 +10804,22 @@ private:
           if (!prepared.root_tables)
             return CompiledCommandFallbackReason::NativeMissingDescriptorBackend;
           const auto &submitted_root_tables = *prepared.root_tables;
-          if (!packet.dispatch.x || !packet.dispatch.y || !packet.dispatch.z)
+          const D3D12_COMMAND_SIGNATURE_DESC *indirect_desc = nullptr;
+          const D3D12_INDIRECT_ARGUMENT_DESC *indirect_argument = nullptr;
+          if (indirect) {
+            auto *signature = dynamic_cast<CommandSignature *>(
+                indirect->command_signature.ptr());
+            if (!signature ||
+                GetDirectIndirectOperation(signature->GetArguments()) !=
+                    DirectIndirectOperation::Dispatch)
+              return CompiledCommandFallbackReason::
+                  NativeUnsupportedExecuteIndirect;
+            indirect_desc = &signature->GetDesc();
+            indirect_argument = &signature->GetArguments()[0];
+          }
+          if (!indirect &&
+              (!packet.dispatch.x || !packet.dispatch.y ||
+               !packet.dispatch.z))
             return CompiledCommandFallbackReason::None;
           DiagReplayRecordScope diag_record_scope(packet.d3d_sequence,
                                                   ++replay_record_serial);
@@ -10820,7 +10913,8 @@ private:
                 packet.d3d_sequence, replay_record_serial,
                 metal->pso.handle);
           }
-          if (!ValidateComputeDispatch(metal->threadgroup_size,
+          if (!indirect &&
+              !ValidateComputeDispatch(metal->threadgroup_size,
                                        packet.dispatch.x, packet.dispatch.y,
                                        packet.dispatch.z))
             return CompiledCommandFallbackReason::UnsupportedCommand;
@@ -10897,9 +10991,128 @@ private:
           if (!native_packet) {
             binding_payload.bindless_snapshot =
                 submitted_snapshot
-                    ? std::move(submitted_snapshot)
+                    ? submitted_snapshot
                     : GetOrCaptureCompiledDescriptorBindingSnapshot(
                           state, packet, *pipeline, root, true);
+          }
+          if (indirect) {
+            const UINT argument_size =
+                IndirectArgumentByteSize(*indirect_argument);
+            if (!argument_size || !indirect_desc->ByteStride ||
+                indirect_desc->ByteStride < argument_size)
+              return CompiledCommandFallbackReason::
+                  NativeUnsupportedExecuteIndirect;
+            if (!indirect->max_command_count)
+              return CompiledCommandFallbackReason::None;
+            auto *argument_resource = GetResource(indirect->arg_buffer.ptr());
+            const UINT64 argument_length =
+                UINT64(indirect->max_command_count - 1) *
+                    indirect_desc->ByteStride +
+                argument_size;
+            if (!ValidateBufferRange(argument_resource,
+                                     indirect->arg_buffer_offset,
+                                     argument_length,
+                                     "compiled indirect dispatch buffer"))
+              return CompiledCommandFallbackReason::
+                  NativeUnsupportedExecuteIndirect;
+            Rc<Buffer> argument_buffer = argument_resource->GetBuffer();
+            UINT64 argument_base_offset =
+                argument_resource->GetHeapOffset() +
+                indirect->arg_buffer_offset;
+            UINT argument_stride = indirect_desc->ByteStride;
+            if (indirect->count_buffer) {
+              auto *count_resource =
+                  GetResource(indirect->count_buffer.ptr());
+              if (!ValidateBufferRange(
+                      count_resource, indirect->count_buffer_offset,
+                      sizeof(UINT), "compiled indirect dispatch count"))
+                return CompiledCommandFallbackReason::
+                    NativeUnsupportedExecuteIndirect;
+              auto count_buffer = count_resource->GetBuffer();
+              const UINT64 count_offset =
+                  count_resource->GetHeapOffset() +
+                  indirect->count_buffer_offset;
+              Rc<Buffer> counted_arguments = new Buffer(
+                  UINT64(indirect->max_command_count) * argument_size,
+                  device_->GetDXMTDevice().device());
+              auto counted_allocation = counted_arguments->allocate(
+                  BufferAllocationFlag::CpuInvisible |
+                  BufferAllocationFlag::GpuPrivate);
+              if (!counted_allocation)
+                return CompiledCommandFallbackReason::
+                    NativeUnsupportedExecuteIndirect;
+              counted_arguments->rename(std::move(counted_allocation));
+              FlushPassBatches(chunk, state);
+              const UINT64 source_length =
+                  UINT64(indirect->max_command_count - 1) *
+                      indirect_desc->ByteStride +
+                  argument_size;
+              const UINT64 destination_length =
+                  UINT64(indirect->max_command_count) * argument_size;
+              chunk->emitcc(
+                  [argument_buffer, argument_base_offset, source_length,
+                   count_buffer, count_offset, counted_arguments,
+                   destination_length,
+                   command_count = indirect->max_command_count,
+                   source_stride = indirect_desc->ByteStride,
+                   argument_size](ArgumentEncodingContext &enc) mutable {
+                    enc.startComputePass(0);
+                    auto [source_allocation, source_sub_offset] =
+                        enc.access<PipelineStage::Compute>(
+                            argument_buffer, argument_base_offset,
+                            source_length, ResourceAccess::Read);
+                    auto [count_allocation, count_sub_offset] =
+                        enc.access<PipelineStage::Compute>(
+                            count_buffer, count_offset, sizeof(UINT),
+                            ResourceAccess::Read);
+                    auto [destination_allocation,
+                          destination_sub_offset] =
+                        enc.access<PipelineStage::Compute>(
+                            counted_arguments, 0, destination_length,
+                            ResourceAccess::Write);
+                    for (UINT command_index = 0;
+                         command_index < command_count; ++command_index) {
+                      enc.emulated_cmd.PrepareCountedIndirectArguments(
+                          count_allocation->buffer(),
+                          count_sub_offset + count_offset,
+                          source_allocation->buffer(),
+                          source_sub_offset + argument_base_offset +
+                              UINT64(command_index) * source_stride,
+                          destination_allocation->buffer(),
+                          destination_sub_offset +
+                              UINT64(command_index) * argument_size,
+                          argument_size, command_index);
+                    }
+                    enc.endPass();
+                  });
+              argument_buffer = counted_arguments;
+              argument_base_offset = 0;
+              argument_stride = argument_size;
+            }
+            for (UINT command_index = 0;
+                 command_index < indirect->max_command_count;
+                 ++command_index) {
+              ReplayDispatchPacket indirect_packet = {};
+              indirect_packet.metal_pso = dispatch_packet.metal_pso;
+              indirect_packet.threadgroup_size =
+                  dispatch_packet.threadgroup_size;
+              indirect_packet.pipeline = dispatch_packet.pipeline;
+              indirect_packet.argument_buffer_size =
+                  dispatch_packet.argument_buffer_size;
+              indirect_packet.compiled_binding_payload =
+                  dispatch_packet.compiled_binding_payload;
+              indirect_packet.indirect_argument_buffer = argument_buffer;
+              indirect_packet.indirect_argument_offset =
+                  argument_base_offset +
+                  UINT64(command_index) * argument_stride;
+              indirect_packet.indirect_argument_size = argument_size;
+              QueueCompiledComputePassCommand(
+                  chunk, state, argument_buffer_size,
+                  std::move(indirect_packet),
+                  EncodeReplayDispatchCompiled);
+            }
+            chunk = queue.CurrentChunk();
+            return CompiledCommandFallbackReason::None;
           }
           QueueCompiledComputePassCommand(
               chunk, state, argument_buffer_size,
@@ -11452,8 +11665,22 @@ private:
                     compiled->compute_packets.size()) {
               const auto &state_packet =
                   compiled->compute_packets[packet.state_packet_index];
-              apply_compiled_compute_compatibility_state(state_packet);
-              ReplayExecuteIndirect(chunk, state, packet.execute);
+              const auto &prepared =
+                  submitted->compute_packets[packet.state_packet_index];
+              auto submitted_snapshot =
+                  submitted_descriptor_snapshots &&
+                          packet.state_packet_index <
+                              submitted_descriptor_snapshots->compute.size()
+                      ? submitted_descriptor_snapshots
+                            ->compute[packet.state_packet_index]
+                      : std::shared_ptr<GraphicsBindingSnapshot>{};
+              const auto fallback_reason = queue_compiled_compute_packet(
+                  state_packet, prepared, std::move(submitted_snapshot),
+                  &packet.execute);
+              if (fallback_reason != CompiledCommandFallbackReason::None) {
+                apply_compiled_compute_compatibility_state(state_packet);
+                ReplayExecuteIndirect(chunk, state, packet.execute);
+              }
               if (test_telemetry)
                 test_telemetry->replayed_compute_packets.fetch_add(
                     1, std::memory_order_relaxed);
@@ -22847,9 +23074,24 @@ private:
     if (enc.argumentBufferOverflowed())
       return;
 
-    auto &dispatch = enc.encodeComputeCommand<wmtcmd_compute_dispatch>();
-    dispatch.type = WMTComputeCommandDispatch;
-    dispatch.size = {packet.dispatch.x, packet.dispatch.y, packet.dispatch.z};
+    if (packet.indirect_argument_buffer) {
+      auto [argument_allocation, argument_sub_offset] =
+          enc.access<PipelineStage::Compute>(
+              packet.indirect_argument_buffer,
+              packet.indirect_argument_offset,
+              packet.indirect_argument_size, ResourceAccess::Read);
+      auto &dispatch =
+          enc.encodeComputeCommand<wmtcmd_compute_dispatch_indirect>();
+      dispatch.type = WMTComputeCommandDispatchIndirect;
+      dispatch.indirect_args_buffer = argument_allocation->buffer();
+      dispatch.indirect_args_offset =
+          argument_sub_offset + packet.indirect_argument_offset;
+    } else {
+      auto &dispatch = enc.encodeComputeCommand<wmtcmd_compute_dispatch>();
+      dispatch.type = WMTComputeCommandDispatch;
+      dispatch.size = {packet.dispatch.x, packet.dispatch.y,
+                       packet.dispatch.z};
+    }
 
     if (perf_enabled) {
       dxmt::perf::recordCompiledDispatchEncodeTime(
