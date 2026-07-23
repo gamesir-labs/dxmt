@@ -2948,8 +2948,10 @@ static void AnnotateCompiledEncoderLifetimes(CompiledCommandList &compiled) {
           node.encoder_index = active_encoder;
         }
         active_render_state = nullptr;
-      } else if (first.graphics_state) {
-        const auto &render_state = first.graphics_state->render_state;
+      } else if (first.state_packet_index <
+                 compiled.graphics_packets.size()) {
+        const auto &render_state =
+            compiled.graphics_packets[first.state_packet_index].render_state;
         if (active_kind != CompiledEncoderKind::Graphics ||
             !active_render_state ||
             !CompiledRenderAttachmentsCompatible(*active_render_state,
@@ -2962,9 +2964,11 @@ static void AnnotateCompiledEncoderLifetimes(CompiledCommandList &compiled) {
         const auto &last = compiled.indirect_packets[
             segment.first_indirect_packet +
             segment.indirect_packet_count - 1];
-        active_render_state = last.graphics_state
-                                  ? &last.graphics_state->render_state
-                                  : &render_state;
+        active_render_state =
+            last.state_packet_index < compiled.graphics_packets.size()
+                ? &compiled.graphics_packets[last.state_packet_index]
+                       .render_state
+                : &render_state;
       } else {
         active_kind = CompiledEncoderKind::None;
         active_encoder = UINT_MAX;
@@ -3286,12 +3290,17 @@ BuildCompiledCommandList(const std::vector<CommandRecord> &records,
   compiled->superseded_state_record_mask =
       BuildCompiledSupersededGraphicsStateRecordMask(records);
   compiled->segments.reserve(records.size());
-  compiled->graphics_packets.reserve(graphics_packet_count);
-  compiled->compute_packets.reserve(compute_packet_count);
-  compiled->indirect_packets.reserve(std::count_if(
+  const auto indirect_packet_count = std::count_if(
       records.begin(), records.end(), [](const CommandRecord &record) {
         return std::holds_alternative<ExecuteIndirectRecord>(record.payload);
-      }));
+      });
+  // Every indirect node also contributes one ordinary immutable state packet
+  // so submission freezing and binding-program compilation cover it.
+  compiled->graphics_packets.reserve(graphics_packet_count +
+                                      indirect_packet_count);
+  compiled->compute_packets.reserve(compute_packet_count +
+                                    indirect_packet_count);
+  compiled->indirect_packets.reserve(indirect_packet_count);
   // Compilation owns these stores exclusively. Hold their mutable views once
   // so per-record appends do not repeatedly execute the immutable wrapper's
   // cross-thread uniqueness check; the stores become immutable when this
@@ -3454,6 +3463,17 @@ BuildCompiledCommandList(const std::vector<CommandRecord> &records,
         dxmt::perf::ScopedCodeTimer packet_timer(
             dxmt::PerfCodePath::CompiledBuildPacketStateCopy);
         packet = BuildCompiledIndirectPacket(record, record_index, state);
+      }
+      if (packet.compute && packet.compute_state) {
+        packet.state_packet_index =
+            static_cast<UINT>(compute_packets.size());
+        compute_packets.push_back(std::move(*packet.compute_state));
+        packet.compute_state.reset();
+      } else if (!packet.compute && packet.graphics_state) {
+        packet.state_packet_index =
+            static_cast<UINT>(graphics_packets.size());
+        graphics_packets.push_back(std::move(*packet.graphics_state));
+        packet.graphics_state.reset();
       }
       AppendCompiledIndirectSegment(
           segments, indirect_packets,

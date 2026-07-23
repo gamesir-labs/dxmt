@@ -916,6 +916,11 @@ struct CompiledIndirectPacket {
   UINT record_index = 0;
   std::uint64_t d3d_sequence = 0;
   ExecuteIndirectRecord execute;
+  // Index of the immutable graphics/compute state packet in the generation's
+  // normal packet store. Indirect work must participate in submission-time
+  // descriptor freezing and Close-time binding-program compilation just like
+  // an ordinary draw/dispatch; keeping a private packet here bypassed both.
+  UINT state_packet_index = UINT_MAX;
   bool compute = false;
   std::optional<CompiledGraphicsPacket> graphics_state;
   std::optional<CompiledComputePacket> compute_state;

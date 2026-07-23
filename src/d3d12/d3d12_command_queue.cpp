@@ -8291,9 +8291,7 @@ private:
 
     auto *stats =
         &device_->GetDXMTDevice().queue().CurrentFrameStatistics();
-    if (compiled_candidate &&
-        !ReplayGraphicsCommandKindIsIndirect(kind) && !use_geometry &&
-        !use_tessellation) {
+    if (compiled_candidate && !use_geometry && !use_tessellation) {
       dxmt::perf::recordCompiledGraphicsPackets(stats, 1);
       return;
     }
@@ -10139,7 +10137,8 @@ private:
         [&](const CompiledGraphicsPacket &packet,
             const SubmittedCompiledGraphicsPacket &prepared,
             std::shared_ptr<GraphicsBindingSnapshot> submitted_snapshot,
-            const ReplayRenderPassAttachments *encoder_attachments)
+            const ReplayRenderPassAttachments *encoder_attachments,
+            const ExecuteIndirectRecord *indirect = nullptr)
             -> CompiledCommandFallbackReason {
           if (std::any_of(
                   packet.render_state.render_targets.begin(),
@@ -10158,7 +10157,26 @@ private:
           if (!prepared.root_tables)
             return CompiledCommandFallbackReason::NativeMissingDescriptorBackend;
           const auto &submitted_root_tables = *prepared.root_tables;
-          if (!packet.draw && !packet.draw_indexed)
+          DirectIndirectOperation indirect_operation =
+              DirectIndirectOperation::None;
+          const D3D12_COMMAND_SIGNATURE_DESC *indirect_desc = nullptr;
+          const D3D12_INDIRECT_ARGUMENT_DESC *indirect_argument = nullptr;
+          if (indirect) {
+            auto *signature = dynamic_cast<CommandSignature *>(
+                indirect->command_signature.ptr());
+            if (!signature || indirect->count_buffer)
+              return CompiledCommandFallbackReason::
+                  NativeUnsupportedExecuteIndirect;
+            const auto &arguments = signature->GetArguments();
+            indirect_operation = GetDirectIndirectOperation(arguments);
+            if (indirect_operation != DirectIndirectOperation::Draw &&
+                indirect_operation != DirectIndirectOperation::DrawIndexed)
+              return CompiledCommandFallbackReason::
+                  NativeUnsupportedExecuteIndirect;
+            indirect_desc = &signature->GetDesc();
+            indirect_argument = &arguments[0];
+          }
+          if (!packet.draw && !packet.draw_indexed && !indirect)
             return CompiledCommandFallbackReason::UnsupportedCommand;
           if (packet.draw &&
               (!packet.draw->vertex_count_per_instance ||
@@ -10275,8 +10293,11 @@ private:
                        : CompiledCommandFallbackReason::TessellationPipeline;
           if (packet.render_state.topology == D3D_PRIMITIVE_TOPOLOGY_UNDEFINED)
             return CompiledCommandFallbackReason::UnsupportedVertexIndexState;
+          const bool indexed =
+              packet.draw_indexed ||
+              indirect_operation == DirectIndirectOperation::DrawIndexed;
           auto metal_pso =
-              packet.draw_indexed && packet.input_assembler.index_buffer
+              indexed && packet.input_assembler.index_buffer
                   ? SelectGraphicsPipelineState(
                         *metal, packet.render_state.topology,
                         packet.input_assembler.index_buffer->Format)
@@ -10294,7 +10315,9 @@ private:
 
           if (native_packet) {
             D3D12DiagLogNativePacket(
-                packet.draw ? "draw" : "draw-indexed",
+                indirect ? (indexed ? "draw-indexed-indirect"
+                                    : "draw-indirect")
+                         : packet.draw ? "draw" : "draw-indexed",
                 queue.CurrentFrameSeq(), packet.d3d_sequence,
                 replay_record_serial, *pipeline, metal_pso.handle,
                 submitted_root_tables,
@@ -10302,12 +10325,18 @@ private:
                  {"pixel", &prepared.native_pixel}});
             DiagnoseCompiledNativeStageDescriptors(
                 submitted_root_tables, *pipeline, *root, PipelineStage::Vertex,
-                false, packet.draw ? "draw" : "draw-indexed",
+                false,
+                indirect ? (indexed ? "draw-indexed-indirect"
+                                    : "draw-indirect")
+                         : packet.draw ? "draw" : "draw-indexed",
                 queue.CurrentFrameSeq(), packet.d3d_sequence,
                 replay_record_serial, metal_pso.handle);
             DiagnoseCompiledNativeStageDescriptors(
                 submitted_root_tables, *pipeline, *root, PipelineStage::Pixel,
-                false, packet.draw ? "draw" : "draw-indexed",
+                false,
+                indirect ? (indexed ? "draw-indexed-indirect"
+                                    : "draw-indirect")
+                         : packet.draw ? "draw" : "draw-indexed",
                 queue.CurrentFrameSeq(), packet.d3d_sequence,
                 replay_record_serial, metal_pso.handle);
           }
@@ -10376,6 +10405,133 @@ private:
                   ? submitted_snapshot->descriptor_content_revision
                   : dxmt::DescriptorContentRevision{
                         binding_fingerprint, binding_fingerprint};
+          if (indirect) {
+            const UINT argument_size =
+                IndirectArgumentByteSize(*indirect_argument);
+            if (!argument_size || !indirect_desc->ByteStride ||
+                indirect_desc->ByteStride < argument_size)
+              return CompiledCommandFallbackReason::
+                  NativeUnsupportedExecuteIndirect;
+            if (!indirect->max_command_count)
+              return CompiledCommandFallbackReason::None;
+            auto *argument_resource = GetResource(indirect->arg_buffer.ptr());
+            const UINT64 argument_length =
+                UINT64(indirect->max_command_count - 1) *
+                    indirect_desc->ByteStride +
+                argument_size;
+            if (!ValidateBufferRange(argument_resource,
+                                     indirect->arg_buffer_offset,
+                                     argument_length,
+                                     "compiled indirect argument buffer"))
+              return CompiledCommandFallbackReason::
+                  NativeUnsupportedExecuteIndirect;
+            auto argument_buffer = argument_resource->GetBuffer();
+            const UINT64 argument_base_offset =
+                argument_resource->GetHeapOffset() +
+                indirect->arg_buffer_offset;
+
+            Rc<BufferAllocation> index_allocation;
+            WMTIndexType index_type = WMTIndexTypeUInt16;
+            UINT64 index_buffer_offset = 0;
+            Resource *index_resource = nullptr;
+            if (indexed) {
+              if (!packet.input_assembler.index_buffer ||
+                  !IsSupportedIndexBufferFormat(
+                      packet.input_assembler.index_buffer->Format))
+                return CompiledCommandFallbackReason::
+                    UnsupportedVertexIndexState;
+              index_buffer_offset = ResolveBufferGpuAddress(
+                  packet.input_assembler.index_buffer->BufferLocation,
+                  index_resource);
+              if (!index_resource || !index_resource->GetBuffer())
+                return CompiledCommandFallbackReason::
+                    NativeUnsupportedDynamicResource;
+              index_allocation = index_resource->GetBufferAllocation();
+              if (!index_allocation)
+                return CompiledCommandFallbackReason::
+                    NativeUnsupportedDynamicResource;
+              index_type =
+                  GetIndexType(packet.input_assembler.index_buffer->Format);
+              bool found_index = false;
+              for (const auto &allocation :
+                   direct_access.static_buffer_allocations)
+                found_index |= allocation.ptr() == index_allocation.ptr();
+              for (const auto &allocation : direct_access.buffer_allocations)
+                found_index |= allocation.ptr() == index_allocation.ptr();
+              if (!found_index)
+                direct_access.buffer_allocations.push_back(index_allocation);
+            }
+            RecordGraphicsPipelineResourceAccess(
+                chunk, state, *pipeline, index_resource,
+                submitted_snapshot.get());
+
+            for (UINT command_index = 0;
+                 command_index < indirect->max_command_count;
+                 ++command_index) {
+              ReplayDrawIndirectCompiledPacket replay_packet = {};
+              auto &common = replay_packet.common;
+              common.metal_pso = metal_pso;
+              common.depth_stencil = metal->depth_stencil;
+              common.rasterizer = metal->rasterizer;
+              common.pipeline = pipeline;
+              common.binding_program = packet.binding_program;
+              common.binding_delta = packet.binding_delta;
+              common.test_telemetry = compiled->test_telemetry;
+              common.binding_generation = binding_fingerprint;
+              common.binding_content_fingerprint = binding_fingerprint;
+              common.descriptor_content_revision =
+                  submitted_descriptor_revision;
+              common.pixel_shader_demote_msaa_srv_mask_lo =
+                  compiled_demote_msaa_srv_mask_lo;
+              common.pixel_shader_demote_msaa_srv_mask_hi =
+                  compiled_demote_msaa_srv_mask_hi;
+              common.primitive = primitive;
+              common.blend_factor = packet.render_state.blend_factor;
+              common.stencil_ref = packet.render_state.stencil_ref;
+              common.dynamic_state_recipe =
+                  packet.dynamic_render_state_recipe;
+              common.viewports = packet.render_state.viewports;
+              common.scissors = packet.render_state.scissors;
+              common.compiled_binding_payload.emplace();
+              auto &binding_payload = *common.compiled_binding_payload;
+              binding_payload.pipeline_state = packet.pipeline.pipeline_state;
+              binding_payload.root_signature = packet.pipeline.root_signature;
+              binding_payload.root_tables = prepared.root_tables;
+              binding_payload.input_assembler = packet.input_assembler;
+              binding_payload.native_root_base_buffer =
+                  frozen_native ? frozen_native->root_base_buffer
+                                : submitted->native_root_base_buffer;
+              binding_payload.native_vertex =
+                  frozen_native ? submitted_snapshot->frozen_native_vertex
+                                : prepared.native_vertex;
+              binding_payload.native_pixel =
+                  frozen_native ? submitted_snapshot->frozen_native_pixel
+                                : prepared.native_pixel;
+              binding_payload.bindless_snapshot = bindless_snapshot;
+              binding_payload.frozen_native = frozen_native;
+              binding_payload.native_binding_recipe = native_binding_recipe;
+              binding_payload.vertex_binding_recipe = vertex_binding_recipe;
+              common.compiled_binding_state = binding_state;
+              common.compiled_direct_access = direct_access;
+              replay_packet.argument_buffer = argument_buffer;
+              replay_packet.argument_offset =
+                  argument_base_offset +
+                  UINT64(command_index) * indirect_desc->ByteStride;
+              replay_packet.argument_size = argument_size;
+              replay_packet.index_allocation = index_allocation;
+              replay_packet.index_type = index_type;
+              replay_packet.index_buffer_offset = index_buffer_offset;
+              replay_packet.indexed = indexed;
+              QueueCompiledGraphicsPassCommand(
+                  chunk, state, *encoder_attachments, argument_buffer_size,
+                  std::move(replay_packet),
+                  EncodeReplayDrawIndirectCompiled, false, false,
+                  indexed ? ReplayGraphicsCommandKind::DrawIndexedIndirect
+                          : ReplayGraphicsCommandKind::DrawIndirect);
+            }
+            chunk = queue.CurrentChunk();
+            return CompiledCommandFallbackReason::None;
+          }
           if (packet.draw) {
             RecordGraphicsPipelineResourceAccess(
                 chunk, state, *pipeline, nullptr, submitted_snapshot.get());
@@ -10856,6 +11012,17 @@ private:
             segment.first_indirect_packet + segment.indirect_packet_count >
                 compiled->indirect_packets.size())
           return false;
+        if (segment.kind == CompiledCommandSegmentKind::Indirect) {
+          for (UINT i = 0; i < segment.indirect_packet_count; ++i) {
+            const auto &packet = compiled->indirect_packets[
+                segment.first_indirect_packet + i];
+            const auto packet_count =
+                packet.compute ? compiled->compute_packets.size()
+                               : compiled->graphics_packets.size();
+            if (packet.state_packet_index >= packet_count)
+              return false;
+          }
+        }
         if (segment.kind == CompiledCommandSegmentKind::Barrier &&
             segment.first_barrier + segment.barrier_count >
                 compiled->access_summary.barriers.size())
@@ -11089,8 +11256,12 @@ private:
                      segment.indirect_packet_count) {
             const auto &indirect = compiled->indirect_packets[
                 segment.first_indirect_packet];
-            if (indirect.graphics_state)
-              first_render_state = &indirect.graphics_state->render_state;
+            if (!indirect.compute &&
+                indirect.state_packet_index <
+                    compiled->graphics_packets.size())
+              first_render_state =
+                  &compiled->graphics_packets[indirect.state_packet_index]
+                       .render_state;
           }
           // Reserved-resource allocation and present-source tracking are
           // submission-dynamic, so materialize the immutable Close-time
@@ -11276,19 +11447,40 @@ private:
             // rebuilding every root/IA binding before each indirect node.
             replay_deferred_state_not_captured_by_indirect_packet(
                 packet.compute);
-            if (packet.compute_state) {
-              apply_compiled_compute_compatibility_state(
-                  *packet.compute_state);
-              dxmt::perf::recordCompiledComputePackets(
-                  &queue.CurrentFrameStatistics(), 1);
+            if (packet.compute &&
+                packet.state_packet_index <
+                    compiled->compute_packets.size()) {
+              const auto &state_packet =
+                  compiled->compute_packets[packet.state_packet_index];
+              apply_compiled_compute_compatibility_state(state_packet);
+              ReplayExecuteIndirect(chunk, state, packet.execute);
               if (test_telemetry)
                 test_telemetry->replayed_compute_packets.fetch_add(
                     1, std::memory_order_relaxed);
-            } else if (packet.graphics_state) {
-              apply_compiled_graphics_compatibility_state(
-                  *packet.graphics_state);
-              dxmt::perf::recordCompiledGraphicsPackets(
-                  &queue.CurrentFrameStatistics(), 1);
+            } else if (!packet.compute &&
+                       packet.state_packet_index <
+                           compiled->graphics_packets.size()) {
+              const auto &state_packet =
+                  compiled->graphics_packets[packet.state_packet_index];
+              const auto &prepared =
+                  submitted->graphics_packets[packet.state_packet_index];
+              auto submitted_snapshot =
+                  submitted_descriptor_snapshots &&
+                          packet.state_packet_index <
+                              submitted_descriptor_snapshots->graphics.size()
+                      ? submitted_descriptor_snapshots
+                            ->graphics[packet.state_packet_index]
+                      : std::shared_ptr<GraphicsBindingSnapshot>{};
+              const auto fallback_reason = queue_compiled_graphics_packet(
+                  state_packet, prepared, std::move(submitted_snapshot),
+                  active_encoder_attachments
+                      ? &*active_encoder_attachments
+                      : nullptr,
+                  &packet.execute);
+              if (fallback_reason != CompiledCommandFallbackReason::None) {
+                apply_compiled_graphics_compatibility_state(state_packet);
+                ReplayExecuteIndirect(chunk, state, packet.execute);
+              }
               if (test_telemetry)
                 test_telemetry->replayed_graphics_packets.fetch_add(
                     1, std::memory_order_relaxed);
@@ -11313,7 +11505,6 @@ private:
                 chunk, state, packet.execute.count_buffer.ptr(),
                 D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
                 "ExecuteIndirect count");
-            ReplayExecuteIndirect(chunk, state, packet.execute);
             chunk = queue.CurrentChunk();
           }
           break;
@@ -24754,6 +24945,17 @@ private:
     UINT base_instance = 0;
   };
 
+  struct ReplayDrawIndirectCompiledPacket {
+    ReplayDrawPacketCommon common;
+    Rc<Buffer> argument_buffer;
+    UINT64 argument_offset = 0;
+    UINT argument_size = 0;
+    Rc<BufferAllocation> index_allocation;
+    WMTIndexType index_type = WMTIndexTypeUInt16;
+    UINT64 index_buffer_offset = 0;
+    bool indexed = false;
+  };
+
   void EncodeCompiledDirectGraphicsBindings(
       ArgumentEncodingContext &enc,
       const CompiledDirectGraphicsBindingPayload &payload,
@@ -25198,6 +25400,64 @@ private:
       uint64_t &argbuf_offset) {
     queue->EncodeReplayDrawInstancedPacket(
         enc, *static_cast<ReplayDrawInstancedPacket *>(payload), argbuf_offset);
+  }
+
+  void EncodeReplayDrawIndirectCompiledPacket(
+      ArgumentEncodingContext &enc,
+      ReplayDrawIndirectCompiledPacket &packet,
+      uint64_t &argbuf_offset) {
+    auto *perf_stats = dxmt::perf::frameStatisticsForContext(enc);
+    dxmt::perf::ScopedFrameDuration encode_scope(
+        perf_stats,
+        &dxmt::FrameStatistics::frame_compiled_draw_direct_encode_interval);
+    dxmt::perf::addFrameCounter(
+        perf_stats,
+        &dxmt::FrameStatistics::frame_compiled_draw_direct_packets);
+    dxmt::perf::addFrameCounter(
+        perf_stats,
+        packet.indexed
+            ? &dxmt::FrameStatistics::frame_compiled_draw_indexed_packets
+            : &dxmt::FrameStatistics::frame_compiled_draw_nonindexed_packets);
+
+    EncodeReplayDrawCommonState(enc, packet.common, argbuf_offset);
+    if (enc.argumentBufferOverflowed() || !packet.common.primitive)
+      return;
+
+    auto [argument_allocation, argument_sub_offset] =
+        enc.access<PipelineStage::Vertex>(
+            packet.argument_buffer, packet.argument_offset,
+            packet.argument_size, ResourceAccess::Read);
+    const auto metal_argument_offset =
+        argument_sub_offset + packet.argument_offset;
+    enc.resolveRenderPassBarrier();
+    if (packet.indexed) {
+      if (!packet.index_allocation)
+        return;
+      auto &draw = enc.encodeRenderCommand<
+          wmtcmd_render_draw_indexed_indirect>();
+      draw.type = WMTRenderCommandDrawIndexedIndirect;
+      draw.primitive_type = *packet.common.primitive;
+      draw.index_type = packet.index_type;
+      draw.index_buffer = packet.index_allocation->buffer();
+      draw.index_buffer_offset = packet.index_buffer_offset;
+      draw.indirect_args_buffer = argument_allocation->buffer();
+      draw.indirect_args_offset = metal_argument_offset;
+    } else {
+      auto &draw =
+          enc.encodeRenderCommand<wmtcmd_render_draw_indirect>();
+      draw.type = WMTRenderCommandDrawIndirect;
+      draw.primitive_type = *packet.common.primitive;
+      draw.indirect_args_buffer = argument_allocation->buffer();
+      draw.indirect_args_offset = metal_argument_offset;
+    }
+  }
+
+  static void EncodeReplayDrawIndirectCompiled(
+      CommandQueueImpl *queue, ArgumentEncodingContext &enc, void *payload,
+      uint64_t &argbuf_offset) {
+    queue->EncodeReplayDrawIndirectCompiledPacket(
+        enc, *static_cast<ReplayDrawIndirectCompiledPacket *>(payload),
+        argbuf_offset);
   }
 
   void EncodeReplayDrawIndexedInstancedPacket(
