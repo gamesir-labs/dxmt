@@ -35,6 +35,7 @@ d3d11_unit_sources = files(
   'texture_cube_array_shader_resource_view_desc_matrix_spec.cpp',
   'texture1d_shader_resource_view_desc_matrix_spec.cpp',
   'texture1d_single_shader_resource_view_desc_matrix_spec.cpp',
+  'texture2d_single_shader_resource_view_desc_matrix_spec.cpp',
   'texture2dms_shader_resource_view_desc_matrix_spec.cpp',
   'texture3d_shader_resource_view_desc_matrix_spec.cpp',
   'unordered_access_view_desc_matrix_spec.cpp',
