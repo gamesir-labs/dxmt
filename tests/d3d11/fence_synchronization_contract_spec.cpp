@@ -47,6 +47,10 @@ const dxmt::test::TestCostRegistration
     kRepeatedOpenFenceCost("D3D11FenceSynchronizationContractSpec."
                            "RepeatedOpenCreatesIndependentWrappers",
                            dxmt::test::kResourceTestCost);
+const dxmt::test::TestCostRegistration
+    kForeignFenceCost("D3D11FenceSynchronizationContractSpec."
+                      "RejectsFenceOwnedByDifferentDevice",
+                      dxmt::test::kResourceTestCost);
 
 std::atomic<std::uint32_t> g_next_fence_name_id{0};
 
@@ -519,6 +523,33 @@ TEST_F(D3D11FenceSynchronizationContractSpec,
   ASSERT_EQ(WaitForSingleObject(completion.handle, 5000), WAIT_OBJECT_0);
   EXPECT_GE(first_opened->GetCompletedValue(), 79u);
   EXPECT_GE(second_opened->GetCompletedValue(), 79u);
+  EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
+  EXPECT_EQ(second_device->GetDeviceRemovedReason(), S_OK);
+}
+
+TEST_F(D3D11FenceSynchronizationContractSpec,
+       RejectsFenceOwnedByDifferentDevice) {
+  constexpr D3D_FEATURE_LEVEL kFeatureLevel = D3D_FEATURE_LEVEL_11_0;
+  D3D_FEATURE_LEVEL chosen_level = D3D_FEATURE_LEVEL_9_1;
+  ComPtr<ID3D11Device> second_device;
+  ComPtr<ID3D11DeviceContext> second_context;
+  ASSERT_EQ(D3D11CreateDevice(context_.adapter(), D3D_DRIVER_TYPE_UNKNOWN,
+                              nullptr, 0, &kFeatureLevel, 1, D3D11_SDK_VERSION,
+                              second_device.put(), &chosen_level,
+                              second_context.put()),
+            S_OK);
+  ASSERT_EQ(chosen_level, kFeatureLevel);
+  ComPtr<ID3D11DeviceContext4> second_context4;
+  ASSERT_EQ(second_context->QueryInterface(
+                __uuidof(ID3D11DeviceContext4),
+                reinterpret_cast<void **>(second_context4.put())),
+            S_OK);
+
+  ComPtr<ID3D11Fence> foreign_fence = CreateFence();
+  ASSERT_TRUE(foreign_fence);
+  EXPECT_EQ(second_context4->Signal(foreign_fence.get(), 1), E_INVALIDARG);
+  EXPECT_EQ(second_context4->Wait(foreign_fence.get(), 0), E_INVALIDARG);
+  EXPECT_EQ(foreign_fence->GetCompletedValue(), 0u);
   EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
   EXPECT_EQ(second_device->GetDeviceRemovedReason(), S_OK);
 }
