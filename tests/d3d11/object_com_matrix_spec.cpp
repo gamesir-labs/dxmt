@@ -4,6 +4,7 @@
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <d3d10_1.h>
 #include <d3d11_4.h>
 
 #include <array>
@@ -89,7 +90,6 @@ struct DeviceInterfaceCase {
 };
 
 std::vector<DeviceInterfaceCase> BuildDeviceInterfaceCases() {
-  // Optional versioned device interfaces: S_OK or E_NOINTERFACE both valid.
   return {
       {&__uuidof(ID3D11Device1), "ID3D11Device1"},
       {&__uuidof(ID3D11Device2), "ID3D11Device2"},
@@ -277,21 +277,11 @@ class DeviceVersionQiMatrixSpec
     : public ObjectComMatrixSpec,
       public ::testing::WithParamInterface<DeviceInterfaceCase> {};
 
-TEST_P(DeviceVersionQiMatrixSpec, AcceptsOptionalVersionedDeviceInterface) {
+TEST_P(DeviceVersionQiMatrixSpec, ExposesVersionedDeviceInterface) {
   const auto &test = GetParam();
   IUnknown *versioned = nullptr;
-  const HRESULT hr =
-      context_.device()->QueryInterface(*test.iid, reinterpret_cast<void **>(
-                                                      &versioned));
-
-  EXPECT_TRUE(hr == S_OK || hr == E_NOINTERFACE) << test.name << " hr=0x"
-                                                 << std::hex
-                                                 << static_cast<unsigned long>(hr);
-
-  if (hr == E_NOINTERFACE) {
-    EXPECT_EQ(versioned, nullptr) << test.name;
-    return;
-  }
+  const HRESULT hr = context_.device()->QueryInterface(
+      *test.iid, reinterpret_cast<void **>(&versioned));
 
   ASSERT_EQ(hr, S_OK) << test.name;
   ASSERT_NE(versioned, nullptr) << test.name;
@@ -346,6 +336,72 @@ TEST_F(ObjectComMatrixSpec, DeviceQueryInterfaceRejectsUnrelatedInterface) {
 TEST_F(ObjectComMatrixSpec, DeviceQueryInterfaceNullOutputIsRejected) {
   EXPECT_EQ(context_.device()->QueryInterface(__uuidof(IUnknown), nullptr),
             E_POINTER);
+}
+
+TEST_F(ObjectComMatrixSpec,
+       D3D10AndD3D11InterfacesShareIdentityAndPrivateData) {
+  ComPtr<ID3D10Device> device10;
+  ComPtr<ID3D10Device1> device10_1;
+  ASSERT_EQ(
+      context_.device()->QueryInterface(
+          __uuidof(ID3D10Device), reinterpret_cast<void **>(device10.put())),
+      S_OK);
+  ASSERT_EQ(
+      context_.device()->QueryInterface(
+          __uuidof(ID3D10Device1), reinterpret_cast<void **>(device10_1.put())),
+      S_OK);
+  ASSERT_NE(device10.get(), nullptr);
+  ASSERT_NE(device10_1.get(), nullptr);
+
+  const auto device11_identity = AsIUnknown(context_.device());
+  const auto device10_identity = AsIUnknown(device10.get());
+  const auto device10_1_identity = AsIUnknown(device10_1.get());
+  ASSERT_TRUE(device11_identity);
+  ASSERT_TRUE(device10_identity);
+  ASSERT_TRUE(device10_1_identity);
+  EXPECT_EQ(device10_identity.get(), device11_identity.get());
+  EXPECT_EQ(device10_1_identity.get(), device11_identity.get());
+
+  ComPtr<ID3D11Device5> device11_5;
+  ASSERT_EQ(
+      device10_1->QueryInterface(__uuidof(ID3D11Device5),
+                                 reinterpret_cast<void **>(device11_5.put())),
+      S_OK);
+  EXPECT_EQ(AsIUnknown(device11_5.get()).get(), device11_identity.get());
+  EXPECT_EQ(device10->GetCreationFlags(),
+            context_.device()->GetCreationFlags());
+
+  constexpr std::array<std::uint8_t, 5> kD3D10Value = {2, 3, 5, 7, 11};
+  ASSERT_EQ(device10->SetPrivateData(kPrivateDataValueKey, kD3D10Value.size(),
+                                     kD3D10Value.data()),
+            S_OK);
+  std::array<std::uint8_t, kD3D10Value.size()> d3d11_value = {};
+  UINT data_size = d3d11_value.size();
+  ASSERT_EQ(context_.device()->GetPrivateData(kPrivateDataValueKey, &data_size,
+                                              d3d11_value.data()),
+            S_OK);
+  EXPECT_EQ(data_size, kD3D10Value.size());
+  EXPECT_EQ(d3d11_value, kD3D10Value);
+
+  constexpr std::array<std::uint8_t, 6> kD3D11Value = {13, 17, 19, 23, 29, 31};
+  ASSERT_EQ(context_.device()->SetPrivateData(
+                kPrivateDataValueKey, kD3D11Value.size(), kD3D11Value.data()),
+            S_OK);
+  std::array<std::uint8_t, kD3D11Value.size()> d3d10_value = {};
+  data_size = d3d10_value.size();
+  ASSERT_EQ(device10_1->GetPrivateData(kPrivateDataValueKey, &data_size,
+                                       d3d10_value.data()),
+            S_OK);
+  EXPECT_EQ(data_size, kD3D11Value.size());
+  EXPECT_EQ(d3d10_value, kD3D11Value);
+
+  EXPECT_EQ(device10_1->SetPrivateData(kPrivateDataValueKey, 0, nullptr), S_OK);
+  data_size = d3d11_value.size();
+  EXPECT_EQ(context_.device()->GetPrivateData(kPrivateDataValueKey, &data_size,
+                                              d3d11_value.data()),
+            DXGI_ERROR_NOT_FOUND);
+  EXPECT_EQ(device10->GetDeviceRemovedReason(), S_OK);
+  EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
 }
 
 // ---------------------------------------------------------------------------
