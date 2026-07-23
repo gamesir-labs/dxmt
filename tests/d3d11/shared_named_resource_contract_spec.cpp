@@ -86,7 +86,7 @@ const dxmt::test::TestCostRegistration kDuplicateNameCost(
     dxmt::test::kResourceTestCost);
 const dxmt::test::TestCostRegistration
     kSecondHandleCost("D3D11SharedNamedResourceContractSpec."
-                      "RejectsSecondHandleCreationForSameResource",
+                      "CreatesAdditionalAnonymousHandleForSameResource",
                       dxmt::test::kResourceTestCost);
 
 std::atomic<std::uint32_t> g_next_name_id{0};
@@ -273,15 +273,22 @@ TEST_F(D3D11SharedNamedResourceContractSpec, RejectsDuplicateLiveName) {
 }
 
 TEST_F(D3D11SharedNamedResourceContractSpec,
-       RejectsSecondHandleCreationForSameResource) {
+       CreatesAdditionalAnonymousHandleForSameResource) {
   ScopedNtHandle second_handle;
-  second_handle.handle = reinterpret_cast<HANDLE>(uintptr_t{1});
-  const HRESULT create_result = resource1_->CreateSharedHandle(
-      nullptr, DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE, nullptr,
-      &second_handle.handle);
-  EXPECT_TRUE(FAILED(create_result));
-  EXPECT_EQ(second_handle.handle, nullptr);
+  ASSERT_EQ(resource1_->CreateSharedHandle(
+                nullptr, DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE,
+                nullptr, &second_handle.handle),
+            S_OK);
+  ASSERT_NE(second_handle.handle, nullptr);
+
+  ComPtr<ID3D11Texture2D> opened;
+  ASSERT_EQ(second_device1_->OpenSharedResource1(
+                second_handle.handle, __uuidof(ID3D11Texture2D),
+                reinterpret_cast<void **>(opened.put())),
+            S_OK);
+  ASSERT_TRUE(opened);
   EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
+  EXPECT_EQ(second_device_->GetDeviceRemovedReason(), S_OK);
 }
 
 } // namespace
