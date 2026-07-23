@@ -198,6 +198,15 @@ public:
 
 HRESULT
 CreateFence(MTLD3D11Device *pDevice, UINT64 InitialValue, D3D11_FENCE_FLAG Flags, REFIID riid, void **ppFence) {
+  InitReturnPtr(ppFence);
+  constexpr UINT kKnownFlags =
+      D3D11_FENCE_FLAG_NONE | D3D11_FENCE_FLAG_SHARED |
+      D3D11_FENCE_FLAG_SHARED_CROSS_ADAPTER |
+      D3D11_FENCE_FLAG_NON_MONITORED;
+  const UINT flags = static_cast<UINT>(Flags);
+  if (!flags || (flags & ~kKnownFlags))
+    return E_INVALIDARG;
+
   bool shared = !!(Flags & (D3D11_FENCE_FLAG_SHARED | D3D11_FENCE_FLAG_SHARED_CROSS_ADAPTER));
   auto event = pDevice->GetMTLDevice().newSharedEvent();
   D3DKMT_HANDLE local_kmt = 0;

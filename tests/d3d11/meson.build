@@ -113,6 +113,7 @@ d3d11_unit_sources = files(
   'multithread_contract_spec.cpp',
   'device_context_state_contract_spec.cpp',
   'fence_contract_spec.cpp',
+  'fence_flag_contract_spec.cpp',
   'fence_shared_handle_contract_spec.cpp',
   'device_removed_event_contract_spec.cpp',
   'counter_contract_spec.cpp',
