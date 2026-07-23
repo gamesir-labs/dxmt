@@ -21,6 +21,12 @@ namespace {
 using dxmt::test::ComPtr;
 using dxmt::test::D3D11TestContext;
 
+constexpr GUID kOpenedFenceDataKey = {
+    0x8cf56a31,
+    0xe10d,
+    0x4af1,
+    {0x93, 0x9a, 0xe5, 0x6d, 0x1b, 0xdf, 0x0b, 0x82}};
+
 const dxmt::test::TestCostRegistration kSharedFenceSynchronizationCost(
     "D3D11FenceSynchronizationContractSpec."
     "SharedFenceSynchronizesBidirectionallyAcrossDevices",
@@ -37,6 +43,10 @@ const dxmt::test::TestCostRegistration
     kMultipleHandleFenceCost("D3D11FenceSynchronizationContractSpec."
                              "MultipleHandlesPreserveSharedIdentity",
                              dxmt::test::kResourceTestCost);
+const dxmt::test::TestCostRegistration
+    kRepeatedOpenFenceCost("D3D11FenceSynchronizationContractSpec."
+                           "RepeatedOpenCreatesIndependentWrappers",
+                           dxmt::test::kResourceTestCost);
 
 std::atomic<std::uint32_t> g_next_fence_name_id{0};
 
@@ -430,6 +440,85 @@ TEST_F(D3D11FenceSynchronizationContractSpec,
   ASSERT_EQ(WaitForSingleObject(completion.handle, 5000), WAIT_OBJECT_0);
   EXPECT_GE(first_opened->GetCompletedValue(), 61u);
   EXPECT_GE(second_opened->GetCompletedValue(), 61u);
+  EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
+  EXPECT_EQ(second_device->GetDeviceRemovedReason(), S_OK);
+}
+
+TEST_F(D3D11FenceSynchronizationContractSpec,
+       RepeatedOpenCreatesIndependentWrappers) {
+  constexpr D3D_FEATURE_LEVEL kFeatureLevel = D3D_FEATURE_LEVEL_11_0;
+  D3D_FEATURE_LEVEL chosen_level = D3D_FEATURE_LEVEL_9_1;
+  ComPtr<ID3D11Device> second_device;
+  ComPtr<ID3D11DeviceContext> second_context;
+  ASSERT_EQ(D3D11CreateDevice(context_.adapter(), D3D_DRIVER_TYPE_UNKNOWN,
+                              nullptr, 0, &kFeatureLevel, 1, D3D11_SDK_VERSION,
+                              second_device.put(), &chosen_level,
+                              second_context.put()),
+            S_OK);
+  ASSERT_EQ(chosen_level, kFeatureLevel);
+  ComPtr<ID3D11Device5> second_device5;
+  ComPtr<ID3D11DeviceContext4> second_context4;
+  ASSERT_EQ(second_device->QueryInterface(
+                __uuidof(ID3D11Device5),
+                reinterpret_cast<void **>(second_device5.put())),
+            S_OK);
+  ASSERT_EQ(second_context->QueryInterface(
+                __uuidof(ID3D11DeviceContext4),
+                reinterpret_cast<void **>(second_context4.put())),
+            S_OK);
+
+  ComPtr<ID3D11Fence> creator_fence;
+  ASSERT_EQ(
+      device5_->CreateFence(71, D3D11_FENCE_FLAG_SHARED, __uuidof(ID3D11Fence),
+                            reinterpret_cast<void **>(creator_fence.put())),
+      S_OK);
+  ScopedNtHandle shared_handle;
+  ASSERT_EQ(creator_fence->CreateSharedHandle(nullptr, GENERIC_ALL, nullptr,
+                                              &shared_handle.handle),
+            S_OK);
+  ASSERT_NE(shared_handle.handle, nullptr);
+
+  ComPtr<ID3D11Fence> first_opened;
+  ComPtr<ID3D11Fence> second_opened;
+  ASSERT_EQ(second_device5->OpenSharedFence(
+                shared_handle.handle, __uuidof(ID3D11Fence),
+                reinterpret_cast<void **>(first_opened.put())),
+            S_OK);
+  ASSERT_EQ(second_device5->OpenSharedFence(
+                shared_handle.handle, __uuidof(ID3D11Fence),
+                reinterpret_cast<void **>(second_opened.put())),
+            S_OK);
+  ASSERT_TRUE(first_opened);
+  ASSERT_TRUE(second_opened);
+
+  ComPtr<IUnknown> first_identity;
+  ComPtr<IUnknown> second_identity;
+  ASSERT_EQ(
+      first_opened->QueryInterface(
+          __uuidof(IUnknown), reinterpret_cast<void **>(first_identity.put())),
+      S_OK);
+  ASSERT_EQ(
+      second_opened->QueryInterface(
+          __uuidof(IUnknown), reinterpret_cast<void **>(second_identity.put())),
+      S_OK);
+  EXPECT_NE(first_identity.get(), second_identity.get());
+
+  constexpr std::array<std::uint8_t, 4> kPrivateData = {0x11, 0x32, 0x57, 0x9b};
+  ASSERT_EQ(first_opened->SetPrivateData(
+                kOpenedFenceDataKey, kPrivateData.size(), kPrivateData.data()),
+            S_OK);
+  UINT private_data_size = 0;
+  EXPECT_EQ(second_opened->GetPrivateData(kOpenedFenceDataKey,
+                                          &private_data_size, nullptr),
+            DXGI_ERROR_NOT_FOUND);
+
+  ScopedEvent completion;
+  ASSERT_NE(completion.handle, nullptr);
+  ASSERT_EQ(second_opened->SetEventOnCompletion(79, completion.handle), S_OK);
+  ASSERT_EQ(second_context4->Signal(first_opened.get(), 79), S_OK);
+  ASSERT_EQ(WaitForSingleObject(completion.handle, 5000), WAIT_OBJECT_0);
+  EXPECT_GE(first_opened->GetCompletedValue(), 79u);
+  EXPECT_GE(second_opened->GetCompletedValue(), 79u);
   EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
   EXPECT_EQ(second_device->GetDeviceRemovedReason(), S_OK);
 }
