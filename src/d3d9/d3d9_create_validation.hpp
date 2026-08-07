@@ -30,6 +30,11 @@
 // test_format_matrix / test_color_rt_format and logged for game bring-up), the
 // allocation itself, and the buffer-backed linear-pitch alignment.
 
+// The managed pool on a D3D9Ex device.  Not in the public D3DPOOL enum -- the
+// runtime accepts it while rejecting plain D3DPOOL_MANAGED on Ex.  Same value
+// and rationale as DXVK's d3d9_include.h.
+#define D3DPOOL_MANAGED_EX D3DPOOL(6)
+
 namespace dxmt {
 
 enum class D3D9TextureCreateKind : uint8_t {
@@ -72,6 +77,27 @@ d3d9_full_mip_levels(uint32_t width, uint32_t height, uint32_t depth) {
 // does not affect the result.
 inline HRESULT
 validate_texture_create(const D3D9TextureCreateInfo &c) {
+  // D3DPOOL_MANAGED_EX is how a D3D9Ex device spells D3DPOOL_MANAGED: plain
+  // MANAGED is rejected on Ex, so an Ex app that wants a managed texture has to
+  // ask for 6.  It is absent from the public D3DPOOL enum but is what the
+  // runtime uses -- DXVK d3d9_include.h: "This is the managed pool on D3D9Ex,
+  // it's just hidden", and d3d9_common_texture.cpp notes the same.  WPF
+  // (wpfgfx_cor3) creates its 128x128 tile cache this way, so rejecting it
+  // costs the whole D3D9 path.
+  //
+  // Fold it to MANAGED and re-run the matrix, clearing is_ex so the "MANAGED is
+  // invalid on Ex" rule below does not fire on the legal spelling.  is_ex gates
+  // nothing else here, so the rest of the matrix is unaffected.  Callers fold
+  // the same way after this returns, so downstream pool comparisons agree.
+  if (c.pool == D3DPOOL_MANAGED_EX) {
+    if (!c.is_ex)
+      return D3DERR_INVALIDCALL;
+    D3D9TextureCreateInfo folded = c;
+    folded.pool = D3DPOOL_MANAGED;
+    folded.is_ex = false;
+    return validate_texture_create(folded);
+  }
+
   const bool is_volume = c.kind == D3D9TextureCreateKind::Volume;
   const bool is_cube = c.kind == D3D9TextureCreateKind::Cube;
 
