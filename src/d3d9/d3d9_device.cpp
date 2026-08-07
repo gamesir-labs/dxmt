@@ -2720,6 +2720,12 @@ MTLD3D9Device::CreateTexture(
       hr != D3D_OK)
     return hr;
 
+  // Validation accepted the Ex spelling of MANAGED; fold it now so every
+  // downstream `m_pool == D3DPOOL_MANAGED` comparison (upload masks, LOD,
+  // mirror backing) sees the pool this texture actually behaves like.
+  if (!d3d9_fold_managed_ex(Pool, m_isEx))
+    return D3DERR_INVALIDCALL;
+
   // pSharedHandle doubles as a user-memory pointer for single-level
   // SYSTEMMEM textures (the Vista-era user-memory path; the rows are
   // tightly packed). wined3d aliases the app pointer in place: LockRect
@@ -2984,6 +2990,13 @@ MTLD3D9Device::CreateVolumeTexture(
       );
       hr != D3D_OK)
     return hr;
+
+  // Validation accepted the Ex spelling of MANAGED; fold it now so every
+  // downstream `m_pool == D3DPOOL_MANAGED` comparison (upload masks, LOD,
+  // mirror backing) sees the pool this texture actually behaves like.
+  if (!d3d9_fold_managed_ex(Pool, m_isEx))
+    return D3DERR_INVALIDCALL;
+
   // Levels=0 means the full chain to 1x1; a count past the chain was rejected
   // in validate_texture_create above.
   UINT real_levels = Levels;
@@ -3083,6 +3096,12 @@ MTLD3D9Device::CreateCubeTexture(
       );
       hr != D3D_OK)
     return hr;
+
+  // Validation accepted the Ex spelling of MANAGED; fold it now so every
+  // downstream `m_pool == D3DPOOL_MANAGED` comparison (upload masks, LOD,
+  // mirror backing) sees the pool this texture actually behaves like.
+  if (!d3d9_fold_managed_ex(Pool, m_isEx))
+    return D3DERR_INVALIDCALL;
 
   if (pSharedHandle) {
     // Non-extended devices reject any handle with E_NOTIMPL (wined3d
@@ -3302,6 +3321,12 @@ MTLD3D9Device::CreateVertexBuffer(
   // wined3d buffer.c; MANAGED on Ex device is invalid.
   if (Pool == D3DPOOL_MANAGED && m_isEx)
     return D3DERR_INVALIDCALL;
+
+  // The Ex spelling of MANAGED; legal only on an Ex device. Folded here so the
+  // switch below and every downstream pool comparison see D3DPOOL_MANAGED.
+  if (!d3d9_fold_managed_ex(Pool, m_isEx))
+    return D3DERR_INVALIDCALL;
+
   // wined3d buffer.c; buffers can't be RT or DS. AUTOGENMIPMAP
   // is texture-only (DXVK d3d9_common_buffer.cpp rejects).
   if (Usage & (D3DUSAGE_RENDERTARGET | D3DUSAGE_DEPTHSTENCIL | D3DUSAGE_AUTOGENMIPMAP))
@@ -3388,6 +3413,12 @@ MTLD3D9Device::CreateIndexBuffer(
     return D3DERR_INVALIDCALL;
   if (Pool == D3DPOOL_MANAGED && m_isEx)
     return D3DERR_INVALIDCALL;
+
+  // The Ex spelling of MANAGED; legal only on an Ex device. Folded here so the
+  // switch below and every downstream pool comparison see D3DPOOL_MANAGED.
+  if (!d3d9_fold_managed_ex(Pool, m_isEx))
+    return D3DERR_INVALIDCALL;
+
   if (Usage & (D3DUSAGE_RENDERTARGET | D3DUSAGE_DEPTHSTENCIL | D3DUSAGE_AUTOGENMIPMAP))
     return D3DERR_INVALIDCALL;
   if (Pool == D3DPOOL_MANAGED && (Usage & D3DUSAGE_DYNAMIC))
