@@ -676,10 +676,12 @@ public:
   struct BatchedDraw {
     D3D9DrawCapture cap;
     // Per-draw POD snapshot captured at queue time for Resolve to read
-    // frozen state without racing setters. COW via m_encShadowDirty:
-    // consecutive draws share one snapshot, O(state-change clusters).
-    // Points into the queue's command-data ring; valid until the owning
-    // chunk retires, which outlives every Resolve read of it.
+    // frozen state without racing setters. Copy-on-write against
+    // m_encShadowDirty, per axis rather than per snapshot: draws that change
+    // nothing share the whole snapshot, and a draw that does rebuild still
+    // shares the blocks of every axis it left alone. Points into the queue's
+    // command-data ring; valid until the owning chunk retires, which outlives
+    // every Resolve read of it.
     const dxmt::D9EncodingState *pod_snapshot = nullptr;
     // Ref-counted state is not per-draw; the chunk walker
     // mutates the persistent device-side D9EncodingRefs mirror

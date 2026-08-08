@@ -41,6 +41,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <bit>
 #include <cfloat>
 #include <chrono>
 #include <cmath>
@@ -7116,17 +7117,19 @@ MTLD3D9Device::QueueBatchedDraw(BatchedDraw &&draw) {
   }
   // Per-draw queue cost (paired with BuildDrawCapture above).
   dxmt::perf::ScopedFrameDuration _record_timer(frameStats(), &dxmt::FrameStatistics::frame_draw_record_interval);
-  // Freeze POD state: m_encShadowDirty==0 means all draws in the chunk share
-  // one snapshot. Non-zero: build a fresh snapshot, overwriting only dirty
-  // axes. Resolve reads draw.pod_snapshot, letting setters skip
+  // Freeze POD state: m_encShadowDirty==0 means this draw can point at the
+  // snapshot the last one built. Non-zero: build a fresh snapshot, which
+  // copies the pointer header forward and rebuilds only the axes that moved,
+  // so the per-draw cost tracks what the app actually changed rather than the
+  // size of the state. Resolve reads draw.pod_snapshot, letting setters skip
   // FlushDrawBatch (each frozen independently). Storage comes from the
   // queue's command-data ring rather than the process heap: the snapshot is
   // recycled wholesale once its chunk retires, so the ~200 clusters a heavy
   // frame produces cost no allocator locking and no cross-thread frees. A
   // snapshot only stays valid for its own chunk; when the chunk has moved
-  // on, the previous block may already be recycled, so a chunk change
-  // rebuilds every axis from the device shadows instead of copying the old
-  // snapshot forward.
+  // on, the previous blocks may already be recycled, so a chunk change
+  // rebuilds every axis from the device shadows instead of inheriting any
+  // pointer from the old snapshot.
   static_assert(
       std::is_trivially_copyable_v<dxmt::D9EncodingState> && std::is_trivially_destructible_v<dxmt::D9EncodingState>,
       "ring-allocated snapshots are recycled without destruction"
@@ -7134,9 +7137,18 @@ MTLD3D9Device::QueueBatchedDraw(BatchedDraw &&draw) {
   const uint64_t snap_chunk = m_dxmtQueue->CurrentSeqId();
   const bool snap_reusable = m_encShadowLastSnap != nullptr && m_encShadowLastSnapChunk == snap_chunk;
   if (m_encShadowDirty != 0 || !snap_reusable) {
-    auto *snap = static_cast<dxmt::D9EncodingState *>(
-        m_dxmtQueue->AllocateCommandData(sizeof(dxmt::D9EncodingState), alignof(dxmt::D9EncodingState))
-    );
+    uint32_t dirty = snap_reusable ? m_encShadowDirty : dxmt::D9ES_DIRTY_ALL;
+    // The header plus one block per dirty axis, in a single suballocation: the
+    // ring takes a lock per call, so carving is cheaper than allocating each
+    // block on its own. Every block is an array of four-byte scalars and the
+    // header's size is a multiple of four, so bumping the cursor by each
+    // block's size keeps the next one aligned.
+    static_assert(sizeof(dxmt::D9EncodingState) % 4 == 0, "the block carve below relies on a 4-aligned cursor");
+    size_t snap_bytes = sizeof(dxmt::D9EncodingState);
+    for (unsigned axis = 0; axis < dxmt::D9ES_AXIS_COUNT; ++axis)
+      if (dirty & (1u << axis))
+        snap_bytes += dxmt::D9ES_AXIS_BYTES[axis];
+    auto *snap_mem = static_cast<char *>(m_dxmtQueue->AllocateCommandData(snap_bytes, alignof(dxmt::D9EncodingState)));
     // Without a snapshot the encode side has no state to resolve this draw
     // against, so drop it rather than construct through a pointer the
     // command-data ring could not back. This catches exhaustion only at a
@@ -7144,7 +7156,7 @@ MTLD3D9Device::QueueBatchedDraw(BatchedDraw &&draw) {
     // suballocation, while a later suballocation of that same block comes back
     // as a small offset from null and passes the test. Losing a draw beats
     // writing through the pointer in the case we can see.
-    if (snap == nullptr) {
+    if (snap_mem == nullptr) {
       dxmt::perf::addFrameCounter(frameStats(), &dxmt::FrameStatistics::frame_draw_dropped_snapshot_count);
       static std::once_flag warned;
       std::call_once(warned, []() {
@@ -7152,34 +7164,56 @@ MTLD3D9Device::QueueBatchedDraw(BatchedDraw &&draw) {
       });
       return;
     }
-    uint32_t dirty = m_encShadowDirty;
-    if (snap_reusable)
-      new (snap) dxmt::D9EncodingState(*m_encShadowLastSnap);
-    else {
-      new (snap) dxmt::D9EncodingState();
-      dirty = dxmt::D9ES_DIRTY_ALL;
+    // Copying the header forward is what makes a clean axis free: its pointer
+    // still names the block the previous draw built, which lives in the same
+    // chunk and so retires no earlier than this draw does.
+    auto *snap = snap_reusable ? new (snap_mem) dxmt::D9EncodingState(*m_encShadowLastSnap)
+                               : new (snap_mem) dxmt::D9EncodingState();
+    char *snap_cursor = snap_mem + sizeof(dxmt::D9EncodingState);
+    // Hand out the next block for a dirty axis. The sizing loop above walked
+    // the same mask over the same table, so the cursor cannot outrun the
+    // allocation.
+    auto carve_block = [&snap_cursor](uint32_t axis_bit) {
+      char *block = snap_cursor;
+      snap_cursor += dxmt::D9ES_AXIS_BYTES[std::countr_zero(axis_bit)];
+      return block;
+    };
+    if (dirty & dxmt::D9ES_DIRTY_RENDER_STATES) {
+      auto *blk = reinterpret_cast<dxmt::D9RenderStateBlock *>(carve_block(dxmt::D9ES_DIRTY_RENDER_STATES));
+      std::memcpy(blk->v, m_renderStates, sizeof(blk->v));
+      snap->render_states = blk;
     }
-    if (dirty & dxmt::D9ES_DIRTY_RENDER_STATES)
-      std::memcpy(snap->render_states, m_renderStates, sizeof(snap->render_states));
     if (dirty & dxmt::D9ES_DIRTY_SAMPLER_STATES) {
-      std::memcpy(snap->sampler_states, m_samplerStates, sizeof(snap->sampler_states));
+      auto *blk = reinterpret_cast<dxmt::D9SamplerStateBlock *>(carve_block(dxmt::D9ES_DIRTY_SAMPLER_STATES));
+      std::memcpy(blk->v, m_samplerStates, sizeof(blk->v));
+      snap->sampler_states = blk;
       // The FETCH4 latch only flips in a SetSamplerState path that also
       // rewrites the stored LOD bias, so it always co-moves with this axis.
       snap->fetch4_latch = m_fetch4Latch;
     }
     if (dirty & dxmt::D9ES_DIRTY_TEXTURE_STAGE_STATES) {
       static_assert(
-          sizeof(dxmt::D9EncodingState::texture_stage_states) == sizeof(m_textureStageStates),
+          sizeof(dxmt::D9TextureStageBlock) == sizeof(m_textureStageStates),
           "TSS snapshot shape must match the device member"
       );
-      std::memcpy(snap->texture_stage_states, m_textureStageStates, sizeof(snap->texture_stage_states));
+      auto *blk = reinterpret_cast<dxmt::D9TextureStageBlock *>(carve_block(dxmt::D9ES_DIRTY_TEXTURE_STAGE_STATES));
+      std::memcpy(blk->v, m_textureStageStates, sizeof(blk->v));
+      snap->texture_stage_states = blk;
     }
-    if (dirty & dxmt::D9ES_DIRTY_CLIP_PLANES)
-      std::memcpy(snap->clip_planes, m_clipPlanes, sizeof(snap->clip_planes));
-    if (dirty & dxmt::D9ES_DIRTY_STREAM_FREQ)
-      std::memcpy(snap->stream_freq, m_streamFreq, sizeof(snap->stream_freq));
+    if (dirty & dxmt::D9ES_DIRTY_CLIP_PLANES) {
+      auto *blk = reinterpret_cast<dxmt::D9ClipPlaneBlock *>(carve_block(dxmt::D9ES_DIRTY_CLIP_PLANES));
+      std::memcpy(blk->v, m_clipPlanes, sizeof(blk->v));
+      snap->clip_planes = blk;
+    }
+    if (dirty & dxmt::D9ES_DIRTY_STREAM_FREQ) {
+      auto *blk = reinterpret_cast<dxmt::D9StreamFreqBlock *>(carve_block(dxmt::D9ES_DIRTY_STREAM_FREQ));
+      std::memcpy(blk->v, m_streamFreq, sizeof(blk->v));
+      snap->stream_freq = blk;
+    }
     if (dirty & dxmt::D9ES_DIRTY_VS_CONST_F) {
-      std::memcpy(snap->vs_const_F, m_vsConstantsF, sizeof(snap->vs_const_F));
+      auto *blk = reinterpret_cast<dxmt::D9VsConstFBlock *>(carve_block(dxmt::D9ES_DIRTY_VS_CONST_F));
+      std::memcpy(blk->v, m_vsConstantsF, sizeof(blk->v));
+      snap->vs_const_F = blk;
       // A software / mixed-VP device with a bound shader that reaches the
       // extended constant file (c256..) needs it uploaded: either through
       // relative addressing (c[a0+N], any index) or a direct read/def past
@@ -7209,16 +7243,31 @@ MTLD3D9Device::QueueBatchedDraw(BatchedDraw &&draw) {
         }
       }
     }
-    if (dirty & dxmt::D9ES_DIRTY_VS_CONST_I)
-      std::memcpy(snap->vs_const_I, m_vsConstantsI, sizeof(snap->vs_const_I));
-    if (dirty & dxmt::D9ES_DIRTY_VS_CONST_B)
-      std::memcpy(snap->vs_const_B, m_vsConstantsB, sizeof(snap->vs_const_B));
-    if (dirty & dxmt::D9ES_DIRTY_PS_CONST_F)
-      std::memcpy(snap->ps_const_F, m_psConstantsF, sizeof(snap->ps_const_F));
-    if (dirty & dxmt::D9ES_DIRTY_PS_CONST_I)
-      std::memcpy(snap->ps_const_I, m_psConstantsI, sizeof(snap->ps_const_I));
-    if (dirty & dxmt::D9ES_DIRTY_PS_CONST_B)
-      std::memcpy(snap->ps_const_B, m_psConstantsB, sizeof(snap->ps_const_B));
+    if (dirty & dxmt::D9ES_DIRTY_VS_CONST_I) {
+      auto *blk = reinterpret_cast<dxmt::D9VsConstIBlock *>(carve_block(dxmt::D9ES_DIRTY_VS_CONST_I));
+      std::memcpy(blk->v, m_vsConstantsI, sizeof(blk->v));
+      snap->vs_const_I = blk;
+    }
+    if (dirty & dxmt::D9ES_DIRTY_VS_CONST_B) {
+      auto *blk = reinterpret_cast<dxmt::D9VsConstBBlock *>(carve_block(dxmt::D9ES_DIRTY_VS_CONST_B));
+      std::memcpy(blk->v, m_vsConstantsB, sizeof(blk->v));
+      snap->vs_const_B = blk;
+    }
+    if (dirty & dxmt::D9ES_DIRTY_PS_CONST_F) {
+      auto *blk = reinterpret_cast<dxmt::D9PsConstFBlock *>(carve_block(dxmt::D9ES_DIRTY_PS_CONST_F));
+      std::memcpy(blk->v, m_psConstantsF, sizeof(blk->v));
+      snap->ps_const_F = blk;
+    }
+    if (dirty & dxmt::D9ES_DIRTY_PS_CONST_I) {
+      auto *blk = reinterpret_cast<dxmt::D9PsConstIBlock *>(carve_block(dxmt::D9ES_DIRTY_PS_CONST_I));
+      std::memcpy(blk->v, m_psConstantsI, sizeof(blk->v));
+      snap->ps_const_I = blk;
+    }
+    if (dirty & dxmt::D9ES_DIRTY_PS_CONST_B) {
+      auto *blk = reinterpret_cast<dxmt::D9PsConstBBlock *>(carve_block(dxmt::D9ES_DIRTY_PS_CONST_B));
+      std::memcpy(blk->v, m_psConstantsB, sizeof(blk->v));
+      snap->ps_const_B = blk;
+    }
     if (dirty & dxmt::D9ES_DIRTY_FFP) {
       if (m_ffpWVPStale) {
         // Row-vector convention: out = v * world * view * projection.
@@ -7272,23 +7321,25 @@ MTLD3D9Device::QueueBatchedDraw(BatchedDraw &&draw) {
             !(proj.m[0][3] == 0.0f && proj.m[1][3] == 0.0f && proj.m[2][3] == 0.0f && proj.m[3][3] == 1.0f);
         m_ffpWVPStale = false;
       }
-      std::memcpy(snap->ffp_wvp, m_ffpWVP, sizeof(snap->ffp_wvp));
-      std::memcpy(snap->ffp_vp_inv, m_ffpVPInv, sizeof(snap->ffp_vp_inv));
-      std::memcpy(snap->ffp_wvp_blend, m_ffpWVPBlend, sizeof(snap->ffp_wvp_blend));
-      std::memcpy(snap->ffp_wv_z, m_ffpWVZ, sizeof(snap->ffp_wv_z));
-      std::memcpy(snap->ffp_wv_x, m_ffpWVX, sizeof(snap->ffp_wv_x));
-      std::memcpy(snap->ffp_wv_y, m_ffpWVY, sizeof(snap->ffp_wv_y));
-      std::memcpy(snap->ffp_wv_blend, m_ffpWVBlend, sizeof(snap->ffp_wv_blend));
-      std::memcpy(snap->ffp_normal, m_ffpNormal, sizeof(snap->ffp_normal));
+      auto *ffp = reinterpret_cast<dxmt::D9FfpBlock *>(carve_block(dxmt::D9ES_DIRTY_FFP));
+      snap->ffp = ffp;
+      std::memcpy(ffp->wvp, m_ffpWVP, sizeof(ffp->wvp));
+      std::memcpy(ffp->vp_inv, m_ffpVPInv, sizeof(ffp->vp_inv));
+      std::memcpy(ffp->wvp_blend, m_ffpWVPBlend, sizeof(ffp->wvp_blend));
+      std::memcpy(ffp->wv_z, m_ffpWVZ, sizeof(ffp->wv_z));
+      std::memcpy(ffp->wv_x, m_ffpWVX, sizeof(ffp->wv_x));
+      std::memcpy(ffp->wv_y, m_ffpWVY, sizeof(ffp->wv_y));
+      std::memcpy(ffp->wv_blend, m_ffpWVBlend, sizeof(ffp->wv_blend));
+      std::memcpy(ffp->normal, m_ffpNormal, sizeof(ffp->normal));
       snap->ffp_fog_coord_w = m_ffpFogCoordW ? 1u : 0u;
-      static_assert(sizeof(snap->ffp_material) <= sizeof(D3DMATERIAL9), "");
-      std::memcpy(snap->ffp_material, &m_material, sizeof(snap->ffp_material));
+      static_assert(sizeof(ffp->material) <= sizeof(D3DMATERIAL9), "");
+      std::memcpy(ffp->material, &m_material, sizeof(ffp->material));
       uint32_t li = 0;
       for (size_t i = 0; i < m_lights.size() && li < 8; ++i) {
         if (!m_lightEnables[i])
           continue;
-        static_assert(sizeof(D3DLIGHT9) <= sizeof(snap->ffp_lights[0]), "");
-        std::memcpy(snap->ffp_lights[li], &m_lights[i], sizeof(D3DLIGHT9));
+        static_assert(sizeof(D3DLIGHT9) <= sizeof(ffp->lights[0]), "");
+        std::memcpy(ffp->lights[li], &m_lights[i], sizeof(D3DLIGHT9));
         // D3D9 light position/direction are world space, but the vertex pipe
         // lights in view space (eye position/normal come from the world*view
         // columns). Both references upload the light already view-transformed;
@@ -7296,7 +7347,7 @@ MTLD3D9Device::QueueBatchedDraw(BatchedDraw &&draw) {
         // camera does not leave point lights displaced by V^-1 and directional
         // lights rotating with the view. The shader normalizes directions, so
         // leaving the view's scale in Direction is harmless.
-        auto *snap_light = reinterpret_cast<D3DLIGHT9 *>(snap->ffp_lights[li]);
+        auto *snap_light = reinterpret_cast<D3DLIGHT9 *>(ffp->lights[li]);
         const float pos_in[3] = {m_lights[i].Position.x, m_lights[i].Position.y, m_lights[i].Position.z};
         const float dir_in[3] = {m_lights[i].Direction.x, m_lights[i].Direction.y, m_lights[i].Direction.z};
         transform_row_vec3(m_transforms[0], pos_in, 1.0f, &snap_light->Position.x);
@@ -7304,8 +7355,8 @@ MTLD3D9Device::QueueBatchedDraw(BatchedDraw &&draw) {
         ++li;
       }
       snap->ffp_light_count = li;
-      static_assert(sizeof(snap->ffp_tex_mats) == sizeof(D3DMATRIX) * 8, "");
-      std::memcpy(snap->ffp_tex_mats, &m_transforms[2], sizeof(snap->ffp_tex_mats));
+      static_assert(sizeof(ffp->tex_mats) == sizeof(D3DMATRIX) * 8, "");
+      std::memcpy(ffp->tex_mats, &m_transforms[2], sizeof(ffp->tex_mats));
     }
     if (dirty & dxmt::D9ES_DIRTY_VS_CONST_F_MAX)
       snap->vs_const_f_max = m_vsConstFMax;
@@ -7585,7 +7636,7 @@ EmitCommonRenderSetup_d9(
   // Per-draw POD state lives on bd.pod_snapshot now; Resolve already read the
   // same frozen snapshot pointer above to populate bd.resolved_*, so reading
   // rs here observes the same snapshot.
-  const DWORD *rs = bd.pod_snapshot->render_states;
+  const DWORD *rs = bd.pod_snapshot->render_states->v;
 
   // Emit setVertex/FragmentBufferOffset when only the offset changed
   // (same buffer handle). Metal's offset-only update is roughly half
@@ -7905,7 +7956,7 @@ EmitDrawCommand_d9(ArgumentEncodingContext &ctx, const MTLD3D9Device::BatchedDra
   // instancing, so the two agree in practice.
   uint32_t instance_count = 1;
   if (bd.type == MTLD3D9Device::BatchedDraw::kIndexed) {
-    UINT s0_freq = bd.pod_snapshot->stream_freq[0];
+    UINT s0_freq = bd.pod_snapshot->stream_freq->v[0];
     if (s0_freq & D3DSTREAMSOURCE_INDEXEDDATA)
       instance_count = std::max(s0_freq & 0x007FFFFFu, 1u);
   }
@@ -8161,7 +8212,7 @@ MTLD3D9Device::PackDrawConstants(
     uint64_t chunk_coherent_id
 ) {
   const dxmt::D9EncodingState &pod = *bd.pod_snapshot;
-  const DWORD *rs = pod.render_states;
+  const DWORD *rs = pod.render_states->v;
   auto *vs = shape.vs;
   auto *ps = shape.ps;
   const bool ffp_vs = shape.ffp_vs;
@@ -8203,18 +8254,18 @@ MTLD3D9Device::PackDrawConstants(
   const bool ffp_world_clip = ffp_vs && !bd.resolved_position_transformed;
   D3DMATRIX ffp_vp_inv;
   if (ffp_world_clip)
-    std::memcpy(&ffp_vp_inv, pod.ffp_vp_inv, sizeof(ffp_vp_inv));
+    std::memcpy(&ffp_vp_inv, pod.ffp->vp_inv, sizeof(ffp_vp_inv));
   for (uint32_t i = 0; i < 8; ++i) {
     if (!(plane_enable & (1u << i)))
       continue;
     if (ffp_world_clip)
-      transform_clip_plane(ffp_vp_inv, pod.clip_planes[i], packed_clip_planes[clip_count]);
+      transform_clip_plane(ffp_vp_inv, pod.clip_planes->v[i], packed_clip_planes[clip_count]);
     else
-      std::memcpy(packed_clip_planes[clip_count], pod.clip_planes[i], sizeof(float) * 4);
+      std::memcpy(packed_clip_planes[clip_count], pod.clip_planes->v[i], sizeof(float) * 4);
     ++clip_count;
   }
-  uint32_t vs_b_bits = pack_bool_bits(pod.vs_const_B, D3D9_MAX_VS_CONST_B);
-  uint32_t ps_b_bits = pack_bool_bits(pod.ps_const_B, D3D9_MAX_PS_CONST_B);
+  uint32_t vs_b_bits = pack_bool_bits(pod.vs_const_B->v, D3D9_MAX_VS_CONST_B);
+  uint32_t ps_b_bits = pack_bool_bits(pod.ps_const_B->v, D3D9_MAX_PS_CONST_B);
   // Per-draw PS data sharing buffer(2), the shared PS uniform tail (DXVK's
   // D3D9SharedPS equivalent): bool bits at byte 0, D3DRS_FOGCOLOR as float4
   // rgba at byte 16, sampler LOD biases as float[16] at byte 32, table-fog
@@ -8235,7 +8286,7 @@ MTLD3D9Device::PackDrawConstants(
   uint32_t ps_b_blob[80] = {};
   ps_b_blob[0] = ps_b_bits;
   {
-    DWORD fog_c = pod.render_states[D3DRS_FOGCOLOR];
+    DWORD fog_c = pod.render_states->v[D3DRS_FOGCOLOR];
     float *fc = reinterpret_cast<float *>(&ps_b_blob[4]);
     fc[0] = static_cast<float>((fog_c >> 16) & 0xFF) / 255.0f;
     fc[1] = static_cast<float>((fog_c >> 8) & 0xFF) / 255.0f;
@@ -8260,7 +8311,7 @@ MTLD3D9Device::PackDrawConstants(
     // layout churn today.
     float *biases = reinterpret_cast<float *>(&ps_b_blob[8]);
     for (uint32_t i = 0; i < 16; ++i) {
-      uint32_t raw = static_cast<uint32_t>(pod.sampler_states[i][D3DSAMP_MIPMAPLODBIAS]);
+      uint32_t raw = static_cast<uint32_t>(pod.sampler_states->v[i][D3DSAMP_MIPMAPLODBIAS]);
       float b;
       std::memcpy(&b, &raw, sizeof(b));
       biases[i] = std::isfinite(b) ? std::clamp(b, -15.0f, 15.0f) : 0.0f;
@@ -8273,9 +8324,9 @@ MTLD3D9Device::PackDrawConstants(
     // are written unconditionally and cost nothing when unused.
     float *fog_params = reinterpret_cast<float *>(&ps_b_blob[24]);
     const DWORD raw[3] = {
-        pod.render_states[D3DRS_FOGSTART],
-        pod.render_states[D3DRS_FOGEND],
-        pod.render_states[D3DRS_FOGDENSITY],
+        pod.render_states->v[D3DRS_FOGSTART],
+        pod.render_states->v[D3DRS_FOGEND],
+        pod.render_states->v[D3DRS_FOGDENSITY],
     };
     std::memcpy(fog_params, raw, sizeof(raw));
   }
@@ -8288,7 +8339,7 @@ MTLD3D9Device::PackDrawConstants(
     // same per-sampler projected spec constant from this flag.
     uint32_t projected = 0;
     for (uint32_t s = 0; s < dxmt::D9ES_MAX_TEXTURE_STAGES; ++s) {
-      if (pod.texture_stage_states[s][D3DTSS_TEXTURETRANSFORMFLAGS] & D3DTTFF_PROJECTED)
+      if (pod.texture_stage_states->v[s][D3DTSS_TEXTURETRANSFORMFLAGS] & D3DTTFF_PROJECTED)
         projected |= 1u << s;
     }
     ps_b_blob[27] = projected;
@@ -8299,7 +8350,7 @@ MTLD3D9Device::PackDrawConstants(
     // (the shader only reads it when the compare FUNC is active); the
     // normalisation matches the immediate a specialised codegen would bake,
     // so a fixed ref renders identically. wined3d/DXVK normalise the same way.
-    float ref = static_cast<float>(pod.render_states[D3DRS_ALPHAREF] & 0xFF) / 255.0f;
+    float ref = static_cast<float>(pod.render_states->v[D3DRS_ALPHAREF] & 0xFF) / 255.0f;
     std::memcpy(&ps_b_blob[28], &ref, sizeof(ref));
   }
   {
@@ -8309,7 +8360,7 @@ MTLD3D9Device::PackDrawConstants(
     // into hardware coverage, and every other PS never reads the slot. The
     // enable bit gating that variant is resolved from the sample count at
     // draw time, so a mask left at the all-ones default is inert.
-    ps_b_blob[29] = pod.render_states[D3DRS_MULTISAMPLEMASK];
+    ps_b_blob[29] = pod.render_states->v[D3DRS_MULTISAMPLEMASK];
   }
   {
     // Per-stage TexBem bump-env: the 2x2 matrix (bm00, bm01, bm10, bm11)
@@ -8321,7 +8372,7 @@ MTLD3D9Device::PackDrawConstants(
     // from its own buffer(0) block, and that DXVK's D3D9SharedPS carries.
     float *bem = reinterpret_cast<float *>(&ps_b_blob[32]);
     for (uint32_t s = 0; s < 8; ++s) {
-      const DWORD *tss = pod.texture_stage_states[s];
+      const DWORD *tss = pod.texture_stage_states->v[s];
       const DWORD raw[6] = {
           tss[D3DTSS_BUMPENVMAT00], tss[D3DTSS_BUMPENVMAT01],  tss[D3DTSS_BUMPENVMAT10],
           tss[D3DTSS_BUMPENVMAT11], tss[D3DTSS_BUMPENVLSCALE], tss[D3DTSS_BUMPENVLOFFSET],
@@ -8411,7 +8462,7 @@ MTLD3D9Device::PackDrawConstants(
     point_params[2] = p.max;
   }
   const size_t sz[10] = {
-      vs_const_f_bytes,  sizeof(pod.vs_const_I),     sizeof(uint32_t), ps_const_f_bytes, sizeof(pod.ps_const_I),
+      vs_const_f_bytes,  sizeof(pod.vs_const_I->v),  sizeof(uint32_t), ps_const_f_bytes, sizeof(pod.ps_const_I->v),
       sizeof(ps_b_blob), sizeof(packed_clip_planes), sizeof(uint32_t), sizeof(vp_remap), sizeof(point_params),
   };
   size_t sub_off[10];
@@ -8429,34 +8480,34 @@ MTLD3D9Device::PackDrawConstants(
   // buffer(0) binding the register file uses; the world*view*projection
   // rows land at the sub-buffer head and the rest of the slot is inert.
   static_assert(
-      256 + 8 * 112 <= sizeof(pod.vs_const_F), "the ffp uniforms payload must fit the vertex constant sub-buffer"
+      256 + 8 * 112 <= sizeof(pod.vs_const_F->v), "the ffp uniforms payload must fit the vertex constant sub-buffer"
   );
   if (ffp_vs) {
     // Layout contract with compile_ffp_vs: float4 0..3 = wvp rows,
     // float4 4 = world*view z column, float4 5 = fog start/end/density.
     char *ffp_base = base + sub_off[0];
-    std::memcpy(ffp_base, pod.ffp_wvp, sizeof(pod.ffp_wvp));
-    std::memcpy(ffp_base + sizeof(pod.ffp_wvp), pod.ffp_wv_z, sizeof(pod.ffp_wv_z));
+    std::memcpy(ffp_base, pod.ffp->wvp, sizeof(pod.ffp->wvp));
+    std::memcpy(ffp_base + sizeof(pod.ffp->wvp), pod.ffp->wv_z, sizeof(pod.ffp->wv_z));
     const DWORD fog_raw[3] = {
-        pod.render_states[D3DRS_FOGSTART],
-        pod.render_states[D3DRS_FOGEND],
-        pod.render_states[D3DRS_FOGDENSITY],
+        pod.render_states->v[D3DRS_FOGSTART],
+        pod.render_states->v[D3DRS_FOGEND],
+        pod.render_states->v[D3DRS_FOGDENSITY],
     };
-    std::memcpy(ffp_base + sizeof(pod.ffp_wvp) + sizeof(pod.ffp_wv_z), fog_raw, sizeof(fog_raw));
+    std::memcpy(ffp_base + sizeof(pod.ffp->wvp) + sizeof(pod.ffp->wv_z), fog_raw, sizeof(fog_raw));
     // Point-scale block (layout contract float4 6..9): the world*view
     // x and y columns, the scale factors with the viewport height,
     // and the raw size with its clamp bounds.
-    std::memcpy(ffp_base + 96, pod.ffp_wv_x, sizeof(pod.ffp_wv_x));
-    std::memcpy(ffp_base + 112, pod.ffp_wv_y, sizeof(pod.ffp_wv_y));
+    std::memcpy(ffp_base + 96, pod.ffp->wv_x, sizeof(pod.ffp->wv_x));
+    std::memcpy(ffp_base + 112, pod.ffp->wv_y, sizeof(pod.ffp->wv_y));
     float scale_blk[8] = {};
-    std::memcpy(&scale_blk[0], &pod.render_states[D3DRS_POINTSCALE_A], sizeof(float));
-    std::memcpy(&scale_blk[1], &pod.render_states[D3DRS_POINTSCALE_B], sizeof(float));
-    std::memcpy(&scale_blk[2], &pod.render_states[D3DRS_POINTSCALE_C], sizeof(float));
+    std::memcpy(&scale_blk[0], &pod.render_states->v[D3DRS_POINTSCALE_A], sizeof(float));
+    std::memcpy(&scale_blk[1], &pod.render_states->v[D3DRS_POINTSCALE_B], sizeof(float));
+    std::memcpy(&scale_blk[2], &pod.render_states->v[D3DRS_POINTSCALE_C], sizeof(float));
     scale_blk[3] = static_cast<float>(pod.viewport.Height);
-    std::memcpy(&scale_blk[4], &pod.render_states[D3DRS_POINTSIZE], sizeof(float));
+    std::memcpy(&scale_blk[4], &pod.render_states->v[D3DRS_POINTSIZE], sizeof(float));
     float mn, mx;
-    std::memcpy(&mn, &pod.render_states[D3DRS_POINTSIZE_MIN], sizeof(float));
-    std::memcpy(&mx, &pod.render_states[D3DRS_POINTSIZE_MAX], sizeof(float));
+    std::memcpy(&mn, &pod.render_states->v[D3DRS_POINTSIZE_MIN], sizeof(float));
+    std::memcpy(&mx, &pod.render_states->v[D3DRS_POINTSIZE_MAX], sizeof(float));
     // Raw minimum (a negative pulled to 0), matching compute_point_size_params
     // so both vertex paths clamp identically; a size clamped to 0 draws nothing.
     scale_blk[5] = std::isfinite(mn) ? (mn > 0.0f ? mn : 0.0f) : 1.0f;
@@ -8465,12 +8516,12 @@ MTLD3D9Device::PackDrawConstants(
     // Lighting block (layout contract float4 10..15 + 7 per light):
     // material colors, power and the packed light count, the global
     // ambient, then the host-packed enabled lights.
-    std::memcpy(ffp_base + 160, pod.ffp_material, 64);
-    float misc[4] = {pod.ffp_material[16], static_cast<float>(pod.ffp_light_count), 0.f, 0.f};
+    std::memcpy(ffp_base + 160, pod.ffp->material, 64);
+    float misc[4] = {pod.ffp->material[16], static_cast<float>(pod.ffp_light_count), 0.f, 0.f};
     std::memcpy(ffp_base + 224, misc, sizeof(misc));
     float amb[4];
     {
-      DWORD a = pod.render_states[D3DRS_AMBIENT];
+      DWORD a = pod.render_states->v[D3DRS_AMBIENT];
       amb[0] = static_cast<float>((a >> 16) & 0xFF) / 255.0f;
       amb[1] = static_cast<float>((a >> 8) & 0xFF) / 255.0f;
       amb[2] = static_cast<float>(a & 0xFF) / 255.0f;
@@ -8478,7 +8529,7 @@ MTLD3D9Device::PackDrawConstants(
     }
     std::memcpy(ffp_base + 240, amb, sizeof(amb));
     for (uint32_t li = 0; li < pod.ffp_light_count; ++li) {
-      const D3DLIGHT9 *lp = reinterpret_cast<const D3DLIGHT9 *>(pod.ffp_lights[li]);
+      const D3DLIGHT9 *lp = reinterpret_cast<const D3DLIGHT9 *>(pod.ffp->lights[li]);
       float blk[28] = {};
       std::memcpy(&blk[0], &lp->Diffuse, 16);
       std::memcpy(&blk[4], &lp->Specular, 16);
@@ -8507,8 +8558,8 @@ MTLD3D9Device::PackDrawConstants(
     // copied into w for the fragment-side divide.
     for (uint32_t s = 0; s < 8; ++s) {
       float m[16];
-      std::memcpy(m, pod.ffp_tex_mats[s], sizeof(m));
-      DWORD ttf = pod.texture_stage_states[s][D3DTSS_TEXTURETRANSFORMFLAGS];
+      std::memcpy(m, pod.ffp->tex_mats[s], sizeof(m));
+      DWORD ttf = pod.texture_stage_states->v[s][D3DTSS_TEXTURETRANSFORMFLAGS];
       // Count is the flags with only the PROJECTED bit removed (wined3d
       // compute_texture_matrix), so any high-bit garbage falls to the
       // identity arm rather than aliasing a 2..4 count.
@@ -8517,8 +8568,8 @@ MTLD3D9Device::PackDrawConstants(
       // (wined3d get_texture_matrix passes attrib_count 3 for them). The
       // coordinate index clamps to the last texcoord set (wined3d
       // min(index, WINED3D_MAX_FFP_TEXTURES - 1)) rather than wrapping.
-      uint32_t coord_idx = pod.texture_stage_states[s][D3DTSS_TEXCOORDINDEX] & 0xFFFFu;
-      uint32_t aw = ((pod.texture_stage_states[s][D3DTSS_TEXCOORDINDEX] >> 16) & 0xFFFFu)
+      uint32_t coord_idx = pod.texture_stage_states->v[s][D3DTSS_TEXCOORDINDEX] & 0xFFFFu;
+      uint32_t aw = ((pod.texture_stage_states->v[s][D3DTSS_TEXCOORDINDEX] >> 16) & 0xFFFFu)
                         ? 3u
                         : ffp_texcoord_width[coord_idx > 7u ? 7u : coord_idx];
       auto row = [&](uint32_t r) { return m + r * 4; };
@@ -8552,25 +8603,25 @@ MTLD3D9Device::PackDrawConstants(
     }
     // Vertex-blend companions (layout contract float4 104 + 4 per
     // extra matrix): world matrices 1..3 folded with view*projection.
-    std::memcpy(ffp_base + 1664, pod.ffp_wvp_blend, sizeof(pod.ffp_wvp_blend));
+    std::memcpy(ffp_base + 1664, pod.ffp->wvp_blend, sizeof(pod.ffp->wvp_blend));
     // Vertex-blend eye-space columns (layout contract float4 116 + 3 per
     // extra matrix): world matrices 1..3 folded with view only, so the
     // shader blends the eye position and normal across the same matrices
     // the clip position uses.
-    std::memcpy(ffp_base + 1856, pod.ffp_wv_blend, sizeof(pod.ffp_wv_blend));
+    std::memcpy(ffp_base + 1856, pod.ffp->wv_blend, sizeof(pod.ffp->wv_blend));
     // Inverse-transpose normal matrix (layout contract float4 125..127):
     // the x/y/z rows of inverse(matrix-0 world*view) for the eye normal.
-    std::memcpy(ffp_base + 2000, pod.ffp_normal, sizeof(pod.ffp_normal));
+    std::memcpy(ffp_base + 2000, pod.ffp->normal, sizeof(pod.ffp->normal));
   } else {
     // Hot registers (< 256) from the POD shadow; extended registers (>= 256)
     // from the captured overflow snapshot. sz[0] is the sub-buffer size the
     // extent already computed: when it stays within the 256 shadow (every
     // hardware-VP draw) this is the same single memcpy as before.
-    const size_t hot_bytes = std::min<size_t>(sz[0], sizeof(pod.vs_const_F));
-    std::memcpy(base + sub_off[0], pod.vs_const_F, hot_bytes);
-    if (sz[0] > sizeof(pod.vs_const_F)) {
-      char *ext_dst = base + sub_off[0] + sizeof(pod.vs_const_F);
-      const size_t ext_bytes = sz[0] - sizeof(pod.vs_const_F);
+    const size_t hot_bytes = std::min<size_t>(sz[0], sizeof(pod.vs_const_F->v));
+    std::memcpy(base + sub_off[0], pod.vs_const_F->v, hot_bytes);
+    if (sz[0] > sizeof(pod.vs_const_F->v)) {
+      char *ext_dst = base + sub_off[0] + sizeof(pod.vs_const_F->v);
+      const size_t ext_bytes = sz[0] - sizeof(pod.vs_const_F->v);
       const size_t have_bytes = pod.vs_const_F_overflow ? static_cast<size_t>(pod.vs_const_F_overflow_count) * 16u : 0u;
       const size_t copy = std::min(ext_bytes, have_bytes);
       if (copy)
@@ -8579,7 +8630,7 @@ MTLD3D9Device::PackDrawConstants(
         std::memset(ext_dst + copy, 0, ext_bytes - copy);
     }
   }
-  std::memcpy(base + sub_off[1], pod.vs_const_I, sz[1]);
+  std::memcpy(base + sub_off[1], pod.vs_const_I->v, sz[1]);
   std::memcpy(base + sub_off[2], &vs_b_bits, sz[2]);
   if (!ps) {
     // Layout contract with the generated PS's combiner: float4 0 =
@@ -8592,23 +8643,23 @@ MTLD3D9Device::PackDrawConstants(
       dst[2] = static_cast<float>(c & 0xFF) / 255.0f;
       dst[3] = static_cast<float>((c >> 24) & 0xFF) / 255.0f;
     };
-    unpack(pod.render_states[D3DRS_TEXTUREFACTOR], &ps_consts[0]);
+    unpack(pod.render_states->v[D3DRS_TEXTUREFACTOR], &ps_consts[0]);
     for (uint32_t s = 0; s < 8; ++s)
-      unpack(pod.texture_stage_states[s][D3DTSS_CONSTANT], &ps_consts[4 + s * 4]);
+      unpack(pod.texture_stage_states->v[s][D3DTSS_CONSTANT], &ps_consts[4 + s * 4]);
     // Bump-env constants (float4 9..16 the 2x2 matrices, 17..24 the
     // luminance scale and offset pairs); the stage states store raw
     // float bits in their DWORD slots.
     for (uint32_t s = 0; s < 8; ++s) {
-      std::memcpy(&ps_consts[36 + s * 4], &pod.texture_stage_states[s][D3DTSS_BUMPENVMAT00], 2 * sizeof(float));
-      std::memcpy(&ps_consts[38 + s * 4], &pod.texture_stage_states[s][D3DTSS_BUMPENVMAT10], 2 * sizeof(float));
-      std::memcpy(&ps_consts[68 + s * 4], &pod.texture_stage_states[s][D3DTSS_BUMPENVLSCALE], sizeof(float));
-      std::memcpy(&ps_consts[69 + s * 4], &pod.texture_stage_states[s][D3DTSS_BUMPENVLOFFSET], sizeof(float));
+      std::memcpy(&ps_consts[36 + s * 4], &pod.texture_stage_states->v[s][D3DTSS_BUMPENVMAT00], 2 * sizeof(float));
+      std::memcpy(&ps_consts[38 + s * 4], &pod.texture_stage_states->v[s][D3DTSS_BUMPENVMAT10], 2 * sizeof(float));
+      std::memcpy(&ps_consts[68 + s * 4], &pod.texture_stage_states->v[s][D3DTSS_BUMPENVLSCALE], sizeof(float));
+      std::memcpy(&ps_consts[69 + s * 4], &pod.texture_stage_states->v[s][D3DTSS_BUMPENVLOFFSET], sizeof(float));
     }
-    static_assert(sizeof(ps_consts) <= sizeof(pod.ps_const_F), "");
+    static_assert(sizeof(ps_consts) <= sizeof(pod.ps_const_F->v), "");
     std::memcpy(base + sub_off[3], ps_consts, sizeof(ps_consts));
   } else
-    std::memcpy(base + sub_off[3], pod.ps_const_F, sz[3]);
-  std::memcpy(base + sub_off[4], pod.ps_const_I, sz[4]);
+    std::memcpy(base + sub_off[3], pod.ps_const_F->v, sz[3]);
+  std::memcpy(base + sub_off[4], pod.ps_const_I->v, sz[4]);
   std::memcpy(base + sub_off[5], ps_b_blob, sz[5]);
   std::memcpy(base + sub_off[6], packed_clip_planes, sz[6]);
   std::memcpy(base + sub_off[7], &clip_count, sz[7]);
@@ -8704,9 +8755,9 @@ MTLD3D9Device::ResolveBatchedDrawForChunk(
   // through `*bd.pod_snapshot`; guaranteed non-null because
   // QueueBatchedDraw populates it before push_back.
   const dxmt::D9EncodingState &pod = *bd.pod_snapshot;
-  const DWORD *rs = pod.render_states;
-  const DWORD(*samp_states)[D3DSAMP_DMAPOFFSET + 1] = pod.sampler_states;
-  const UINT *stream_freq = pod.stream_freq;
+  const DWORD *rs = pod.render_states->v;
+  const DWORD(*samp_states)[D3DSAMP_DMAPOFFSET + 1] = pod.sampler_states->v;
+  const UINT *stream_freq = pod.stream_freq->v;
 
   // Cluster cache: pod/ref pointer-equality implies byte-equality.
   // ~80% hit rate; per-hit saves PSO lookup, 16 per-stage sampler/view operations, compiles.
@@ -9030,7 +9081,7 @@ MTLD3D9Device::ResolveBatchedDrawForChunk(
     uint32_t ffp_texcoord_index_key = 0;
     if (ffp_vs) {
       for (uint32_t s = 0; s < 8; ++s) {
-        DWORD ttf = pod.texture_stage_states[s][D3DTSS_TEXTURETRANSFORMFLAGS];
+        DWORD ttf = pod.texture_stage_states->v[s][D3DTSS_TEXTURETRANSFORMFLAGS];
         // A bare PROJECTED flag with a zero count still transforms (the
         // identity-with-divisor arm of the matrix preprocessing). A pre-
         // transformed (XYZRHW) draw never applies the texcoord matrix:
@@ -9043,10 +9094,10 @@ MTLD3D9Device::ResolveBatchedDrawForChunk(
         // utils.c copies the raw TEXCOORDINDEX per stage and a
         // generated stage ignores the low coordinate index, writing
         // the stage's own varying.
-        uint32_t tci_mode = (pod.texture_stage_states[s][D3DTSS_TEXCOORDINDEX] >> 16) & 0xFFFFu;
+        uint32_t tci_mode = (pod.texture_stage_states->v[s][D3DTSS_TEXCOORDINDEX] >> 16) & 0xFFFFu;
         if (tci_mode >= 1 && tci_mode <= 4)
           ffp_texgen_key |= tci_mode << (s * 3);
-        ffp_texcoord_index_key |= (pod.texture_stage_states[s][D3DTSS_TEXCOORDINDEX] & 7u) << (s * 3);
+        ffp_texcoord_index_key |= (pod.texture_stage_states->v[s][D3DTSS_TEXCOORDINDEX] & 7u) << (s * 3);
       }
       if (ffp_texgen_key != 0 && rs[D3DRS_NORMALIZENORMALS] != FALSE)
         ffp_texgen_key |= 1u << 24;
@@ -9307,7 +9358,7 @@ MTLD3D9Device::ResolveBatchedDrawForChunk(
     uint32_t ffp_stages[8][3] = {};
     if (ffp_ps) {
       for (uint32_t s = 0; s < 8; ++s) {
-        const DWORD *tss = pod.texture_stage_states[s];
+        const DWORD *tss = pod.texture_stage_states->v[s];
         uint32_t color_op = tss[D3DTSS_COLOROP] & 0xFF;
         uint32_t alpha_op = tss[D3DTSS_ALPHAOP] & 0xFF;
         if (s > 0 && color_op == D3DTOP_DISABLE) {
