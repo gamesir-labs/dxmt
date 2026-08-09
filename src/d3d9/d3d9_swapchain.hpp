@@ -4,6 +4,7 @@
 #include "com/com_object.hpp"
 #include "com/com_pointer.hpp"
 #include "d3d9.h"
+#include "dxmt_hud_state.hpp"
 #include "rc/util_rc_ptr.hpp"
 #include <unordered_map>
 #include <vector>
@@ -211,6 +212,11 @@ private:
   // params.hDeviceWindow / hFocusWindow before construction.
   // Null on headless chains.
   HWND m_hWindow = nullptr;
+  // Metal developer HUD heading, so a running title names which layer is
+  // serving it the way the d3d11 chain does. The properties object is a
+  // process-wide singleton; Metal shows the panel only when the HUD is
+  // enabled, so this costs nothing when it is not.
+  HUDState m_hud;
   // Shared presenter that owns the present_blit / present_scale PSOs and
   // does the scale-with-letterbox blit at Present time. Null on headless
   // chains (no m_layer). The dtor explicitly resets this before

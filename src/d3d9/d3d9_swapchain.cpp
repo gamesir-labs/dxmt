@@ -17,6 +17,7 @@
 #include "dxmt_command_queue.hpp"
 #include "dxmt_context.hpp"
 #include "dxmt_format.hpp"
+#include "dxmt_info.hpp"
 #include "dxmt_presenter.hpp"
 #include "util_env.hpp"
 #include "wsi_monitor.hpp"
@@ -291,7 +292,8 @@ MTLD3D9SwapChain::MTLD3D9SwapChain(
     m_device(device),
     m_isEx(isEx),
     m_isImplicit(isImplicit),
-    m_params(params) {
+    m_params(params),
+    m_hud(WMT::DeveloperHUDProperties::instance()) {
   // GetPresentParameters reports the resolved device window: the app's
   // hDeviceWindow when non-null, otherwise the device's focus window. Store
   // the effective window so the reported params match what D3D9 substitutes
@@ -307,6 +309,12 @@ MTLD3D9SwapChain::MTLD3D9SwapChain(
   }
 
   createPresentTarget(hEffectiveWindow);
+
+  // Name the layer on the developer HUD the way the d3d11 chain does. Ordered
+  // after the Metal view exists, since the HUD properties singleton only comes
+  // up once a layer is presenting. D3D9 predates feature levels; 0x9300 shapes
+  // the heading like the sibling's rather than reporting an unknown one.
+  m_hud.initialize(GetVersionDescriptionText(9, 0x9300));
 }
 
 void
