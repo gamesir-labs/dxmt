@@ -6014,7 +6014,7 @@ MTLD3D9Device::SetTransform(D3DTRANSFORMSTATETYPE State, const D3DMATRIX *pMatri
   // shape; same for every recording arm below).
   if (m_inStateBlockRecord) {
     m_recordingBlock->m_snapTransforms[idx] = *pMatrix;
-    m_recordingBlock->m_changes.transforms = true;
+    m_recordingBlock->m_changes.markTransform(idx);
     return D3D_OK;
   }
   // Unchanged-value short-circuit. D3DX-style engines re-set the same
@@ -6261,7 +6261,7 @@ MTLD3D9Device::SetClipPlane(DWORD Index, const float *pPlane) {
   if (m_inStateBlockRecord) {
     for (uint32_t i = 0; i < 4; ++i)
       m_recordingBlock->m_snapClipPlanes[Index][i] = pPlane[i];
-    m_recordingBlock->m_changes.clip_planes = true;
+    m_recordingBlock->m_changes.markClipPlane(Index);
     return D3D_OK;
   }
   // Unchanged-value short-circuit. The clip-plane array is in
@@ -6420,15 +6420,16 @@ MTLD3D9Device::BeginStateBlock() {
   // returned block (wine d3d9 device.c repoints device->update_state;
   // DXVK allocates m_recorder the same way at BeginStateBlock).
   //
-  // Seed-capture the coarse-masked categories from live state. KNOWN
-  // DIVERGENCE from the per-element tracking wined3d / DXVK do: where
-  // the changed mask is one bit per category (sampler states, texture
-  // stage states, transforms, clip planes, lights, VS/PS I+B constant
-  // files, gaps inside the recorded F-constant range), recording ONE
-  // element marks the whole category and Apply restores the
-  // un-recorded siblings to these Begin-time values, not the live
-  // values at Apply time. Render states are per-state exact; textures
-  // and streams are per-slot; F constants are range-tracked. The
+  // Seed-capture the coarse-masked categories from live state. Exact per
+  // element: render states, transforms, clip planes, textures and streams
+  // (per slot), and F constants (range-tracked). KNOWN DIVERGENCE from the
+  // per-element tracking wined3d and DXVK do, for what is left: where the
+  // changed mask is still one bit per category (sampler states, texture stage
+  // states, lights, VS/PS I+B constant files, gaps inside the recorded
+  // F-constant range), recording ONE element marks the whole category and
+  // Apply restores the un-recorded siblings to these Begin-time values rather
+  // than the live values at Apply time. The seed is what makes that survivable:
+  // without it those siblings would restore to zero. The
   // ref-pinned single-slot categories (textures, streams, index
   // buffer, decl, shaders) are NOT seeded: a recorded Set wholly
   // overwrites those snapshot slots, and skipping the seed keeps the
