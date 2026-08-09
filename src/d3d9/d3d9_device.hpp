@@ -1214,6 +1214,22 @@ private:
       ResolveCache &resolve_cache
   );
 
+  // Resolve the cluster-stable half of a draw: the IA layout, the vertex and
+  // pixel variant keys, the PSO, the DSSO, the per-stage textures and
+  // samplers, and the render-target / depth-stencil bundle. Split out of
+  // ResolveBatchedDrawForChunk as the arm the cluster cache exists to skip: it
+  // runs on a miss, fills bd, then records the same fields into resolve_cache
+  // for the draws behind it. The caller owns the gates it reads; a draw with
+  // no declaration or no colour target never reaches here, and the
+  // fixed-function stage selection is already made. The declaration-derived
+  // texcoord widths go back through ffp_texcoord_width, which both the cluster
+  // cache and the constant packer key on. Returns false when the draw cannot
+  // be resolved.
+  bool ResolveClusterState(
+      BatchedDraw &bd, ResolveCache &resolve_cache, const D9EncodingRefs &refs, bool ffp_vs, bool ffp_ps,
+      uint32_t *ffp_texcoord_width
+  );
+
   // What the draw's shader pair looks like to the constant packer: which
   // stages the fixed-function generator supplies, and which read constants
   // relatively (c[a0.x + n]), since a relative read decides both the upload

@@ -8452,7 +8452,7 @@ MTLD3D9Device::PackDrawConstants(
   // a const-upload cache entry shared by a point and a non-point draw
   // carries the right values; only injecting point draws bind it. The
   // programmable VS clamps the size against these bounds the way DXVK's
-  // GetPointSizeInfoVS does, so one variant serves every point size.
+  // DXVK does, so one variant serves every point size.
   float point_params[4] = {};
   {
     dxmt::D3D9PointSizeParams p =
@@ -8696,6 +8696,1075 @@ MTLD3D9Device::PackDrawConstants(
 }
 
 bool
+MTLD3D9Device::ResolveClusterState(
+    BatchedDraw &bd, ResolveCache &resolve_cache, const D9EncodingRefs &refs, bool ffp_vs, bool ffp_ps,
+    uint32_t *ffp_texcoord_width
+) {
+  auto &cap = bd.cap;
+  auto *vs = refs.vertex_shader.ptr();
+  auto *ps = refs.pixel_shader.ptr();
+  auto *decl = refs.vertex_declaration.ptr();
+  auto *rt0 = refs.render_targets[0].ptr();
+  const dxmt::D9EncodingState &pod = *bd.pod_snapshot;
+  const DWORD *rs = pod.render_states->v;
+  const DWORD(*samp_states)[D3DSAMP_DMAPOFFSET + 1] = pod.sampler_states->v;
+  const UINT *stream_freq = pod.stream_freq->v;
+  const bool up_vb = bd.override_vb_buffer != 0;
+  const bool up_ib = bd.override_ib_buffer != 0;
+  const bool indexed = (bd.type == BatchedDraw::kIndexed);
+  // Pre-convert viewport / scissor to Metal shape so per-draw emit does not
+  // re-run the helpers.
+  bd.resolved_viewport = wmt_viewport_from_d3d9(pod.viewport);
+  bd.resolved_scissor = wmt_scissor_from_d3d9(pod.scissor_rect, pod.viewport, rs[D3DRS_SCISSORTESTENABLE] != 0);
+
+  // ---- IA layout ----
+  // D3D9 caps vertex declarations at MAX_FVF_DECL_SIZE = 64 elements
+  // (D3DDECL_END terminator brings the typical cap to ~16 active);
+  // a stack-resident array avoids the per-draw std::vector heap alloc
+  // entirely. decl->elementCount() includes the terminator, so the
+  // bound here is a generous 64.
+  DXSO_IA_INPUT_ELEMENT elements[64];
+  uint32_t element_count = 0;
+  uint32_t slot_mask = 0;
+  bool decl_position_transformed = false;
+  bool ffp_has_diffuse = false;
+  bool ffp_has_texcoord0 = false;
+  bool ffp_has_specular = false;
+  bool ffp_has_normal = false;
+  bool ffp_has_psize = false;
+  uint32_t ffp_texcoord_mask = 0;
+  bool ffp_decl_has_diffuse = false;
+  bool ffp_decl_has_specular = false;
+  for (UINT i = 0; i < decl->elementCount(); ++i) {
+    const D3DVERTEXELEMENT9 &e = decl->elements()[i];
+    if (e.Stream == 0xFF)
+      continue;
+    // Filter elements past the 16-stream cap wholesale, before any per-stream
+    // read (wined3d vertexdeclaration.c, "filter tessellation pseudo streams"):
+    // such a stream has no vertex_buffers[]/stream_freq[] slot, so it must not
+    // reach the material-source bookkeeping below, and 1u << Stream would be an
+    // out-of-range shift. CreateVertexDeclaration accepts the decl (both refs
+    // do); the draw drops the element. should_skip_ia_element encodes the same
+    // past-cap rule, but the guard here also protects the reads that precede it.
+    if (e.Stream >= D3D9_MAX_VERTEX_STREAMS)
+      continue;
+    // Declaration presence, independent of stream liveness: the material
+    // source validation below keys on whether the declaration carries the
+    // color at all (wined3d validate_material_colour_source); an element
+    // declared on an unbound stream keeps its selector and zero-fills
+    // through the fetch instead.
+    if (ffp_vs && e.Usage == D3DDECLUSAGE_COLOR) {
+      if (e.UsageIndex == 0)
+        ffp_decl_has_diffuse = true;
+      else if (e.UsageIndex == 1)
+        ffp_decl_has_specular = true;
+    }
+    // An element on a stream with no bound vertex buffer drops out of
+    // the layout instead of failing the draw: wined3d derives stream
+    // liveness per draw (context.c wined3d_stream_info_from_declaration)
+    // and still renders, with the unfed shader input reading its
+    // zero-fill default. A declaration-only stream reference is common
+    // in runner-style harnesses that always declare a position element.
+    // Stream is in-cap here (guarded above), so the per-stream read is safe.
+    const bool has_live_stream =
+        refs.vertex_buffers[e.Stream].ptr() != nullptr || (e.Stream == 0 && bd.override_vb_buffer != 0);
+    if (should_skip_ia_element(e.Stream, has_live_stream)) {
+      // A PSIZE declared on an unfed stream still sets the point size: D3D9
+      // reads the missing per-vertex size as 1 (AMD / WARP), not the render
+      // state. Mark the per-vertex path even though the element drops out of
+      // the layout; with no element backing it the generated VS emits size 1.
+      if (e.Usage == D3DDECLUSAGE_PSIZE)
+        ffp_has_psize = true;
+      continue;
+    }
+    // A pre-transformed position element (D3DDECLUSAGE_POSITIONT) carries
+    // window-space coordinates. D3D9 routes such a draw through the fixed-
+    // function pre-transform and ignores the bound vertex shader (per spec),
+    // which is why ffp_vs was forced true above for a pre-transformed decl.
+    // The generated FFP vertex shader consumes the POSITIONT element as its
+    // position input (matched to reg 0 below) and applies the screen->clip
+    // remap from the viewport uniform (vp_remap).
+    uint32_t match_usage = e.Usage;
+    if (e.Usage == D3DDECLUSAGE_POSITIONT)
+      match_usage = D3DDECLUSAGE_POSITION;
+    int vs_reg = -1;
+    if (ffp_vs) {
+      // Generated-VS register contract (ffp_input_register, airconv_public.h):
+      // the injective (usage, index) -> input register map. Derive the material-
+      // source flags and texcoord widths off the resolved register; the map is
+      // injective, so each register unambiguously identifies its semantic.
+      vs_reg = ffp_input_register(match_usage, e.UsageIndex);
+      switch (vs_reg) {
+      case 1:
+        ffp_has_diffuse = true;
+        break;
+      case 3:
+        ffp_has_specular = true;
+        break;
+      case 4:
+        ffp_has_normal = true;
+        break;
+      case 13:
+        ffp_has_psize = true;
+        break;
+      case 2:
+        ffp_has_texcoord0 = true;
+        ffp_texcoord_mask |= 1u;
+        ffp_texcoord_width[0] = texcoord_component_count(e.Type);
+        break;
+      default:
+        // Registers 5..11 are texcoord sets 1..7 (reg = 4 + UsageIndex).
+        if (vs_reg >= 5 && vs_reg <= 11) {
+          const uint32_t tex_set = static_cast<uint32_t>(vs_reg) - 4u;
+          ffp_texcoord_mask |= 1u << tex_set;
+          ffp_texcoord_width[tex_set] = texcoord_component_count(e.Type);
+        }
+        break;
+      }
+    } else
+      for (const auto &d : vs->metadata().dcls) {
+        if (d.bound_to.type == DxsoRegisterType::Input && static_cast<uint32_t>(d.dcl.usage) == match_usage &&
+            d.dcl.usage_index == e.UsageIndex) {
+          vs_reg = static_cast<int>(d.bound_to.num);
+          break;
+        }
+      }
+    if (vs_reg < 0)
+      continue;
+    // Flag the draw only once the POSITIONT element actually feeds a VS input,
+    // so a declared-but-unconsumed position doesn't force the transformed variant.
+    if (e.Usage == D3DDECLUSAGE_POSITIONT)
+      decl_position_transformed = true;
+    if (element_count >= 64)
+      break;
+    DXSO_IA_INPUT_ELEMENT &elem = elements[element_count++];
+    elem = DXSO_IA_INPUT_ELEMENT{};
+    elem.reg = static_cast<uint32_t>(vs_reg);
+    elem.slot = e.Stream;
+    elem.aligned_byte_offset = e.Offset;
+    elem.format = to_mtl_attr_format(e.Type);
+    UINT freq = stream_freq[e.Stream];
+    if (freq & D3DSTREAMSOURCE_INSTANCEDATA) {
+      elem.step_function = 1;
+      // INSTANCEDATA | 0 is a legal API input (matches native D3D9);
+      // Metal cannot encode a per-instance stepRate of 0, so clamp the
+      // divider to >= 1 the same way instance_count is clamped above.
+      elem.step_rate = std::max(freq & 0x007FFFFFu, 1u);
+    } else {
+      elem.step_function = 0;
+      elem.step_rate = 0;
+    }
+    slot_mask |= (1u << e.Stream);
+  }
+  // element_count of zero is a legal draw: a constant-output VS with a
+  // declaration whose only elements sit on unbound streams (filtered
+  // above) fetches nothing and every dcl'd input zero-fills.
+  bd.resolved_slot_mask = slot_mask;
+
+  DXSO_INDEX_BUFFER_FORMAT ib_fmt = DXSO_INDEX_BUFFER_FORMAT_NONE;
+  if (indexed) {
+    D3DFORMAT d3d_ib_format;
+    if (bd.override_ib_buffer != 0) {
+      d3d_ib_format = bd.override_ib_format;
+    } else {
+      // cap.ib_format / cap.ib_buffer were frozen at BuildDrawCapture
+      // time so Lock(DISCARD) between queue and execute can't move the
+      // index data out from under this draw.
+      if (cap.ib_buffer == 0)
+        return false;
+      d3d_ib_format = cap.ib_format;
+    }
+    ib_fmt = (d3d_ib_format == D3DFMT_INDEX32) ? DXSO_INDEX_BUFFER_FORMAT_UINT32 : DXSO_INDEX_BUFFER_FORMAT_UINT16;
+  }
+  bd.resolved_ib_fmt = static_cast<uint32_t>(ib_fmt);
+
+  DXSO_SHADER_IA_INPUT_LAYOUT_DATA layout{};
+  layout.slot_mask = slot_mask;
+  layout.num_elements = element_count;
+  layout.elements = elements;
+  layout.index_buffer_format = ib_fmt;
+  layout.position_transformed = decl_position_transformed ? 1u : 0u;
+  bd.resolved_position_transformed = decl_position_transformed;
+
+  // D3DRS_POINTSIZE auto-injection: the injecting VS variant emits
+  // [[point_size]] for a point-list draw and reads the size + clamp
+  // bounds from a per-draw uniform (VS buffer 6, filled below), so
+  // distinct sizes share one MTLFunction instead of minting a cold PSO
+  // link per value. A VS that writes its own oPts always injects (the
+  // epilogue clamps its output against the uniform); one that doesn't
+  // injects only when the clamped render-state size leaves the 1.0
+  // default, keeping ordinary point draws on the base variant. Mirrors
+  // DXVK supplies the same values as push data and clamps against them in
+  // both its paths. The decision is invariant under
+  // the numeric size beyond that one default test (see d3d9_point_size.hpp).
+  bool vs_inject_point_size = inject_point_size(
+      bd.primitive_type == D3DPT_POINTLIST, !ffp_vs && vs->metadata().writes_point_size, rs[D3DRS_POINTSIZE],
+      rs[D3DRS_POINTSIZE_MIN], rs[D3DRS_POINTSIZE_MAX]
+  );
+  bd.resolved_inject_point_size = vs_inject_point_size;
+  // Fixed-function vertex fog: active when fog is enabled and table
+  // fog is off (table fog computes per fragment and takes priority).
+  // The D3DFOG_* value keys the generated VS directly.
+  uint32_t ffp_vs_fog_mode = 0;
+  if (ffp_vs && rs[D3DRS_FOGENABLE] != FALSE && rs[D3DRS_FOGTABLEMODE] == D3DFOG_NONE) {
+    ffp_vs_fog_mode = rs[D3DRS_FOGVERTEXMODE] <= D3DFOG_LINEAR ? rs[D3DRS_FOGVERTEXMODE] : 0;
+    // With no vertex-fog formula and no table fog, the D3D9 fog factor is the
+    // vertex specular alpha. It must interpolate smoothly even under FLAT
+    // shading (the specular color flat-shades, but the fog factor does not),
+    // so route it through the smooth oFog varying (a distinct mode 4) rather
+    // than let the pixel stage sample the flat COLOR1 alpha. DXVK emits
+    // specular.w to oFog the same way (DoFixedFunctionFog, D3DFOG_NONE).
+    // Pretransformed draws keep the pixel-stage specular-alpha path.
+    if (ffp_vs_fog_mode == 0 && ffp_has_specular && !bd.resolved_position_transformed)
+      ffp_vs_fog_mode = 4;
+  }
+  // D3DRS_RANGEFOGENABLE switches vertex fog from planar (view-space z) to
+  // radial (true eye-space distance), so objects at the screen edge fog by
+  // distance instead of depth and stop swimming on camera rotation. One key
+  // bit onto the fog axis (both refs implement it: wined3d
+  // WINED3D_FFP_VS_FOG_RANGE = length(ec_pos.xyz), DXVK RangeFog VS key).
+  // Range fog only affects vertex fog, never table fog; programmable-VS
+  // draws are unaffected (their fog rides oFog). Without this the advertised
+  // D3DPRASTERCAPS_FOGRANGE cap is a lie.
+  bool ffp_vs_range_fog = ffp_vs_fog_mode >= 1u && ffp_vs_fog_mode <= 3u && rs[D3DRS_RANGEFOGENABLE] != FALSE;
+  // Only the point-vs-nonpoint, scale-enable and per-vertex gates key the
+  // generated VS. The size, clamp bounds and attenuation factors ride the
+  // uniform block, so changing a value does not build a new variant.
+  // Lighting key: enabled + normal presence + the specular/normalize/
+  // local-viewer/color-vertex render states + the four material source
+  // selectors (values 0..2 per D3DMCS_*).
+  uint32_t ffp_lighting_key = 0;
+  // A pre-transformed (XYZRHW) draw is never lit: its position is already in
+  // clip space, so there is no world/view to light in. Native and both
+  // references bypass lighting for transformed vertices (wined3d's
+  // transformed vertex pipe emits no lighting, DXVK gates lighting on
+  // !VertexHasPositionT); without this an XYZRHW draw left at the default
+  // LIGHTING=TRUE replaces its vertex color with a zero light accumulation
+  // and renders black. Same carve-out the table-fog selection already makes.
+  if (ffp_vs && rs[D3DRS_LIGHTING] != FALSE && !bd.resolved_position_transformed) {
+    auto src_sel = [&](DWORD v) -> uint32_t { return v <= 2 ? v : 0; };
+    ffp_lighting_key = 1u | (rs[D3DRS_SPECULARENABLE] != FALSE ? 4u : 0u) |
+                       (rs[D3DRS_NORMALIZENORMALS] != FALSE ? 8u : 0u) | (rs[D3DRS_LOCALVIEWER] != FALSE ? 16u : 0u) |
+                       (rs[D3DRS_COLORVERTEX] != FALSE ? 32u : 0u);
+    const bool cv = rs[D3DRS_COLORVERTEX] != FALSE;
+    uint32_t sd = cv ? src_sel(rs[D3DRS_DIFFUSEMATERIALSOURCE]) : 0;
+    uint32_t ss = cv ? src_sel(rs[D3DRS_SPECULARMATERIALSOURCE]) : 0;
+    uint32_t sa = cv ? src_sel(rs[D3DRS_AMBIENTMATERIALSOURCE]) : 0;
+    uint32_t se = cv ? src_sel(rs[D3DRS_EMISSIVEMATERIALSOURCE]) : 0;
+    // A source pointing at a color the declaration does not carry falls
+    // back to the material (wined3d validate_material_colour_source).
+    if (!ffp_decl_has_diffuse) {
+      if (sd == 1)
+        sd = 0;
+      if (sa == 1)
+        sa = 0;
+      if (se == 1)
+        se = 0;
+      if (ss == 1)
+        ss = 0;
+    }
+    if (!ffp_decl_has_specular) {
+      if (sd == 2)
+        sd = 0;
+      if (ss == 2)
+        ss = 0;
+      if (sa == 2)
+        sa = 0;
+      if (se == 2)
+        se = 0;
+    }
+    ffp_lighting_key |= (sd | (ss << 2) | (sa << 4) | (se << 6)) << 8;
+    if (ffp_has_normal)
+      ffp_lighting_key |= 2u;
+  }
+  // Per-stage texcoord transforms: the enable bit keys the generated
+  // shader; the count, projection and attribute-width semantics fold
+  // into the matrix at upload (wined3d utils.c compute_texture_matrix)
+  // and the projective divide rides the combiner stage flags.
+  uint32_t ffp_tt_key = 0;
+  uint32_t ffp_texgen_key = 0;
+  uint32_t ffp_texcoord_index_key = 0;
+  if (ffp_vs) {
+    for (uint32_t s = 0; s < 8; ++s) {
+      DWORD ttf = pod.texture_stage_states->v[s][D3DTSS_TEXTURETRANSFORMFLAGS];
+      // A bare PROJECTED flag with a zero count still transforms (the
+      // identity-with-divisor arm of the matrix preprocessing). A pre-
+      // transformed (XYZRHW) draw never applies the texcoord matrix:
+      // wined3d gates the shader multiply on !transformed (glsl_shader.c)
+      // and DXVK on !VertexHasPositionT, so those texcoords reach the
+      // sampler raw. Leave the enable bit clear rather than warp them.
+      if (ttf != D3DTTFF_DISABLE && !bd.resolved_position_transformed)
+        ffp_tt_key |= 1u << (s * 4);
+      // D3DTSS_TCI_* texture generation, keyed by stage: wined3d
+      // utils.c copies the raw TEXCOORDINDEX per stage and a
+      // generated stage ignores the low coordinate index, writing
+      // the stage's own varying.
+      uint32_t tci_mode = (pod.texture_stage_states->v[s][D3DTSS_TEXCOORDINDEX] >> 16) & 0xFFFFu;
+      if (tci_mode >= 1 && tci_mode <= 4)
+        ffp_texgen_key |= tci_mode << (s * 3);
+      ffp_texcoord_index_key |= (pod.texture_stage_states->v[s][D3DTSS_TEXCOORDINDEX] & 7u) << (s * 3);
+    }
+    if (ffp_texgen_key != 0 && rs[D3DRS_NORMALIZENORMALS] != FALSE)
+      ffp_texgen_key |= 1u << 24;
+  }
+  // Fixed-function point size: emit the [[point_size]] output for every
+  // point-list draw. The size, clamp bounds and scale factors ride the
+  // uniforms block (float4 8/9), so only the point-vs-nonpoint /
+  // POINTSCALEENABLE / per-vertex gates key the generated variant.
+  bool ffp_point_size = false;
+  bool ffp_point_scale = false;
+  bool ffp_point_size_per_vertex = false;
+  if (ffp_vs && bd.primitive_type == D3DPT_POINTLIST) {
+    ffp_point_size = true;
+    ffp_point_scale = rs[D3DRS_POINTSCALEENABLE] != FALSE;
+    // A declared PSIZE attribute overrides the render-state size
+    // (wined3d per_vertex_point_size).
+    ffp_point_size_per_vertex = ffp_has_psize;
+  }
+  // D3DRS_VERTEXBLEND declared weight count for the generated VS.
+  // Tweening and the zero-weight arm collapse to disabled (world
+  // matrix 0 only), the same 1..3 support the wined3d vertex pipe
+  // implements; a pre-transformed position never blends.
+  uint32_t ffp_vertex_blend = 0;
+  if (ffp_vs && !bd.resolved_position_transformed) {
+    DWORD vb = rs[D3DRS_VERTEXBLEND];
+    if (vb >= D3DVBF_1WEIGHTS && vb <= D3DVBF_3WEIGHTS)
+      ffp_vertex_blend = vb;
+  }
+  // Fetch (find-or-create + submit) the async vertex-function compile
+  // task; the LLVM AIR emit runs on a pool thread, not here. A cold
+  // variant does not stall the encode thread; the PSO task below waits
+  // on this task off-thread and the null-state skip drops a failed compile.
+  D3D9CompiledFunction *vs_fn =
+      ffp_vs ? ffpVertexFunction(
+                   layout, ffp_has_diffuse, ffp_has_texcoord0, ffp_has_specular, ffp_vs_fog_mode, ffp_vs_range_fog,
+                   ffp_point_size, ffp_point_scale, ffp_lighting_key, ffp_texcoord_mask, ffp_tt_key, ffp_vertex_blend,
+                   ffp_texgen_key, ffp_texcoord_index_key, ffp_point_size_per_vertex, ffp_decl_has_diffuse
+               )
+             : vs->getVariantTask(layout, vs_inject_point_size);
+
+  // SM 1.0..1.3 PS lack dcl_2d/dcl_cube tokens; infer kinds from bound textures.
+  // dxso_compile defaults to Texture2D, causing Metal validation and cube-map flicker.
+  uint8_t ps_samp_kinds[16] = {};
+  for (uint32_t stage = 0; stage < 16; ++stage) {
+    auto *tex = refs.textures[stage].ptr();
+    if (!tex)
+      continue;
+    switch (tex->commonTextureType()) {
+    case D3DRTYPE_TEXTURE:
+      // INTZ/DF24/DF16 are depth textures but bound as D3DRTYPE_TEXTURE.
+      // Force depth2d<float> codegen; MSL texture2d<float> leaves .gba undefined.
+      switch (tex->metalPixelFormat()) {
+      case WMTPixelFormatDepth16Unorm:
+      case WMTPixelFormatDepth32Float:
+      case WMTPixelFormatDepth32Float_Stencil8:
+      case WMTPixelFormatDepth24Unorm_Stencil8:
+        // INTZ and the HW-shadow depth formats both land on a Metal
+        // depth texture; the D3DFORMAT picks the sample op. INTZ ->
+        // raw depth replicated (in-shader compare); D24S8/DF24/DF16 ->
+        // hardware PCF (sample_compare). See IsHardwarePCFDepthFormat.
+        // The raw-depth trio with the FETCH4 latch armed gathers the
+        // neighbourhood instead (DXVK lists the same three among its
+        // FETCH4-compatible formats); the PCF formats never gather.
+        if (!IsHardwarePCFDepthFormat(tex->d3dFormat()) && (pod.fetch4_latch & (1u << stage)) &&
+            samp_states[stage][D3DSAMP_MAGFILTER] == D3DTEXF_POINT)
+          ps_samp_kinds[stage] = DXSO_PS_SAMPLER_KIND_TEXTURE_2D_DEPTH_FETCH4;
+        else if (IsHardwarePCFDepthFormat(tex->d3dFormat()))
+          ps_samp_kinds[stage] = DXSO_PS_SAMPLER_KIND_TEXTURE_2D_DEPTH_COMPARE;
+        else
+          // Raw depth: INTZ replicates, the DF formats read red only.
+          ps_samp_kinds[stage] = tex->d3dFormat() == D3DFMT_INTZ ? DXSO_PS_SAMPLER_KIND_TEXTURE_2D_DEPTH
+                                                                 : DXSO_PS_SAMPLER_KIND_TEXTURE_2D_DEPTH_DF;
+        break;
+      default:
+        // Two-channel signed formats take the snorm rescale kinds.
+        if (tex->d3dFormat() == D3DFMT_V8U8) {
+          ps_samp_kinds[stage] = DXSO_PS_SAMPLER_KIND_TEXTURE_2D_SNORM2_8;
+          break;
+        }
+        if (tex->d3dFormat() == D3DFMT_V16U16) {
+          ps_samp_kinds[stage] = DXSO_PS_SAMPLER_KIND_TEXTURE_2D_SNORM2_16;
+          break;
+        }
+        // FETCH4: armed latch + point magnification + a single-channel
+        // colour format gathers instead of sampling (DXVK gates on the
+        // same trio; its format list is the source of this one).
+        if (stage < 16 && (pod.fetch4_latch & (1u << stage)) &&
+            samp_states[stage][D3DSAMP_MAGFILTER] == D3DTEXF_POINT) {
+          switch (tex->d3dFormat()) {
+          case D3DFMT_R16F:
+          case D3DFMT_R32F:
+          case D3DFMT_A8:
+          case D3DFMT_L8:
+          case D3DFMT_L16:
+            ps_samp_kinds[stage] = DXSO_PS_SAMPLER_KIND_TEXTURE_2D_FETCH4;
+            break;
+          case D3DFMT_ATI1:
+            // Block-compressed: the hardware replicates the sampled
+            // red instead of gathering across the block.
+            ps_samp_kinds[stage] = DXSO_PS_SAMPLER_KIND_TEXTURE_2D_FETCH4_REPLICATE;
+            break;
+          default:
+            // An armed latch on a format outside the single-channel
+            // set: the vendor hardware returns zero for the plain
+            // sample forms and only the projected form degrades to a
+            // normal sample; wine's fetch4 rows pin both sides.
+            ps_samp_kinds[stage] = DXSO_PS_SAMPLER_KIND_TEXTURE_2D_FETCH4_BROKEN;
+            break;
+          }
+          break;
+        }
+        ps_samp_kinds[stage] = DXSO_PS_SAMPLER_KIND_TEXTURE_2D;
+        break;
+      }
+      break;
+    case D3DRTYPE_CUBETEXTURE:
+      ps_samp_kinds[stage] = DXSO_PS_SAMPLER_KIND_TEXTURE_CUBE;
+      break;
+    case D3DRTYPE_VOLUMETEXTURE:
+      ps_samp_kinds[stage] = DXSO_PS_SAMPLER_KIND_TEXTURE_3D;
+      break;
+    default:
+      ps_samp_kinds[stage] = DXSO_PS_SAMPLER_KIND_UNKNOWN;
+      break;
+    }
+  }
+  // Unbound slots the PS still declares a sampler for: take the kind
+  // from the dcl so the compiled variant and the bound dummy agree on
+  // texture type. Without this a dcl_volume / dcl_cube slot with no app
+  // texture bound compiles the PS as 3D/cube (airconv's dcl fallback)
+  // while the resolve binds a 2D dummy: a Metal type mismatch that
+  // samples undefined (black). Host-authoritative, mirroring DXVK's
+  // per-slot texture-type tracking (D3D9TextureSlotTracking) + wined3d's
+  // per-type dummy textures.
+  if (!ffp_ps)
+    for (const auto &d : ps->metadata().dcls) {
+      if (d.bound_to.type != DxsoRegisterType::Sampler || d.bound_to.num >= 16)
+        continue;
+      if (refs.textures[d.bound_to.num].ptr())
+        continue; // bound: kind already set from the actual texture above
+      switch (d.dcl.texture_type) {
+      case DxsoTextureType::TextureCube:
+        ps_samp_kinds[d.bound_to.num] = DXSO_PS_SAMPLER_KIND_TEXTURE_CUBE;
+        break;
+      case DxsoTextureType::Texture3D:
+        ps_samp_kinds[d.bound_to.num] = DXSO_PS_SAMPLER_KIND_TEXTURE_3D;
+        break;
+      default:
+        ps_samp_kinds[d.bound_to.num] = DXSO_PS_SAMPLER_KIND_TEXTURE_2D;
+        break;
+      }
+    }
+  // Only the alpha compare FUNC keys the variant (D3DCMP_ALWAYS = no
+  // discard emit); the ref rides the shared PS uniform tail, written into
+  // ps_b_blob at the const-upload below and read at runtime.
+  DWORD alpha_func = rs[D3DRS_ALPHAFUNC];
+  // An out-of-range compare func (uninitialized app state) kills every
+  // fragment on both refs (their DecodeCompareOp default arm is NEVER,
+  // the same rule to_mtl_compare_func now follows). Normalize garbage to
+  // D3DCMP_NEVER here, at the single producer of the variant key, so the
+  // generated discard matches instead of the codegen default passing
+  // everything; the alpha_func rides the WoW64 arg chain, so fixing it at
+  // the source keeps both PS paths honest.
+  if (alpha_func < D3DCMP_NEVER || alpha_func > D3DCMP_ALWAYS)
+    alpha_func = D3DCMP_NEVER;
+  bool alpha_test = rs[D3DRS_ALPHATESTENABLE] != FALSE && alpha_func != D3DCMP_ALWAYS;
+  // POINTSPRITEENABLE only applies to point-list primitives; non-point
+  // draws skip the variant so the cache doesn't explode on toggles.
+  // D3DRS_POINTSPRITEENABLE default is FALSE so most apps never hit
+  // the variant path at all.
+  bool point_sprite = rs[D3DRS_POINTSPRITEENABLE] != FALSE && bd.primitive_type == D3DPT_POINTLIST;
+  // TexBem / TexBemL / Bem: the per-stage D3DTSS_BUMPENV* matrix and
+  // luminance scale/offset ride the shared PS uniform tail (written into
+  // ps_b_blob below, unconditionally from the pod so the buffer stays a
+  // pure function of the const-cache key) and the generated PS reads them
+  // at runtime. They do not bake into the variant, so an app that
+  // animates bump-env keeps one variant per material instead of churning
+  // a cold PSO link per frame. DXVK feeds the same constants through its
+  // D3D9SharedPS uniform (dxvk src/d3d9/d3d9_state.h).
+  // D3D9 fog blend (pre-SM3 contract): the PS epilogue lerps oC0.rgb
+  // toward D3DRS_FOGCOLOR by a fog factor, as wined3d's and DXVK's
+  // generated pixel shaders do. ps_3_0 computes fog itself per spec;
+  // gating the version here keeps SM3 titles that leave FOGENABLE set
+  // from forking byte-identical PSOs (wined3d zeroes its fog
+  // compile-arg the same way).
+  //
+  // FOGTABLEMODE != NONE means table (pixel) fog, which takes priority
+  // over vertex fog per the D3D9 contract: the factor is computed per
+  // fragment from depth in the PS, with FOGSTART/FOGEND/FOGDENSITY
+  // threaded through the bool-constant blob below. Otherwise vertex
+  // fog uses the VS oFog factor; a VS that writes no oFog (or fixed
+  // function with FOGVERTEXMODE none) falls back to the interpolated
+  // specular alpha, which test_fog's rows pin.
+  int fog_mode = -1;
+  if (rs[D3DRS_FOGENABLE] != FALSE && (ffp_ps || ps->metadata().major < 3)) {
+    DWORD table_mode = rs[D3DRS_FOGTABLEMODE];
+    if (table_mode != D3DFOG_NONE) {
+      // D3DFOG_EXP=1, EXP2=2, LINEAR=3; map onto DXSO_PS_FOG_MODE_*.
+      switch (table_mode) {
+      case D3DFOG_LINEAR:
+        fog_mode = DXSO_PS_FOG_MODE_LINEAR;
+        break;
+      case D3DFOG_EXP:
+        fog_mode = DXSO_PS_FOG_MODE_EXP;
+        break;
+      case D3DFOG_EXP2:
+        fog_mode = DXSO_PS_FOG_MODE_EXP2;
+        break;
+      default:
+        break;
+      }
+    } else if (bd.resolved_position_transformed) {
+      // A pre-transformed draw never takes the vertex-fog formula,
+      // whatever FOGVERTEXMODE says: the factor is always the
+      // specular alpha (test_fog's RHW rows pin it for every mode).
+      fog_mode = DXSO_PS_FOG_MODE_SPECULAR_ALPHA;
+    } else if (ffp_vs ? ffp_vs_fog_mode != 0 : vs->metadata().writes_fog) {
+      fog_mode = DXSO_PS_FOG_MODE_VERTEX;
+    } else {
+      // No table mode and no fog factor from the vertex stage: the
+      // factor is the interpolated specular alpha (a bytecode VS
+      // without an oFog write, a pre-transformed draw, or fixed
+      // function with FOGVERTEXMODE none); the fog params are ignored
+      // on this path per test_fog's contract.
+      fog_mode = DXSO_PS_FOG_MODE_SPECULAR_ALPHA;
+    }
+  }
+  // Dual-source blending: only when the active blend factors actually
+  // read SRC1 (D3DBLEND_SRCCOLOR2 / INVSRCCOLOR2) does oC1 become the
+  // second color index of attachment 0. A draw that writes oC1 as a
+  // normal second render target must not take this variant, so the
+  // detection is on the bound blend factors, not the shader. Alpha
+  // factors only matter under SEPARATEALPHABLENDENABLE. The variant
+  // additionally requires the PS to export oC1: a Source1 PSO whose
+  // fragment function has no index(1) output fails Metal pipeline
+  // creation, so apply_blend_state_to_attachment folds the SRC1
+  // factors away instead when the shader can't feed them.
+  bool dual_source = false;
+  if (!ffp_ps && rs[D3DRS_ALPHABLENDENABLE] != FALSE && ps->metadata().writes_oc1) {
+    auto is_src1 = [](DWORD f) { return f == D3DBLEND_SRCCOLOR2 || f == D3DBLEND_INVSRCCOLOR2; };
+    dual_source = is_src1(rs[D3DRS_SRCBLEND]) || is_src1(rs[D3DRS_DESTBLEND]);
+    if (rs[D3DRS_SEPARATEALPHABLENDENABLE] != FALSE)
+      dual_source = dual_source || is_src1(rs[D3DRS_SRCBLENDALPHA]) || is_src1(rs[D3DRS_DESTBLENDALPHA]);
+  }
+  // The generated PS's combiner table, packed per the key contract:
+  // ops and args from the frozen texture-stage state, the has-texture
+  // and result-is-temp flags; each stage samples its own varying,
+  // the per-stage routing living in the vertex key. A stage whose
+  // arguments reference TEXTURE with none bound ends the chain, the
+  // wined3d contract for incomplete stages.
+  // The host-resolved sampler kinds for the combiner's eight stages,
+  // packed four bits each; the bytecode variants receive the same
+  // resolution through their PSO argument instead.
+  uint32_t ffp_sampler_kind_key = 0;
+  if (ffp_ps)
+    for (uint32_t s = 0; s < 8; ++s)
+      ffp_sampler_kind_key |= uint32_t(ps_samp_kinds[s] & 0xFu) << (s * 4);
+  uint32_t ffp_stages[8][3] = {};
+  if (ffp_ps) {
+    for (uint32_t s = 0; s < 8; ++s) {
+      const DWORD *tss = pod.texture_stage_states->v[s];
+      uint32_t color_op = tss[D3DTSS_COLOROP] & 0xFF;
+      uint32_t alpha_op = tss[D3DTSS_ALPHAOP] & 0xFF;
+      if (s > 0 && color_op == D3DTOP_DISABLE) {
+        ffp_stages[s][0] = D3DTOP_DISABLE;
+        break;
+      }
+      const bool has_tex = refs.textures[s].ptr() != nullptr;
+      auto refs_texture = [&](DWORD arg) { return (arg & D3DTA_SELECTMASK) == D3DTA_TEXTURE; };
+      DWORD carg1 = tss[D3DTSS_COLORARG1], carg2 = tss[D3DTSS_COLORARG2], carg0 = tss[D3DTSS_COLORARG0];
+      DWORD aarg1 = tss[D3DTSS_ALPHAARG1], aarg2 = tss[D3DTSS_ALPHAARG2], aarg0 = tss[D3DTSS_ALPHAARG0];
+      // An op reading TEXTURE with none bound rewrites to
+      // SELECTARG1(CURRENT) and the chain continues; the third
+      // argument only invalidates the ops that read it (wined3d
+      // utils.c is_invalid_op, applied per color and alpha op).
+      auto invalid_op = [&](uint32_t op, DWORD a1, DWORD a2, DWORD a0) {
+        if (op == D3DTOP_DISABLE || has_tex)
+          return false;
+        if (refs_texture(a1) && op != D3DTOP_SELECTARG2)
+          return true;
+        if (refs_texture(a2) && op != D3DTOP_SELECTARG1)
+          return true;
+        if (refs_texture(a0) && (op == D3DTOP_MULTIPLYADD || op == D3DTOP_LERP))
+          return true;
+        return false;
+      };
+      if (invalid_op(color_op, carg1, carg2, carg0)) {
+        color_op = D3DTOP_SELECTARG1;
+        carg1 = D3DTA_CURRENT;
+        carg2 = D3DTA_CURRENT;
+        carg0 = D3DTA_CURRENT;
+      }
+      if (invalid_op(alpha_op, aarg1, aarg2, aarg0)) {
+        alpha_op = D3DTOP_SELECTARG1;
+        aarg1 = D3DTA_CURRENT;
+        aarg2 = D3DTA_CURRENT;
+        aarg0 = D3DTA_CURRENT;
+      }
+      // A dot product on the color op overwrites the alpha operation
+      // and replicates the color result into alpha (wined3d utils.c).
+      if (color_op == D3DTOP_DOTPRODUCT3) {
+        alpha_op = color_op;
+        aarg1 = carg1;
+        aarg2 = carg2;
+        // DOTPRODUCT3 ignores arg0, but wined3d utils.c mirrors carg0 into
+        // aarg0 so the identical-op collapse recognises the two ops as equal.
+        aarg0 = carg0;
+      }
+      uint32_t flags = (has_tex ? 1u : 0u) | ((tss[D3DTSS_RESULTARG] & D3DTA_SELECTMASK) == D3DTA_TEMP ? 2u : 0u) |
+                       ((tss[D3DTSS_TEXTURETRANSFORMFLAGS] & D3DTTFF_PROJECTED) ? 4u : 0u);
+      ffp_stages[s][0] = color_op | (alpha_op << 8) | (flags << 16);
+      ffp_stages[s][1] = (carg1 & 0xFF) | ((carg2 & 0xFF) << 8) | ((carg0 & 0xFF) << 16);
+      ffp_stages[s][2] = (aarg1 & 0xFF) | ((aarg2 & 0xFF) << 8) | ((aarg0 & 0xFF) << 16);
+    }
+  }
+  // Table-fog coordinate: fog against eye-space w (1/position.w) when the
+  // projection can produce a non-unit w (pod.ffp_fog_coord_w), else the
+  // vertex-output Z. The non-w arm reads the VS-written FOG0.y varying
+  // (clip-space Z for a WVP draw, window-space Z for a pre-transformed draw,
+  // wined3d ffp_varying_fogcoord), not the fragment [[position]].z, which
+  // keeps it off the post-perspective device depth and clear of the
+  // rasterizer depth bias. A pre-transformed draw takes the same
+  // projection-derived choice: its rhw carries the perspective w a
+  // non-orthographic projection would have made.
+  const bool fog_coord_w =
+      fog_mode >= DXSO_PS_FOG_MODE_LINEAR && fog_mode <= DXSO_PS_FOG_MODE_EXP2 && pod.ffp_fog_coord_w != 0;
+  // Per-attachment 8-bit-UNORM snap mask: bit i set when render target i
+  // resolves to a LINEAR 8-bit unorm Metal format, so the PS epilogue rounds
+  // oC<i> to the nearest k/255 (round-half-to-even) and Metal's unorm write
+  // reproduces WARP's byte instead of rounding an exact half the other way.
+  // The mask keys the PS variant, so a shader shared between an 8-bit-unorm
+  // and a float/HDR RT forks one metallib per mask. An SRGBWRITEENABLE target
+  // recalls to an sRGB format IsUnorm8RenderTargetFormat rejects (an sRGB
+  // attachment applies its own curve), so sRGB and float/HDR keep full
+  // precision. Mirrors the DXBC pipeline's unorm_output_reg_mask.
+  uint32_t unorm_snap_mask = 0;
+  for (unsigned i = 0; i < D3D_MAX_SIMULTANEOUS_RENDERTARGETS; ++i) {
+    MTLD3D9Surface *rt = refs.render_targets[i].ptr();
+    if (!rt || IsNullFormat(rt->desc().Format))
+      continue;
+    WMTPixelFormat fmt = D3DFormatToMetal(rt->desc().Format, D3D9FormatUsage::RenderTarget);
+    if (rs[D3DRS_SRGBWRITEENABLE] != 0)
+      fmt = Recall_sRGB(fmt);
+    if (IsUnorm8RenderTargetFormat(fmt))
+      unorm_snap_mask |= 1u << i;
+  }
+  // ---- PSO descriptor build ----
+  MTLD3D9Surface *ds = refs.depth_stencil_surface.ptr();
+  // Sample count flows from the realized Metal texture, NOT
+  // desc().MultiSampleType: NONMASKABLE (and any path that allocates more
+  // samples than the enum encodes) stores an enum that maps to 1 while the
+  // texture carries the real count, and Metal hard-errors (hangs AGX) when
+  // the pipeline rasterSampleCount differs from an attachment. Mirrors
+  // d3d11's OM-bind, which reads the count off the bound view. Resolved
+  // before the PS variant so the D3DRS_MULTISAMPLEMASK gate below can key it.
+  uint8_t raster_sample_count = 1;
+  if (rt0 && !IsNullFormat(rt0->desc().Format) && rt0->dxmtTexture()) {
+    raster_sample_count = static_cast<uint8_t>(rt0->dxmtTexture()->sampleCount());
+  } else if (ds && ds->dxmtTexture()) {
+    raster_sample_count = static_cast<uint8_t>(ds->dxmtTexture()->sampleCount());
+  }
+  // D3DRS_MULTISAMPLEMASK rides the PS coverage output, not the pipeline key:
+  // only a 1-bit enable keys the variant (an animated mask never churns PSOs)
+  // while the 32-bit mask word rides the ps_b_blob tail below. The
+  // sample-count gate is mandatory: on a single-sample target a cleared mask
+  // bit0 would kill every fragment, and an all-ones mask is inert anywhere,
+  // so both keep the plain (non-coverage) variant. wined3d/DXVK apply the
+  // mask unconditionally; Metal has no encoder/PSO sample mask, only the
+  // shader-side [[sample_mask]] output the variant now emits.
+  const bool emit_sample_mask = raster_sample_count > 1 && rs[D3DRS_MULTISAMPLEMASK] != 0xffffffffu;
+  // The alpha compare FUNC keys the variant; the REF rides the shared PS
+  // uniform tail (written into ps_b_blob below), so it never reaches the
+  // pipeline key. TexBem bump-env constants ride the same tail.
+  D3D9CompiledFunction *ps_fn =
+      ffp_ps ? ffpPixelFunction(
+                   ffp_stages, rs[D3DRS_SPECULARENABLE] != FALSE, point_sprite, fog_mode, fog_coord_w,
+                   alpha_test ? alpha_func : 8, ffp_sampler_kind_key, rs[D3DRS_SHADEMODE] == D3DSHADE_FLAT,
+                   emit_sample_mask, unorm_snap_mask
+               )
+             : ps->getVariantTask(
+                   alpha_test ? alpha_func : D3DCMP_ALWAYS, ps_samp_kinds, point_sprite, fog_mode, fog_coord_w,
+                   dual_source, rs[D3DRS_SHADEMODE] == D3DSHADE_FLAT, emit_sample_mask, unorm_snap_mask
+               );
+  // Every render-pass attachment + the pipeline must share one sample count.
+  // A bound DS whose sample count disagrees with the color target (an app
+  // pairing an MSAA depth surface with a single-sample render target, or the
+  // reverse) is dropped here, before the PSO bakes a depth format, rather than
+  // faulting the GPU. The mismatch is an app error, so warn once instead of
+  // once per draw.
+  if (ds && ds->dxmtTexture() && rt0 && !IsNullFormat(rt0->desc().Format) &&
+      ds->dxmtTexture()->sampleCount() != raster_sample_count) {
+    // Encode thread is the sole toucher; a plain static needs no guard.
+    static bool warned = false;
+    if (!warned) {
+      warned = true;
+      Logger::warn(
+          str::format(
+              "d3d9: depth-stencil sample count ", ds->dxmtTexture()->sampleCount(), " != render target ",
+              (unsigned)raster_sample_count,
+              "; dropping the DS (a render target and depth-stencil must match multisample)"
+          )
+      );
+    }
+    ds = nullptr;
+    bd.resolved_ds_dxmt = nullptr;
+  }
+  // A depth-stencil smaller than the colour target cannot cover it: wined3d
+  // detaches it and keeps drawing (context_gl.c find_fbo_entry), surfacing
+  // the pairing only through ValidateDevice. Metal rasterizes a render pass
+  // to its SMALLEST attachment, so an undersized DS left attached silently
+  // crops every draw. Gate on dxmtTexture() too: the pass builder skips a
+  // colour target with no Metal backing, and dropping the DS for one would
+  // leave the pass with no attachment at all.
+  if (ds && rt0 && !IsNullFormat(rt0->desc().Format) && rt0->dxmtTexture() &&
+      (ds->desc().Width < rt0->desc().Width || ds->desc().Height < rt0->desc().Height)) {
+    static bool warned = false;
+    if (!warned) {
+      warned = true;
+      Logger::warn(
+          str::format(
+              "d3d9: depth-stencil ", ds->desc().Width, "x", ds->desc().Height, " is smaller than render target ",
+              rt0->desc().Width, "x", rt0->desc().Height, "; dropping the DS (it cannot cover the target)"
+          )
+      );
+    }
+    ds = nullptr;
+    bd.resolved_ds_dxmt = nullptr;
+  }
+  WMTPixelFormat ds_pixel_format = WMTPixelFormatInvalid;
+  bool ds_has_stencil = false;
+  if (ds) {
+    ds_pixel_format = D3DFormatToMetal(ds->desc().Format, D3D9FormatUsage::DepthStencil);
+    ds_has_stencil = HasStencilAspect(ds->desc().Format);
+  }
+  // Plumb the sample count through to the chunk lambda so its
+  // startRenderPass(default_raster_sample_count=N) matches the PSO's
+  // raster_sample_count=N. Metal validates this equality at
+  // setRenderPipelineState time; a mismatch hard-errors under
+  // MTL_DEBUG_LAYER.
+  bd.resolved_raster_sample_count = raster_sample_count;
+
+  WMTPrimitiveTopologyClass topology_class = WMTPrimitiveTopologyClassTriangle;
+  switch (bd.primitive_type) {
+  case D3DPT_POINTLIST:
+    topology_class = WMTPrimitiveTopologyClassPoint;
+    break;
+  case D3DPT_LINELIST:
+  case D3DPT_LINESTRIP:
+    topology_class = WMTPrimitiveTopologyClassLine;
+    break;
+  case D3DPT_TRIANGLELIST:
+  case D3DPT_TRIANGLESTRIP:
+  case D3DPT_TRIANGLEFAN:
+    topology_class = WMTPrimitiveTopologyClassTriangle;
+    break;
+  default:
+    break;
+  }
+
+  WMTRenderPipelineInfo pso_info;
+  WMT::InitializeRenderPipelineInfo(pso_info);
+  // The function handles are filled by the PSO task once its function-task
+  // dependencies compile off-thread; they do not exist yet, so leave them
+  // at the zero InitializeRenderPipelineInfo set.
+  pso_info.input_primitive_topology = topology_class;
+  pso_info.depth_pixel_format = ds_pixel_format;
+  pso_info.stencil_pixel_format = ds_has_stencil ? ds_pixel_format : WMTPixelFormatInvalid;
+  pso_info.raster_sample_count = raster_sample_count;
+
+  const bool srgb_write = rs[D3DRS_SRGBWRITEENABLE] != 0;
+  for (unsigned i = 0; i < D3D_MAX_SIMULTANEOUS_RENDERTARGETS; ++i) {
+    MTLD3D9Surface *rt = refs.render_targets[i].ptr();
+    if (!rt || IsNullFormat(rt->desc().Format))
+      continue;
+    WMTPixelFormat fmt = D3DFormatToMetal(rt->desc().Format, D3D9FormatUsage::RenderTarget);
+    if (srgb_write)
+      fmt = Recall_sRGB_ForRenderTarget(fmt);
+    pso_info.colors[i].pixel_format = fmt;
+    const bool alpha_is_one = D3DFormatHasNoAlpha(rt->desc().Format);
+    apply_blend_state_to_attachment(pso_info.colors[i], rs, rs[kColorWriteEnableRS[i]], dual_source, alpha_is_one);
+  }
+
+  uint64_t pso_key = 0xcbf29ce484222325ull;
+  auto mix64 = [&](uint64_t v) {
+    pso_key ^= v;
+    pso_key *= 0x100000001b3ull;
+  };
+  // Key on the function-task identities, not the compiled handles (which
+  // do not exist until the async compile finishes). The task pointer is a
+  // bijection with (module, variant key): get-or-create returns one task
+  // per variant, pinned for device lifetime (module tasks by the PSO
+  // cache's Com<shader>, FFP tasks by the device caches), so ABA is
+  // impossible and two distinct variants never collide.
+  mix64(reinterpret_cast<uint64_t>(vs_fn));
+  mix64(reinterpret_cast<uint64_t>(ps_fn));
+  mix64(static_cast<uint32_t>(pso_info.depth_pixel_format));
+  mix64(static_cast<uint32_t>(pso_info.stencil_pixel_format));
+  mix64(static_cast<uint32_t>(pso_info.input_primitive_topology));
+  mix64(static_cast<uint32_t>(pso_info.raster_sample_count));
+  for (unsigned i = 0; i < D3D_MAX_SIMULTANEOUS_RENDERTARGETS; ++i) {
+    const auto &b = pso_info.colors[i];
+    mix64(static_cast<uint32_t>(b.pixel_format));
+    mix64((static_cast<uint64_t>(b.blending_enabled ? 1u : 0u) << 32) | static_cast<uint32_t>(b.write_mask));
+    mix64(
+        (static_cast<uint64_t>(b.rgb_blend_operation) << 48) | (static_cast<uint64_t>(b.alpha_blend_operation) << 32) |
+        (static_cast<uint64_t>(b.src_rgb_blend_factor) << 24) | (static_cast<uint64_t>(b.dst_rgb_blend_factor) << 16) |
+        (static_cast<uint64_t>(b.src_alpha_blend_factor) << 8) | static_cast<uint64_t>(b.dst_alpha_blend_factor)
+    );
+  }
+
+  D3D9PsoCompileTask *task;
+  bool first_time = false;
+  // Cluster-miss short-circuit: even when ref_ptr or sampler-state
+  // changed (forcing a rebuild here), the PSO inputs (vs/ps function +
+  // RT/DS formats + blend state) often haven't moved. The previous
+  // draw's pso_key is the cheap gate before the FNV map probe. Both the
+  // fast path and the map probe confirm the full key inputs on a hash
+  // hit before reusing the task, the same collision guard the bytecode
+  // module cache applies (a 64-bit hit alone would pick the wrong
+  // pipeline); the verify is a handful of int compares and rejects on
+  // the first differing field.
+  if (pso_key == resolve_cache.last_pso_key && resolve_cache.last_pso_task &&
+      resolve_cache.last_pso_task->matchesKeyInputs(vs_fn, ps_fn, pso_info)) {
+    task = resolve_cache.last_pso_task;
+  } else if (
+      auto it = m_psoCache.find(pso_key); it != m_psoCache.end() && it->second->matchesKeyInputs(vs_fn, ps_fn, pso_info)
+  ) {
+    task = it->second.get();
+    resolve_cache.last_pso_key = pso_key;
+    resolve_cache.last_pso_task = task;
+  } else {
+    auto fresh = std::make_unique<D3D9PsoCompileTask>(
+        m_metalDevice, Com<MTLD3D9VertexShader, false>{vs}, Com<MTLD3D9PixelShader, false>{ps}, pso_info, vs_fn, ps_fn
+    );
+    task = fresh.get();
+    // A true miss inserts; a verified 64-bit collision (the slot already
+    // holds a different PSO's task, which an in-flight chunk may still
+    // reference so it can't be evicted) leaves try_emplace's argument
+    // un-moved. Pin that loser for device lifetime in m_psoCacheCollisions
+    // instead, so the non-owning task pointer handed to the chunk stays
+    // valid; a collision is astronomically rare, so a non-cached rebuild is
+    // acceptable.
+    if (!m_psoCache.try_emplace(pso_key, std::move(fresh)).second)
+      m_psoCacheCollisions.push_back(std::move(fresh));
+    m_psoScheduler.submit(task);
+    first_time = true;
+    resolve_cache.last_pso_key = pso_key;
+    resolve_cache.last_pso_task = task;
+  }
+  // Defer the cold-compile wait to the encode thread so the calling
+  // thread never blocks on a PSO link; do so ONLY when the compile
+  // is still in flight. If the task
+  // already completed (cache hit, or rare submit-flushed-fast), do
+  // the cheap atomic-load resolve here; that preserves the
+  // Resolve-time return-false rejection for known-bad PSOs so a
+  // failed front draw can't silently drop the chunk's pending-clear
+  // flags. m_psoCache pins the task pointer for the device lifetime.
+  if (task->GetDone()) {
+    WMT::RenderPipelineState pso = task->state();
+    if (pso.handle == 0)
+      return false;
+    bd.resolved_pso = pso.handle;
+  } else {
+    bd.resolved_pso_task = task;
+    bd.resolved_pso_first_use = first_time;
+  }
+
+  // ---- Per-stage textures + samplers ----
+  for (uint32_t stage = 0; stage < 16; ++stage) {
+    auto *tex = refs.textures[stage].ptr();
+    const DWORD *samp_row = samp_states[stage];
+    // A bound texture with no Metal backing (a SCRATCH / packed-YUV resource
+    // constructed with a null dxmt::Texture, which SetTexture accepts) has no
+    // view to resolve; treat it as unbound so the dummy-texture arm below
+    // binds a placeholder instead of dereferencing the null backing here on
+    // the encode thread. Covers 2D, cube and volume alike.
+    if (!tex || !tex->dxmtTexture()) {
+      // Unbound sampler post-Reset causes Metal validation error and GPU callback error.
+      // Bind 1x1 placeholder + sampler to complete encoder.
+      WMTSamplerInfo sinfo = sampler_info_from_d3d9_state(samp_row);
+      if (auto sampler = getOrCreateSampler(sinfo))
+        bd.resolved_frag_samplers[stage] = sampler->sampler_state.handle;
+      // The dummy's type must match the kind the PS variant was compiled
+      // with for this slot (set above from the bound texture, or the dcl
+      // for an unbound-but-declared slot), or Metal flags a 2D-vs-3D/cube
+      // type mismatch and samples undefined.
+      WMTTextureType dummy_type = WMTTextureType2D;
+      if (ps_samp_kinds[stage] == DXSO_PS_SAMPLER_KIND_TEXTURE_3D)
+        dummy_type = WMTTextureType3D;
+      else if (ps_samp_kinds[stage] == DXSO_PS_SAMPLER_KIND_TEXTURE_CUBE)
+        dummy_type = WMTTextureTypeCube;
+      bd.resolved_frag_textures[stage] = dummyFragmentTexture(dummy_type);
+      continue;
+    }
+    // View lives on TextureAllocation (survives wrapper Reset via
+    // ref_tracker). derivations chain off fullView.
+    const Rc<dxmt::Texture> &rc = tex->dxmtTexture();
+    // Per-format channel swizzle + optional sRGB alias + SetLOD mip clamp.
+    // Shared with the VTF bind below (deriveSampleView) so a fixup-needing
+    // format samples the same shape in a VS as in a PS.
+    uint64_t view = deriveSampleView(rc, tex, samp_row);
+    // Resolve the view's Metal handle now (encode thread; same
+    // allocation as emit since both run inside this chunk). Kept for
+    // the cluster cache + the per-encoder bind shadow; the fence-tracked
+    // ctx.access(viewId) in EmitCommonRenderSetup_d9 re-fetches the same
+    // view object. Fall back to the base view if aliasing failed (an
+    // unsupported format pair); matches the old D3D9ViewCache.
+    obj_handle_t vh = rc->view(view).texture.handle;
+    if (!vh) {
+      view = rc->fullView;
+      vh = rc->view(view).texture.handle;
+    }
+    bd.resolved_frag_view[stage] = view;
+    bd.resolved_frag_textures[stage] = vh;
+    bd.resolved_frag_texture_dxmt[stage] = rc;
+    // Hardware-PCF depth textures need a LessEqual compare sampler so
+    // sample_compare (emitted by the _DEPTH_COMPARE PS variant for this
+    // stage) returns the filtered shadow result. Must match the kind
+    // classification above (both gate on IsHardwarePCFDepthFormat).
+    WMTSamplerInfo sinfo = sampler_info_from_d3d9_state(
+        samp_row, IsHardwarePCFDepthFormat(tex->d3dFormat()), IsMetalNonFilterableFormat(tex->d3dFormat())
+    );
+    auto sampler = getOrCreateSampler(sinfo);
+    if (sampler)
+      bd.resolved_frag_samplers[stage] = sampler->sampler_state.handle;
+  }
+
+  // ---- DSSO + stencil ref ----
+  if (ds) {
+    WMTDepthStencilInfo ds_info = depth_stencil_info_from_d3d9_state(rs, /*dsAttached=*/true, ds_has_stencil);
+    auto dsso = getOrCreateDSSO(ds_info);
+    bd.resolved_dsso = dsso.handle;
+    bd.resolved_stencil_ref = static_cast<uint8_t>(rs[D3DRS_STENCILREF] & 0xFF);
+  }
+
+  // ---- RT / DS Rc<dxmt::Texture> + TextureViewKey + Metal handles + dims ----
+  uint32_t rt_count = 0;
+  for (unsigned i = 0; i < D3D_MAX_SIMULTANEOUS_RENDERTARGETS; ++i) {
+    auto *rt = refs.render_targets[i].ptr();
+    if (!rt || IsNullFormat(rt->desc().Format))
+      continue;
+    bd.resolved_rt_dxmt[i] = rt->dxmtTexture();
+    if (bd.resolved_rt_dxmt[i]) {
+      TextureViewKey view = bd.resolved_rt_dxmt[i]->fullView;
+      if (srgb_write) {
+        // D3DRS_SRGBWRITEENABLE renders through the sRGB-format view; the
+        // attachment encodes the fragment output on store.
+        WMTPixelFormat base = bd.resolved_rt_dxmt[i]->pixelFormat();
+        WMTPixelFormat srgb = Recall_sRGB_ForRenderTarget(base);
+        if (srgb != base)
+          view = bd.resolved_rt_dxmt[i]->checkViewUseFormat(view, srgb);
+      }
+      bd.resolved_rt_view[i] = static_cast<uint64_t>(view);
+    }
+    bd.resolved_rt_handles[i] = rt->metalTexture().handle;
+    bd.resolved_rt_level[i] = static_cast<uint16_t>(rt->mipLevel());
+    bd.resolved_rt_slice[i] = static_cast<uint16_t>(rt->arraySlice());
+    rt_count = i + 1;
+    if (i == 0) {
+      bd.resolved_rt_width = rt->desc().Width;
+      bd.resolved_rt_height = rt->desc().Height;
+    }
+  }
+  bd.resolved_rt_count = static_cast<uint8_t>(rt_count);
+
+  // Self-downsample: a draw renders into mip N while sampling a lower
+  // mip of the same texture (e.g. an HDR luminance pyramid). Legal in
+  // D3D9, distinct subresources; DXVK skips the hazard for rtMip != 0.
+  // Apple GPUs allow attachment + sampler to share an allocation only
+  // as distinct, non-overlapping MTLTexture views (MoltenVK mints one
+  // per subresource range); the default full-mip attachment view
+  // overlaps the sampled mip, so the GPU drops the write and leaves NaN
+  // that the tonemap turns black. Bind the sampler to [0,N) and the
+  // attachment to a single mip [N,1). A mip-0 RT sampled at 0 is a real
+  // feedback loop and is left alone.
+  for (unsigned i = 0; i < bd.resolved_rt_count; ++i) {
+    auto *rt_tex = bd.resolved_rt_dxmt[i].ptr();
+    uint32_t rt_level = bd.resolved_rt_level[i];
+    if (!rt_tex || rt_level == 0)
+      continue;
+    bool self_sampled = false;
+    for (uint32_t stage = 0; stage < 16; ++stage) {
+      if (bd.resolved_frag_texture_dxmt[stage].ptr() != rt_tex)
+        continue;
+      self_sampled = true;
+      TextureViewKey src_view = rt_tex->checkViewUseMipRange(TextureViewKey(bd.resolved_frag_view[stage]), 0, rt_level);
+      if (obj_handle_t vh = rt_tex->view(src_view).texture.handle) {
+        bd.resolved_frag_view[stage] = static_cast<uint64_t>(src_view);
+        bd.resolved_frag_textures[stage] = vh;
+      }
+    }
+    if (self_sampled) {
+      TextureViewKey rt_view = rt_tex->checkViewUseMipRange(TextureViewKey(bd.resolved_rt_view[i]), rt_level, 1);
+      bd.resolved_rt_view[i] = static_cast<uint64_t>(rt_view);
+      bd.resolved_rt_level[i] = 0;
+    }
+  }
+  if (ds) {
+    bd.resolved_ds_dxmt = ds->dxmtTexture();
+    if (bd.resolved_ds_dxmt)
+      bd.resolved_ds_view = static_cast<uint64_t>(bd.resolved_ds_dxmt->fullView);
+    bd.resolved_ds_handle = ds->metalTexture().handle;
+    bd.resolved_ds_has_stencil = ds_has_stencil;
+    bd.resolved_ds_level = static_cast<uint16_t>(ds->mipLevel());
+    bd.resolved_ds_slice = static_cast<uint16_t>(ds->arraySlice());
+    bd.resolved_depth_bias_scale = DepthBiasScale(ds->desc().Format);
+    if (bd.resolved_rt_width == 0) {
+      bd.resolved_rt_width = ds->desc().Width;
+      bd.resolved_rt_height = ds->desc().Height;
+    }
+  }
+
+  // ---- Populate cluster cache so the next draw in the cluster can
+  // skip the FNV+map-lookup work above. ----
+  resolve_cache.pod_ptr = bd.pod_snapshot;
+  resolve_cache.ref_gen = m_encodeSideRefsGen;
+  resolve_cache.up_vb = up_vb;
+  resolve_cache.up_ib = up_ib;
+  resolve_cache.up_ib_format = bd.override_ib_format;
+  resolve_cache.primitive_type = bd.primitive_type;
+  resolve_cache.draw_type = bd.type;
+  resolve_cache.resolved_pso = bd.resolved_pso;
+  resolve_cache.resolved_pso_task = bd.resolved_pso_task;
+  resolve_cache.resolved_dsso = bd.resolved_dsso;
+  resolve_cache.resolved_stencil_ref = bd.resolved_stencil_ref;
+  resolve_cache.resolved_slot_mask = bd.resolved_slot_mask;
+  resolve_cache.resolved_ib_fmt = bd.resolved_ib_fmt;
+  resolve_cache.resolved_raster_sample_count = bd.resolved_raster_sample_count;
+  resolve_cache.resolved_depth_bias_scale = bd.resolved_depth_bias_scale;
+  resolve_cache.resolved_ds_has_stencil = bd.resolved_ds_has_stencil;
+  resolve_cache.resolved_rt_count = bd.resolved_rt_count;
+  resolve_cache.resolved_rt_width = bd.resolved_rt_width;
+  resolve_cache.resolved_rt_height = bd.resolved_rt_height;
+  resolve_cache.resolved_ds_handle = bd.resolved_ds_handle;
+  resolve_cache.resolved_ds_view = bd.resolved_ds_view;
+  resolve_cache.resolved_ds_level = bd.resolved_ds_level;
+  resolve_cache.resolved_ds_slice = bd.resolved_ds_slice;
+  resolve_cache.resolved_viewport = bd.resolved_viewport;
+  resolve_cache.resolved_position_transformed = bd.resolved_position_transformed;
+  resolve_cache.resolved_inject_point_size = bd.resolved_inject_point_size;
+  std::memcpy(resolve_cache.ffp_texcoord_width, ffp_texcoord_width, sizeof(resolve_cache.ffp_texcoord_width));
+  resolve_cache.resolved_scissor = bd.resolved_scissor;
+  std::memcpy(resolve_cache.resolved_rt_handles, bd.resolved_rt_handles, sizeof(resolve_cache.resolved_rt_handles));
+  std::memcpy(resolve_cache.resolved_rt_view, bd.resolved_rt_view, sizeof(resolve_cache.resolved_rt_view));
+  std::memcpy(resolve_cache.resolved_rt_level, bd.resolved_rt_level, sizeof(resolve_cache.resolved_rt_level));
+  std::memcpy(resolve_cache.resolved_rt_slice, bd.resolved_rt_slice, sizeof(resolve_cache.resolved_rt_slice));
+  std::memcpy(
+      resolve_cache.resolved_frag_textures, bd.resolved_frag_textures, sizeof(resolve_cache.resolved_frag_textures)
+  );
+  std::memcpy(resolve_cache.resolved_frag_view, bd.resolved_frag_view, sizeof(resolve_cache.resolved_frag_view));
+  std::memcpy(
+      resolve_cache.resolved_frag_samplers, bd.resolved_frag_samplers, sizeof(resolve_cache.resolved_frag_samplers)
+  );
+  for (uint32_t i = 0; i < D3D_MAX_SIMULTANEOUS_RENDERTARGETS; ++i)
+    resolve_cache.resolved_rt_dxmt[i] = bd.resolved_rt_dxmt[i];
+  resolve_cache.resolved_ds_dxmt = bd.resolved_ds_dxmt;
+  for (uint32_t i = 0; i < 16; ++i)
+    resolve_cache.resolved_frag_texture_dxmt[i] = bd.resolved_frag_texture_dxmt[i];
+  return true;
+}
+
+bool
 MTLD3D9Device::ResolveBatchedDrawForChunk(
     BatchedDraw &bd, uint64_t chunk_seq, uint64_t chunk_coherent_id, ConstUploadCache &const_cache,
     ResolveCache &resolve_cache
@@ -8757,7 +9826,6 @@ MTLD3D9Device::ResolveBatchedDrawForChunk(
   const dxmt::D9EncodingState &pod = *bd.pod_snapshot;
   const DWORD *rs = pod.render_states->v;
   const DWORD(*samp_states)[D3DSAMP_DMAPOFFSET + 1] = pod.sampler_states->v;
-  const UINT *stream_freq = pod.stream_freq->v;
 
   // Cluster cache: pod/ref pointer-equality implies byte-equality.
   // ~80% hit rate; per-hit saves PSO lookup, 16 per-stage sampler/view operations, compiles.
@@ -8806,1061 +9874,9 @@ MTLD3D9Device::ResolveBatchedDrawForChunk(
     bd.resolved_ds_dxmt = resolve_cache.resolved_ds_dxmt;
     for (uint32_t i = 0; i < 16; ++i)
       bd.resolved_frag_texture_dxmt[i] = resolve_cache.resolved_frag_texture_dxmt[i];
-  } else {
-    // Pre-convert viewport / scissor to Metal shape so per-draw emit does not
-    // re-run the helpers.
-    bd.resolved_viewport = wmt_viewport_from_d3d9(pod.viewport);
-    bd.resolved_scissor = wmt_scissor_from_d3d9(pod.scissor_rect, pod.viewport, rs[D3DRS_SCISSORTESTENABLE] != 0);
-
-    // ---- IA layout ----
-    // D3D9 caps vertex declarations at MAX_FVF_DECL_SIZE = 64 elements
-    // (D3DDECL_END terminator brings the typical cap to ~16 active);
-    // a stack-resident array avoids the per-draw std::vector heap alloc
-    // entirely. decl->elementCount() includes the terminator, so the
-    // bound here is a generous 64.
-    DXSO_IA_INPUT_ELEMENT elements[64];
-    uint32_t element_count = 0;
-    uint32_t slot_mask = 0;
-    bool decl_position_transformed = false;
-    bool ffp_has_diffuse = false;
-    bool ffp_has_texcoord0 = false;
-    bool ffp_has_specular = false;
-    bool ffp_has_normal = false;
-    bool ffp_has_psize = false;
-    uint32_t ffp_texcoord_mask = 0;
-    bool ffp_decl_has_diffuse = false;
-    bool ffp_decl_has_specular = false;
-    for (UINT i = 0; i < decl->elementCount(); ++i) {
-      const D3DVERTEXELEMENT9 &e = decl->elements()[i];
-      if (e.Stream == 0xFF)
-        continue;
-      // Filter elements past the 16-stream cap wholesale, before any per-stream
-      // read (wined3d vertexdeclaration.c, "filter tessellation pseudo streams"):
-      // such a stream has no vertex_buffers[]/stream_freq[] slot, so it must not
-      // reach the material-source bookkeeping below, and 1u << Stream would be an
-      // out-of-range shift. CreateVertexDeclaration accepts the decl (both refs
-      // do); the draw drops the element. should_skip_ia_element encodes the same
-      // past-cap rule, but the guard here also protects the reads that precede it.
-      if (e.Stream >= D3D9_MAX_VERTEX_STREAMS)
-        continue;
-      // Declaration presence, independent of stream liveness: the material
-      // source validation below keys on whether the declaration carries the
-      // color at all (wined3d validate_material_colour_source); an element
-      // declared on an unbound stream keeps its selector and zero-fills
-      // through the fetch instead.
-      if (ffp_vs && e.Usage == D3DDECLUSAGE_COLOR) {
-        if (e.UsageIndex == 0)
-          ffp_decl_has_diffuse = true;
-        else if (e.UsageIndex == 1)
-          ffp_decl_has_specular = true;
-      }
-      // An element on a stream with no bound vertex buffer drops out of
-      // the layout instead of failing the draw: wined3d derives stream
-      // liveness per draw (context.c wined3d_stream_info_from_declaration)
-      // and still renders, with the unfed shader input reading its
-      // zero-fill default. A declaration-only stream reference is common
-      // in runner-style harnesses that always declare a position element.
-      // Stream is in-cap here (guarded above), so the per-stream read is safe.
-      const bool has_live_stream =
-          refs.vertex_buffers[e.Stream].ptr() != nullptr || (e.Stream == 0 && bd.override_vb_buffer != 0);
-      if (should_skip_ia_element(e.Stream, has_live_stream)) {
-        // A PSIZE declared on an unfed stream still sets the point size: D3D9
-        // reads the missing per-vertex size as 1 (AMD / WARP), not the render
-        // state. Mark the per-vertex path even though the element drops out of
-        // the layout; with no element backing it the generated VS emits size 1.
-        if (e.Usage == D3DDECLUSAGE_PSIZE)
-          ffp_has_psize = true;
-        continue;
-      }
-      // A pre-transformed position element (D3DDECLUSAGE_POSITIONT) carries
-      // window-space coordinates. D3D9 routes such a draw through the fixed-
-      // function pre-transform and ignores the bound vertex shader (per spec),
-      // which is why ffp_vs was forced true above for a pre-transformed decl.
-      // The generated FFP vertex shader consumes the POSITIONT element as its
-      // position input (matched to reg 0 below) and applies the screen->clip
-      // remap from the viewport uniform (vp_remap).
-      uint32_t match_usage = e.Usage;
-      if (e.Usage == D3DDECLUSAGE_POSITIONT)
-        match_usage = D3DDECLUSAGE_POSITION;
-      int vs_reg = -1;
-      if (ffp_vs) {
-        // Generated-VS register contract (ffp_input_register, airconv_public.h):
-        // the injective (usage, index) -> input register map. Derive the material-
-        // source flags and texcoord widths off the resolved register; the map is
-        // injective, so each register unambiguously identifies its semantic.
-        vs_reg = ffp_input_register(match_usage, e.UsageIndex);
-        switch (vs_reg) {
-        case 1:
-          ffp_has_diffuse = true;
-          break;
-        case 3:
-          ffp_has_specular = true;
-          break;
-        case 4:
-          ffp_has_normal = true;
-          break;
-        case 13:
-          ffp_has_psize = true;
-          break;
-        case 2:
-          ffp_has_texcoord0 = true;
-          ffp_texcoord_mask |= 1u;
-          ffp_texcoord_width[0] = texcoord_component_count(e.Type);
-          break;
-        default:
-          // Registers 5..11 are texcoord sets 1..7 (reg = 4 + UsageIndex).
-          if (vs_reg >= 5 && vs_reg <= 11) {
-            const uint32_t tex_set = static_cast<uint32_t>(vs_reg) - 4u;
-            ffp_texcoord_mask |= 1u << tex_set;
-            ffp_texcoord_width[tex_set] = texcoord_component_count(e.Type);
-          }
-          break;
-        }
-      } else
-        for (const auto &d : vs->metadata().dcls) {
-          if (d.bound_to.type == DxsoRegisterType::Input && static_cast<uint32_t>(d.dcl.usage) == match_usage &&
-              d.dcl.usage_index == e.UsageIndex) {
-            vs_reg = static_cast<int>(d.bound_to.num);
-            break;
-          }
-        }
-      if (vs_reg < 0)
-        continue;
-      // Flag the draw only once the POSITIONT element actually feeds a VS input,
-      // so a declared-but-unconsumed position doesn't force the transformed variant.
-      if (e.Usage == D3DDECLUSAGE_POSITIONT)
-        decl_position_transformed = true;
-      if (element_count >= 64)
-        break;
-      DXSO_IA_INPUT_ELEMENT &elem = elements[element_count++];
-      elem = DXSO_IA_INPUT_ELEMENT{};
-      elem.reg = static_cast<uint32_t>(vs_reg);
-      elem.slot = e.Stream;
-      elem.aligned_byte_offset = e.Offset;
-      elem.format = to_mtl_attr_format(e.Type);
-      UINT freq = stream_freq[e.Stream];
-      if (freq & D3DSTREAMSOURCE_INSTANCEDATA) {
-        elem.step_function = 1;
-        // INSTANCEDATA | 0 is a legal API input (matches native D3D9);
-        // Metal cannot encode a per-instance stepRate of 0, so clamp the
-        // divider to >= 1 the same way instance_count is clamped above.
-        elem.step_rate = std::max(freq & 0x007FFFFFu, 1u);
-      } else {
-        elem.step_function = 0;
-        elem.step_rate = 0;
-      }
-      slot_mask |= (1u << e.Stream);
-    }
-    // element_count of zero is a legal draw: a constant-output VS with a
-    // declaration whose only elements sit on unbound streams (filtered
-    // above) fetches nothing and every dcl'd input zero-fills.
-    bd.resolved_slot_mask = slot_mask;
-
-    DXSO_INDEX_BUFFER_FORMAT ib_fmt = DXSO_INDEX_BUFFER_FORMAT_NONE;
-    if (indexed) {
-      D3DFORMAT d3d_ib_format;
-      if (bd.override_ib_buffer != 0) {
-        d3d_ib_format = bd.override_ib_format;
-      } else {
-        // cap.ib_format / cap.ib_buffer were frozen at BuildDrawCapture
-        // time so Lock(DISCARD) between queue and execute can't move the
-        // index data out from under this draw.
-        if (cap.ib_buffer == 0)
-          return false;
-        d3d_ib_format = cap.ib_format;
-      }
-      ib_fmt = (d3d_ib_format == D3DFMT_INDEX32) ? DXSO_INDEX_BUFFER_FORMAT_UINT32 : DXSO_INDEX_BUFFER_FORMAT_UINT16;
-    }
-    bd.resolved_ib_fmt = static_cast<uint32_t>(ib_fmt);
-
-    DXSO_SHADER_IA_INPUT_LAYOUT_DATA layout{};
-    layout.slot_mask = slot_mask;
-    layout.num_elements = element_count;
-    layout.elements = elements;
-    layout.index_buffer_format = ib_fmt;
-    layout.position_transformed = decl_position_transformed ? 1u : 0u;
-    bd.resolved_position_transformed = decl_position_transformed;
-
-    // D3DRS_POINTSIZE auto-injection: the injecting VS variant emits
-    // [[point_size]] for a point-list draw and reads the size + clamp
-    // bounds from a per-draw uniform (VS buffer 6, filled below), so
-    // distinct sizes share one MTLFunction instead of minting a cold PSO
-    // link per value. A VS that writes its own oPts always injects (the
-    // epilogue clamps its output against the uniform); one that doesn't
-    // injects only when the clamped render-state size leaves the 1.0
-    // default, keeping ordinary point draws on the base variant. Mirrors
-    // DXVK src/d3d9/d3d9_fixed_function.cpp GetPointSizeInfoVS + the
-    // dxso_compiler.cpp emitPsize clamp. The decision is invariant under
-    // the numeric size beyond that one default test (see d3d9_point_size.hpp).
-    bool vs_inject_point_size = inject_point_size(
-        bd.primitive_type == D3DPT_POINTLIST, !ffp_vs && vs->metadata().writes_point_size, rs[D3DRS_POINTSIZE],
-        rs[D3DRS_POINTSIZE_MIN], rs[D3DRS_POINTSIZE_MAX]
-    );
-    bd.resolved_inject_point_size = vs_inject_point_size;
-    // Fixed-function vertex fog: active when fog is enabled and table
-    // fog is off (table fog computes per fragment and takes priority).
-    // The D3DFOG_* value keys the generated VS directly.
-    uint32_t ffp_vs_fog_mode = 0;
-    if (ffp_vs && rs[D3DRS_FOGENABLE] != FALSE && rs[D3DRS_FOGTABLEMODE] == D3DFOG_NONE) {
-      ffp_vs_fog_mode = rs[D3DRS_FOGVERTEXMODE] <= D3DFOG_LINEAR ? rs[D3DRS_FOGVERTEXMODE] : 0;
-      // With no vertex-fog formula and no table fog, the D3D9 fog factor is the
-      // vertex specular alpha. It must interpolate smoothly even under FLAT
-      // shading (the specular color flat-shades, but the fog factor does not),
-      // so route it through the smooth oFog varying (a distinct mode 4) rather
-      // than let the pixel stage sample the flat COLOR1 alpha. DXVK emits
-      // specular.w to oFog the same way (DoFixedFunctionFog, D3DFOG_NONE).
-      // Pretransformed draws keep the pixel-stage specular-alpha path.
-      if (ffp_vs_fog_mode == 0 && ffp_has_specular && !bd.resolved_position_transformed)
-        ffp_vs_fog_mode = 4;
-    }
-    // D3DRS_RANGEFOGENABLE switches vertex fog from planar (view-space z) to
-    // radial (true eye-space distance), so objects at the screen edge fog by
-    // distance instead of depth and stop swimming on camera rotation. One key
-    // bit onto the fog axis (both refs implement it: wined3d
-    // WINED3D_FFP_VS_FOG_RANGE = length(ec_pos.xyz), DXVK RangeFog VS key).
-    // Range fog only affects vertex fog, never table fog; programmable-VS
-    // draws are unaffected (their fog rides oFog). Without this the advertised
-    // D3DPRASTERCAPS_FOGRANGE cap is a lie.
-    bool ffp_vs_range_fog = ffp_vs_fog_mode >= 1u && ffp_vs_fog_mode <= 3u && rs[D3DRS_RANGEFOGENABLE] != FALSE;
-    // Only the point-vs-nonpoint, scale-enable and per-vertex gates key the
-    // generated VS. The size, clamp bounds and attenuation factors ride the
-    // uniform block, so changing a value does not build a new variant.
-    // Lighting key: enabled + normal presence + the specular/normalize/
-    // local-viewer/color-vertex render states + the four material source
-    // selectors (values 0..2 per D3DMCS_*).
-    uint32_t ffp_lighting_key = 0;
-    // A pre-transformed (XYZRHW) draw is never lit: its position is already in
-    // clip space, so there is no world/view to light in. Native and both
-    // references bypass lighting for transformed vertices (wined3d's
-    // transformed vertex pipe emits no lighting, DXVK gates lighting on
-    // !VertexHasPositionT); without this an XYZRHW draw left at the default
-    // LIGHTING=TRUE replaces its vertex color with a zero light accumulation
-    // and renders black. Same carve-out the table-fog selection already makes.
-    if (ffp_vs && rs[D3DRS_LIGHTING] != FALSE && !bd.resolved_position_transformed) {
-      auto src_sel = [&](DWORD v) -> uint32_t { return v <= 2 ? v : 0; };
-      ffp_lighting_key = 1u | (rs[D3DRS_SPECULARENABLE] != FALSE ? 4u : 0u) |
-                         (rs[D3DRS_NORMALIZENORMALS] != FALSE ? 8u : 0u) | (rs[D3DRS_LOCALVIEWER] != FALSE ? 16u : 0u) |
-                         (rs[D3DRS_COLORVERTEX] != FALSE ? 32u : 0u);
-      const bool cv = rs[D3DRS_COLORVERTEX] != FALSE;
-      uint32_t sd = cv ? src_sel(rs[D3DRS_DIFFUSEMATERIALSOURCE]) : 0;
-      uint32_t ss = cv ? src_sel(rs[D3DRS_SPECULARMATERIALSOURCE]) : 0;
-      uint32_t sa = cv ? src_sel(rs[D3DRS_AMBIENTMATERIALSOURCE]) : 0;
-      uint32_t se = cv ? src_sel(rs[D3DRS_EMISSIVEMATERIALSOURCE]) : 0;
-      // A source pointing at a color the declaration does not carry falls
-      // back to the material (wined3d validate_material_colour_source).
-      if (!ffp_decl_has_diffuse) {
-        if (sd == 1)
-          sd = 0;
-        if (sa == 1)
-          sa = 0;
-        if (se == 1)
-          se = 0;
-        if (ss == 1)
-          ss = 0;
-      }
-      if (!ffp_decl_has_specular) {
-        if (sd == 2)
-          sd = 0;
-        if (ss == 2)
-          ss = 0;
-        if (sa == 2)
-          sa = 0;
-        if (se == 2)
-          se = 0;
-      }
-      ffp_lighting_key |= (sd | (ss << 2) | (sa << 4) | (se << 6)) << 8;
-      if (ffp_has_normal)
-        ffp_lighting_key |= 2u;
-    }
-    // Per-stage texcoord transforms: the enable bit keys the generated
-    // shader; the count, projection and attribute-width semantics fold
-    // into the matrix at upload (wined3d utils.c compute_texture_matrix)
-    // and the projective divide rides the combiner stage flags.
-    uint32_t ffp_tt_key = 0;
-    uint32_t ffp_texgen_key = 0;
-    uint32_t ffp_texcoord_index_key = 0;
-    if (ffp_vs) {
-      for (uint32_t s = 0; s < 8; ++s) {
-        DWORD ttf = pod.texture_stage_states->v[s][D3DTSS_TEXTURETRANSFORMFLAGS];
-        // A bare PROJECTED flag with a zero count still transforms (the
-        // identity-with-divisor arm of the matrix preprocessing). A pre-
-        // transformed (XYZRHW) draw never applies the texcoord matrix:
-        // wined3d gates the shader multiply on !transformed (glsl_shader.c)
-        // and DXVK on !VertexHasPositionT, so those texcoords reach the
-        // sampler raw. Leave the enable bit clear rather than warp them.
-        if (ttf != D3DTTFF_DISABLE && !bd.resolved_position_transformed)
-          ffp_tt_key |= 1u << (s * 4);
-        // D3DTSS_TCI_* texture generation, keyed by stage: wined3d
-        // utils.c copies the raw TEXCOORDINDEX per stage and a
-        // generated stage ignores the low coordinate index, writing
-        // the stage's own varying.
-        uint32_t tci_mode = (pod.texture_stage_states->v[s][D3DTSS_TEXCOORDINDEX] >> 16) & 0xFFFFu;
-        if (tci_mode >= 1 && tci_mode <= 4)
-          ffp_texgen_key |= tci_mode << (s * 3);
-        ffp_texcoord_index_key |= (pod.texture_stage_states->v[s][D3DTSS_TEXCOORDINDEX] & 7u) << (s * 3);
-      }
-      if (ffp_texgen_key != 0 && rs[D3DRS_NORMALIZENORMALS] != FALSE)
-        ffp_texgen_key |= 1u << 24;
-    }
-    // Fixed-function point size: emit the [[point_size]] output for every
-    // point-list draw. The size, clamp bounds and scale factors ride the
-    // uniforms block (float4 8/9), so only the point-vs-nonpoint /
-    // POINTSCALEENABLE / per-vertex gates key the generated variant.
-    bool ffp_point_size = false;
-    bool ffp_point_scale = false;
-    bool ffp_point_size_per_vertex = false;
-    if (ffp_vs && bd.primitive_type == D3DPT_POINTLIST) {
-      ffp_point_size = true;
-      ffp_point_scale = rs[D3DRS_POINTSCALEENABLE] != FALSE;
-      // A declared PSIZE attribute overrides the render-state size
-      // (wined3d per_vertex_point_size).
-      ffp_point_size_per_vertex = ffp_has_psize;
-    }
-    // D3DRS_VERTEXBLEND declared weight count for the generated VS.
-    // Tweening and the zero-weight arm collapse to disabled (world
-    // matrix 0 only), the same 1..3 support the wined3d vertex pipe
-    // implements; a pre-transformed position never blends.
-    uint32_t ffp_vertex_blend = 0;
-    if (ffp_vs && !bd.resolved_position_transformed) {
-      DWORD vb = rs[D3DRS_VERTEXBLEND];
-      if (vb >= D3DVBF_1WEIGHTS && vb <= D3DVBF_3WEIGHTS)
-        ffp_vertex_blend = vb;
-    }
-    // Fetch (find-or-create + submit) the async vertex-function compile
-    // task; the LLVM AIR emit runs on a pool thread, not here. A cold
-    // variant does not stall the encode thread; the PSO task below waits
-    // on this task off-thread and the null-state skip drops a failed compile.
-    D3D9CompiledFunction *vs_fn =
-        ffp_vs ? ffpVertexFunction(
-                     layout, ffp_has_diffuse, ffp_has_texcoord0, ffp_has_specular, ffp_vs_fog_mode, ffp_vs_range_fog,
-                     ffp_point_size, ffp_point_scale, ffp_lighting_key, ffp_texcoord_mask, ffp_tt_key, ffp_vertex_blend,
-                     ffp_texgen_key, ffp_texcoord_index_key, ffp_point_size_per_vertex, ffp_decl_has_diffuse
-                 )
-               : vs->getVariantTask(layout, vs_inject_point_size);
-
-    // SM 1.0..1.3 PS lack dcl_2d/dcl_cube tokens; infer kinds from bound textures.
-    // dxso_compile defaults to Texture2D, causing Metal validation and cube-map flicker.
-    uint8_t ps_samp_kinds[16] = {};
-    for (uint32_t stage = 0; stage < 16; ++stage) {
-      auto *tex = refs.textures[stage].ptr();
-      if (!tex)
-        continue;
-      switch (tex->commonTextureType()) {
-      case D3DRTYPE_TEXTURE:
-        // INTZ/DF24/DF16 are depth textures but bound as D3DRTYPE_TEXTURE.
-        // Force depth2d<float> codegen; MSL texture2d<float> leaves .gba undefined.
-        switch (tex->metalPixelFormat()) {
-        case WMTPixelFormatDepth16Unorm:
-        case WMTPixelFormatDepth32Float:
-        case WMTPixelFormatDepth32Float_Stencil8:
-        case WMTPixelFormatDepth24Unorm_Stencil8:
-          // INTZ and the HW-shadow depth formats both land on a Metal
-          // depth texture; the D3DFORMAT picks the sample op. INTZ ->
-          // raw depth replicated (in-shader compare); D24S8/DF24/DF16 ->
-          // hardware PCF (sample_compare). See IsHardwarePCFDepthFormat.
-          // The raw-depth trio with the FETCH4 latch armed gathers the
-          // neighbourhood instead (DXVK lists the same three among its
-          // FETCH4-compatible formats); the PCF formats never gather.
-          if (!IsHardwarePCFDepthFormat(tex->d3dFormat()) && (pod.fetch4_latch & (1u << stage)) &&
-              samp_states[stage][D3DSAMP_MAGFILTER] == D3DTEXF_POINT)
-            ps_samp_kinds[stage] = DXSO_PS_SAMPLER_KIND_TEXTURE_2D_DEPTH_FETCH4;
-          else if (IsHardwarePCFDepthFormat(tex->d3dFormat()))
-            ps_samp_kinds[stage] = DXSO_PS_SAMPLER_KIND_TEXTURE_2D_DEPTH_COMPARE;
-          else
-            // Raw depth: INTZ replicates, the DF formats read red only.
-            ps_samp_kinds[stage] = tex->d3dFormat() == D3DFMT_INTZ ? DXSO_PS_SAMPLER_KIND_TEXTURE_2D_DEPTH
-                                                                   : DXSO_PS_SAMPLER_KIND_TEXTURE_2D_DEPTH_DF;
-          break;
-        default:
-          // Two-channel signed formats take the snorm rescale kinds.
-          if (tex->d3dFormat() == D3DFMT_V8U8) {
-            ps_samp_kinds[stage] = DXSO_PS_SAMPLER_KIND_TEXTURE_2D_SNORM2_8;
-            break;
-          }
-          if (tex->d3dFormat() == D3DFMT_V16U16) {
-            ps_samp_kinds[stage] = DXSO_PS_SAMPLER_KIND_TEXTURE_2D_SNORM2_16;
-            break;
-          }
-          // FETCH4: armed latch + point magnification + a single-channel
-          // colour format gathers instead of sampling (DXVK gates on the
-          // same trio; its format list is the source of this one).
-          if (stage < 16 && (pod.fetch4_latch & (1u << stage)) &&
-              samp_states[stage][D3DSAMP_MAGFILTER] == D3DTEXF_POINT) {
-            switch (tex->d3dFormat()) {
-            case D3DFMT_R16F:
-            case D3DFMT_R32F:
-            case D3DFMT_A8:
-            case D3DFMT_L8:
-            case D3DFMT_L16:
-              ps_samp_kinds[stage] = DXSO_PS_SAMPLER_KIND_TEXTURE_2D_FETCH4;
-              break;
-            case D3DFMT_ATI1:
-              // Block-compressed: the hardware replicates the sampled
-              // red instead of gathering across the block.
-              ps_samp_kinds[stage] = DXSO_PS_SAMPLER_KIND_TEXTURE_2D_FETCH4_REPLICATE;
-              break;
-            default:
-              // An armed latch on a format outside the single-channel
-              // set: the vendor hardware returns zero for the plain
-              // sample forms and only the projected form degrades to a
-              // normal sample; wine's fetch4 rows pin both sides.
-              ps_samp_kinds[stage] = DXSO_PS_SAMPLER_KIND_TEXTURE_2D_FETCH4_BROKEN;
-              break;
-            }
-            break;
-          }
-          ps_samp_kinds[stage] = DXSO_PS_SAMPLER_KIND_TEXTURE_2D;
-          break;
-        }
-        break;
-      case D3DRTYPE_CUBETEXTURE:
-        ps_samp_kinds[stage] = DXSO_PS_SAMPLER_KIND_TEXTURE_CUBE;
-        break;
-      case D3DRTYPE_VOLUMETEXTURE:
-        ps_samp_kinds[stage] = DXSO_PS_SAMPLER_KIND_TEXTURE_3D;
-        break;
-      default:
-        ps_samp_kinds[stage] = DXSO_PS_SAMPLER_KIND_UNKNOWN;
-        break;
-      }
-    }
-    // Unbound slots the PS still declares a sampler for: take the kind
-    // from the dcl so the compiled variant and the bound dummy agree on
-    // texture type. Without this a dcl_volume / dcl_cube slot with no app
-    // texture bound compiles the PS as 3D/cube (airconv's dcl fallback)
-    // while the resolve binds a 2D dummy: a Metal type mismatch that
-    // samples undefined (black). Host-authoritative, mirroring DXVK's
-    // per-slot texture-type tracking (D3D9TextureSlotTracking) + wined3d's
-    // per-type dummy textures.
-    if (!ffp_ps)
-      for (const auto &d : ps->metadata().dcls) {
-        if (d.bound_to.type != DxsoRegisterType::Sampler || d.bound_to.num >= 16)
-          continue;
-        if (refs.textures[d.bound_to.num].ptr())
-          continue; // bound: kind already set from the actual texture above
-        switch (d.dcl.texture_type) {
-        case DxsoTextureType::TextureCube:
-          ps_samp_kinds[d.bound_to.num] = DXSO_PS_SAMPLER_KIND_TEXTURE_CUBE;
-          break;
-        case DxsoTextureType::Texture3D:
-          ps_samp_kinds[d.bound_to.num] = DXSO_PS_SAMPLER_KIND_TEXTURE_3D;
-          break;
-        default:
-          ps_samp_kinds[d.bound_to.num] = DXSO_PS_SAMPLER_KIND_TEXTURE_2D;
-          break;
-        }
-      }
-    // Only the alpha compare FUNC keys the variant (D3DCMP_ALWAYS = no
-    // discard emit); the ref rides the shared PS uniform tail, written into
-    // ps_b_blob at the const-upload below and read at runtime.
-    DWORD alpha_func = rs[D3DRS_ALPHAFUNC];
-    // An out-of-range compare func (uninitialized app state) kills every
-    // fragment on both refs (their DecodeCompareOp default arm is NEVER,
-    // the same rule to_mtl_compare_func now follows). Normalize garbage to
-    // D3DCMP_NEVER here, at the single producer of the variant key, so the
-    // generated discard matches instead of the codegen default passing
-    // everything; the alpha_func rides the WoW64 arg chain, so fixing it at
-    // the source keeps both PS paths honest.
-    if (alpha_func < D3DCMP_NEVER || alpha_func > D3DCMP_ALWAYS)
-      alpha_func = D3DCMP_NEVER;
-    bool alpha_test = rs[D3DRS_ALPHATESTENABLE] != FALSE && alpha_func != D3DCMP_ALWAYS;
-    // POINTSPRITEENABLE only applies to point-list primitives; non-point
-    // draws skip the variant so the cache doesn't explode on toggles.
-    // D3DRS_POINTSPRITEENABLE default is FALSE so most apps never hit
-    // the variant path at all.
-    bool point_sprite = rs[D3DRS_POINTSPRITEENABLE] != FALSE && bd.primitive_type == D3DPT_POINTLIST;
-    // TexBem / TexBemL / Bem: the per-stage D3DTSS_BUMPENV* matrix and
-    // luminance scale/offset ride the shared PS uniform tail (written into
-    // ps_b_blob below, unconditionally from the pod so the buffer stays a
-    // pure function of the const-cache key) and the generated PS reads them
-    // at runtime. They do not bake into the variant, so an app that
-    // animates bump-env keeps one variant per material instead of churning
-    // a cold PSO link per frame. DXVK feeds the same constants through its
-    // D3D9SharedPS uniform (src/d3d9/d3d9_state.h + dxso_compiler.cpp emitBem).
-    // D3D9 fog blend (pre-SM3 contract): the PS epilogue lerps oC0.rgb
-    // toward D3DRS_FOGCOLOR by a fog factor, as wined3d's and DXVK's
-    // generated pixel shaders do. ps_3_0 computes fog itself per spec;
-    // gating the version here keeps SM3 titles that leave FOGENABLE set
-    // from forking byte-identical PSOs (wined3d zeroes its fog
-    // compile-arg the same way).
-    //
-    // FOGTABLEMODE != NONE means table (pixel) fog, which takes priority
-    // over vertex fog per the D3D9 contract: the factor is computed per
-    // fragment from depth in the PS, with FOGSTART/FOGEND/FOGDENSITY
-    // threaded through the bool-constant blob below. Otherwise vertex
-    // fog uses the VS oFog factor; a VS that writes no oFog (or fixed
-    // function with FOGVERTEXMODE none) falls back to the interpolated
-    // specular alpha, which test_fog's rows pin.
-    int fog_mode = -1;
-    if (rs[D3DRS_FOGENABLE] != FALSE && (ffp_ps || ps->metadata().major < 3)) {
-      DWORD table_mode = rs[D3DRS_FOGTABLEMODE];
-      if (table_mode != D3DFOG_NONE) {
-        // D3DFOG_EXP=1, EXP2=2, LINEAR=3; map onto DXSO_PS_FOG_MODE_*.
-        switch (table_mode) {
-        case D3DFOG_LINEAR:
-          fog_mode = DXSO_PS_FOG_MODE_LINEAR;
-          break;
-        case D3DFOG_EXP:
-          fog_mode = DXSO_PS_FOG_MODE_EXP;
-          break;
-        case D3DFOG_EXP2:
-          fog_mode = DXSO_PS_FOG_MODE_EXP2;
-          break;
-        default:
-          break;
-        }
-      } else if (bd.resolved_position_transformed) {
-        // A pre-transformed draw never takes the vertex-fog formula,
-        // whatever FOGVERTEXMODE says: the factor is always the
-        // specular alpha (test_fog's RHW rows pin it for every mode).
-        fog_mode = DXSO_PS_FOG_MODE_SPECULAR_ALPHA;
-      } else if (ffp_vs ? ffp_vs_fog_mode != 0 : vs->metadata().writes_fog) {
-        fog_mode = DXSO_PS_FOG_MODE_VERTEX;
-      } else {
-        // No table mode and no fog factor from the vertex stage: the
-        // factor is the interpolated specular alpha (a bytecode VS
-        // without an oFog write, a pre-transformed draw, or fixed
-        // function with FOGVERTEXMODE none); the fog params are ignored
-        // on this path per test_fog's contract.
-        fog_mode = DXSO_PS_FOG_MODE_SPECULAR_ALPHA;
-      }
-    }
-    // Dual-source blending: only when the active blend factors actually
-    // read SRC1 (D3DBLEND_SRCCOLOR2 / INVSRCCOLOR2) does oC1 become the
-    // second color index of attachment 0. A draw that writes oC1 as a
-    // normal second render target must not take this variant, so the
-    // detection is on the bound blend factors, not the shader. Alpha
-    // factors only matter under SEPARATEALPHABLENDENABLE. The variant
-    // additionally requires the PS to export oC1: a Source1 PSO whose
-    // fragment function has no index(1) output fails Metal pipeline
-    // creation, so apply_blend_state_to_attachment folds the SRC1
-    // factors away instead when the shader can't feed them.
-    bool dual_source = false;
-    if (!ffp_ps && rs[D3DRS_ALPHABLENDENABLE] != FALSE && ps->metadata().writes_oc1) {
-      auto is_src1 = [](DWORD f) { return f == D3DBLEND_SRCCOLOR2 || f == D3DBLEND_INVSRCCOLOR2; };
-      dual_source = is_src1(rs[D3DRS_SRCBLEND]) || is_src1(rs[D3DRS_DESTBLEND]);
-      if (rs[D3DRS_SEPARATEALPHABLENDENABLE] != FALSE)
-        dual_source = dual_source || is_src1(rs[D3DRS_SRCBLENDALPHA]) || is_src1(rs[D3DRS_DESTBLENDALPHA]);
-    }
-    // The generated PS's combiner table, packed per the key contract:
-    // ops and args from the frozen texture-stage state, the has-texture
-    // and result-is-temp flags; each stage samples its own varying,
-    // the per-stage routing living in the vertex key. A stage whose
-    // arguments reference TEXTURE with none bound ends the chain, the
-    // wined3d contract for incomplete stages.
-    // The host-resolved sampler kinds for the combiner's eight stages,
-    // packed four bits each; the bytecode variants receive the same
-    // resolution through their PSO argument instead.
-    uint32_t ffp_sampler_kind_key = 0;
-    if (ffp_ps)
-      for (uint32_t s = 0; s < 8; ++s)
-        ffp_sampler_kind_key |= uint32_t(ps_samp_kinds[s] & 0xFu) << (s * 4);
-    uint32_t ffp_stages[8][3] = {};
-    if (ffp_ps) {
-      for (uint32_t s = 0; s < 8; ++s) {
-        const DWORD *tss = pod.texture_stage_states->v[s];
-        uint32_t color_op = tss[D3DTSS_COLOROP] & 0xFF;
-        uint32_t alpha_op = tss[D3DTSS_ALPHAOP] & 0xFF;
-        if (s > 0 && color_op == D3DTOP_DISABLE) {
-          ffp_stages[s][0] = D3DTOP_DISABLE;
-          break;
-        }
-        const bool has_tex = refs.textures[s].ptr() != nullptr;
-        auto refs_texture = [&](DWORD arg) { return (arg & D3DTA_SELECTMASK) == D3DTA_TEXTURE; };
-        DWORD carg1 = tss[D3DTSS_COLORARG1], carg2 = tss[D3DTSS_COLORARG2], carg0 = tss[D3DTSS_COLORARG0];
-        DWORD aarg1 = tss[D3DTSS_ALPHAARG1], aarg2 = tss[D3DTSS_ALPHAARG2], aarg0 = tss[D3DTSS_ALPHAARG0];
-        // An op reading TEXTURE with none bound rewrites to
-        // SELECTARG1(CURRENT) and the chain continues; the third
-        // argument only invalidates the ops that read it (wined3d
-        // utils.c is_invalid_op, applied per color and alpha op).
-        auto invalid_op = [&](uint32_t op, DWORD a1, DWORD a2, DWORD a0) {
-          if (op == D3DTOP_DISABLE || has_tex)
-            return false;
-          if (refs_texture(a1) && op != D3DTOP_SELECTARG2)
-            return true;
-          if (refs_texture(a2) && op != D3DTOP_SELECTARG1)
-            return true;
-          if (refs_texture(a0) && (op == D3DTOP_MULTIPLYADD || op == D3DTOP_LERP))
-            return true;
-          return false;
-        };
-        if (invalid_op(color_op, carg1, carg2, carg0)) {
-          color_op = D3DTOP_SELECTARG1;
-          carg1 = D3DTA_CURRENT;
-          carg2 = D3DTA_CURRENT;
-          carg0 = D3DTA_CURRENT;
-        }
-        if (invalid_op(alpha_op, aarg1, aarg2, aarg0)) {
-          alpha_op = D3DTOP_SELECTARG1;
-          aarg1 = D3DTA_CURRENT;
-          aarg2 = D3DTA_CURRENT;
-          aarg0 = D3DTA_CURRENT;
-        }
-        // A dot product on the color op overwrites the alpha operation
-        // and replicates the color result into alpha (wined3d utils.c).
-        if (color_op == D3DTOP_DOTPRODUCT3) {
-          alpha_op = color_op;
-          aarg1 = carg1;
-          aarg2 = carg2;
-          // DOTPRODUCT3 ignores arg0, but wined3d utils.c mirrors carg0 into
-          // aarg0 so the identical-op collapse recognises the two ops as equal.
-          aarg0 = carg0;
-        }
-        uint32_t flags = (has_tex ? 1u : 0u) | ((tss[D3DTSS_RESULTARG] & D3DTA_SELECTMASK) == D3DTA_TEMP ? 2u : 0u) |
-                         ((tss[D3DTSS_TEXTURETRANSFORMFLAGS] & D3DTTFF_PROJECTED) ? 4u : 0u);
-        ffp_stages[s][0] = color_op | (alpha_op << 8) | (flags << 16);
-        ffp_stages[s][1] = (carg1 & 0xFF) | ((carg2 & 0xFF) << 8) | ((carg0 & 0xFF) << 16);
-        ffp_stages[s][2] = (aarg1 & 0xFF) | ((aarg2 & 0xFF) << 8) | ((aarg0 & 0xFF) << 16);
-      }
-    }
-    // Table-fog coordinate: fog against eye-space w (1/position.w) when the
-    // projection can produce a non-unit w (pod.ffp_fog_coord_w), else the
-    // vertex-output Z. The non-w arm reads the VS-written FOG0.y varying
-    // (clip-space Z for a WVP draw, window-space Z for a pre-transformed draw,
-    // wined3d ffp_varying_fogcoord), not the fragment [[position]].z, which
-    // keeps it off the post-perspective device depth and clear of the
-    // rasterizer depth bias. A pre-transformed draw takes the same
-    // projection-derived choice: its rhw carries the perspective w a
-    // non-orthographic projection would have made.
-    const bool fog_coord_w =
-        fog_mode >= DXSO_PS_FOG_MODE_LINEAR && fog_mode <= DXSO_PS_FOG_MODE_EXP2 && pod.ffp_fog_coord_w != 0;
-    // Per-attachment 8-bit-UNORM snap mask: bit i set when render target i
-    // resolves to a LINEAR 8-bit unorm Metal format, so the PS epilogue rounds
-    // oC<i> to the nearest k/255 (round-half-to-even) and Metal's unorm write
-    // reproduces WARP's byte instead of rounding an exact half the other way.
-    // The mask keys the PS variant, so a shader shared between an 8-bit-unorm
-    // and a float/HDR RT forks one metallib per mask. An SRGBWRITEENABLE target
-    // recalls to an sRGB format IsUnorm8RenderTargetFormat rejects (an sRGB
-    // attachment applies its own curve), so sRGB and float/HDR keep full
-    // precision. Mirrors the DXBC pipeline's unorm_output_reg_mask.
-    uint32_t unorm_snap_mask = 0;
-    for (unsigned i = 0; i < D3D_MAX_SIMULTANEOUS_RENDERTARGETS; ++i) {
-      MTLD3D9Surface *rt = refs.render_targets[i].ptr();
-      if (!rt || IsNullFormat(rt->desc().Format))
-        continue;
-      WMTPixelFormat fmt = D3DFormatToMetal(rt->desc().Format, D3D9FormatUsage::RenderTarget);
-      if (rs[D3DRS_SRGBWRITEENABLE] != 0)
-        fmt = Recall_sRGB(fmt);
-      if (IsUnorm8RenderTargetFormat(fmt))
-        unorm_snap_mask |= 1u << i;
-    }
-    // ---- PSO descriptor build ----
-    MTLD3D9Surface *ds = refs.depth_stencil_surface.ptr();
-    // Sample count flows from the realized Metal texture, NOT
-    // desc().MultiSampleType: NONMASKABLE (and any path that allocates more
-    // samples than the enum encodes) stores an enum that maps to 1 while the
-    // texture carries the real count, and Metal hard-errors (hangs AGX) when
-    // the pipeline rasterSampleCount differs from an attachment. Mirrors
-    // d3d11's OM-bind, which reads the count off the bound view. Resolved
-    // before the PS variant so the D3DRS_MULTISAMPLEMASK gate below can key it.
-    uint8_t raster_sample_count = 1;
-    if (rt0 && !IsNullFormat(rt0->desc().Format) && rt0->dxmtTexture()) {
-      raster_sample_count = static_cast<uint8_t>(rt0->dxmtTexture()->sampleCount());
-    } else if (ds && ds->dxmtTexture()) {
-      raster_sample_count = static_cast<uint8_t>(ds->dxmtTexture()->sampleCount());
-    }
-    // D3DRS_MULTISAMPLEMASK rides the PS coverage output, not the pipeline key:
-    // only a 1-bit enable keys the variant (an animated mask never churns PSOs)
-    // while the 32-bit mask word rides the ps_b_blob tail below. The
-    // sample-count gate is mandatory: on a single-sample target a cleared mask
-    // bit0 would kill every fragment, and an all-ones mask is inert anywhere,
-    // so both keep the plain (non-coverage) variant. wined3d/DXVK apply the
-    // mask unconditionally; Metal has no encoder/PSO sample mask, only the
-    // shader-side [[sample_mask]] output the variant now emits.
-    const bool emit_sample_mask = raster_sample_count > 1 && rs[D3DRS_MULTISAMPLEMASK] != 0xffffffffu;
-    // The alpha compare FUNC keys the variant; the REF rides the shared PS
-    // uniform tail (written into ps_b_blob below), so it never reaches the
-    // pipeline key. TexBem bump-env constants ride the same tail.
-    D3D9CompiledFunction *ps_fn =
-        ffp_ps ? ffpPixelFunction(
-                     ffp_stages, rs[D3DRS_SPECULARENABLE] != FALSE, point_sprite, fog_mode, fog_coord_w,
-                     alpha_test ? alpha_func : 8, ffp_sampler_kind_key, rs[D3DRS_SHADEMODE] == D3DSHADE_FLAT,
-                     emit_sample_mask, unorm_snap_mask
-                 )
-               : ps->getVariantTask(
-                     alpha_test ? alpha_func : D3DCMP_ALWAYS, ps_samp_kinds, point_sprite, fog_mode, fog_coord_w,
-                     dual_source, rs[D3DRS_SHADEMODE] == D3DSHADE_FLAT, emit_sample_mask, unorm_snap_mask
-                 );
-    // Every render-pass attachment + the pipeline must share one sample count.
-    // A bound DS whose sample count disagrees with the color target (an app
-    // pairing an MSAA depth surface with a single-sample render target, or the
-    // reverse) is dropped here, before the PSO bakes a depth format, rather than
-    // faulting the GPU. The mismatch is an app error, so warn once instead of
-    // once per draw.
-    if (ds && ds->dxmtTexture() && rt0 && !IsNullFormat(rt0->desc().Format) &&
-        ds->dxmtTexture()->sampleCount() != raster_sample_count) {
-      // Encode thread is the sole toucher; a plain static needs no guard.
-      static bool warned = false;
-      if (!warned) {
-        warned = true;
-        Logger::warn(
-            str::format(
-                "d3d9: depth-stencil sample count ", ds->dxmtTexture()->sampleCount(), " != render target ",
-                (unsigned)raster_sample_count,
-                "; dropping the DS (a render target and depth-stencil must match multisample)"
-            )
-        );
-      }
-      ds = nullptr;
-      bd.resolved_ds_dxmt = nullptr;
-    }
-    // A depth-stencil smaller than the colour target cannot cover it: wined3d
-    // detaches it and keeps drawing (context_gl.c find_fbo_entry), surfacing
-    // the pairing only through ValidateDevice. Metal rasterizes a render pass
-    // to its SMALLEST attachment, so an undersized DS left attached silently
-    // crops every draw. Gate on dxmtTexture() too: the pass builder skips a
-    // colour target with no Metal backing, and dropping the DS for one would
-    // leave the pass with no attachment at all.
-    if (ds && rt0 && !IsNullFormat(rt0->desc().Format) && rt0->dxmtTexture() &&
-        (ds->desc().Width < rt0->desc().Width || ds->desc().Height < rt0->desc().Height)) {
-      static bool warned = false;
-      if (!warned) {
-        warned = true;
-        Logger::warn(
-            str::format(
-                "d3d9: depth-stencil ", ds->desc().Width, "x", ds->desc().Height, " is smaller than render target ",
-                rt0->desc().Width, "x", rt0->desc().Height, "; dropping the DS (it cannot cover the target)"
-            )
-        );
-      }
-      ds = nullptr;
-      bd.resolved_ds_dxmt = nullptr;
-    }
-    WMTPixelFormat ds_pixel_format = WMTPixelFormatInvalid;
-    bool ds_has_stencil = false;
-    if (ds) {
-      ds_pixel_format = D3DFormatToMetal(ds->desc().Format, D3D9FormatUsage::DepthStencil);
-      ds_has_stencil = HasStencilAspect(ds->desc().Format);
-    }
-    // Plumb the sample count through to the chunk lambda so its
-    // startRenderPass(default_raster_sample_count=N) matches the PSO's
-    // raster_sample_count=N. Metal validates this equality at
-    // setRenderPipelineState time; a mismatch hard-errors under
-    // MTL_DEBUG_LAYER.
-    bd.resolved_raster_sample_count = raster_sample_count;
-
-    WMTPrimitiveTopologyClass topology_class = WMTPrimitiveTopologyClassTriangle;
-    switch (bd.primitive_type) {
-    case D3DPT_POINTLIST:
-      topology_class = WMTPrimitiveTopologyClassPoint;
-      break;
-    case D3DPT_LINELIST:
-    case D3DPT_LINESTRIP:
-      topology_class = WMTPrimitiveTopologyClassLine;
-      break;
-    case D3DPT_TRIANGLELIST:
-    case D3DPT_TRIANGLESTRIP:
-    case D3DPT_TRIANGLEFAN:
-      topology_class = WMTPrimitiveTopologyClassTriangle;
-      break;
-    default:
-      break;
-    }
-
-    WMTRenderPipelineInfo pso_info;
-    WMT::InitializeRenderPipelineInfo(pso_info);
-    // The function handles are filled by the PSO task once its function-task
-    // dependencies compile off-thread; they do not exist yet, so leave them
-    // at the zero InitializeRenderPipelineInfo set.
-    pso_info.input_primitive_topology = topology_class;
-    pso_info.depth_pixel_format = ds_pixel_format;
-    pso_info.stencil_pixel_format = ds_has_stencil ? ds_pixel_format : WMTPixelFormatInvalid;
-    pso_info.raster_sample_count = raster_sample_count;
-
-    const bool srgb_write = rs[D3DRS_SRGBWRITEENABLE] != 0;
-    for (unsigned i = 0; i < D3D_MAX_SIMULTANEOUS_RENDERTARGETS; ++i) {
-      MTLD3D9Surface *rt = refs.render_targets[i].ptr();
-      if (!rt || IsNullFormat(rt->desc().Format))
-        continue;
-      WMTPixelFormat fmt = D3DFormatToMetal(rt->desc().Format, D3D9FormatUsage::RenderTarget);
-      if (srgb_write)
-        fmt = Recall_sRGB_ForRenderTarget(fmt);
-      pso_info.colors[i].pixel_format = fmt;
-      const bool alpha_is_one = D3DFormatHasNoAlpha(rt->desc().Format);
-      apply_blend_state_to_attachment(pso_info.colors[i], rs, rs[kColorWriteEnableRS[i]], dual_source, alpha_is_one);
-    }
-
-    uint64_t pso_key = 0xcbf29ce484222325ull;
-    auto mix64 = [&](uint64_t v) {
-      pso_key ^= v;
-      pso_key *= 0x100000001b3ull;
-    };
-    // Key on the function-task identities, not the compiled handles (which
-    // do not exist until the async compile finishes). The task pointer is a
-    // bijection with (module, variant key): get-or-create returns one task
-    // per variant, pinned for device lifetime (module tasks by the PSO
-    // cache's Com<shader>, FFP tasks by the device caches), so ABA is
-    // impossible and two distinct variants never collide.
-    mix64(reinterpret_cast<uint64_t>(vs_fn));
-    mix64(reinterpret_cast<uint64_t>(ps_fn));
-    mix64(static_cast<uint32_t>(pso_info.depth_pixel_format));
-    mix64(static_cast<uint32_t>(pso_info.stencil_pixel_format));
-    mix64(static_cast<uint32_t>(pso_info.input_primitive_topology));
-    mix64(static_cast<uint32_t>(pso_info.raster_sample_count));
-    for (unsigned i = 0; i < D3D_MAX_SIMULTANEOUS_RENDERTARGETS; ++i) {
-      const auto &b = pso_info.colors[i];
-      mix64(static_cast<uint32_t>(b.pixel_format));
-      mix64((static_cast<uint64_t>(b.blending_enabled ? 1u : 0u) << 32) | static_cast<uint32_t>(b.write_mask));
-      mix64(
-          (static_cast<uint64_t>(b.rgb_blend_operation) << 48) |
-          (static_cast<uint64_t>(b.alpha_blend_operation) << 32) |
-          (static_cast<uint64_t>(b.src_rgb_blend_factor) << 24) |
-          (static_cast<uint64_t>(b.dst_rgb_blend_factor) << 16) |
-          (static_cast<uint64_t>(b.src_alpha_blend_factor) << 8) | static_cast<uint64_t>(b.dst_alpha_blend_factor)
-      );
-    }
-
-    D3D9PsoCompileTask *task;
-    bool first_time = false;
-    // Cluster-miss short-circuit: even when ref_ptr or sampler-state
-    // changed (forcing a rebuild here), the PSO inputs (vs/ps function +
-    // RT/DS formats + blend state) often haven't moved. The previous
-    // draw's pso_key is the cheap gate before the FNV map probe. Both the
-    // fast path and the map probe confirm the full key inputs on a hash
-    // hit before reusing the task, the same collision guard the bytecode
-    // module cache applies (a 64-bit hit alone would pick the wrong
-    // pipeline); the verify is a handful of int compares and rejects on
-    // the first differing field.
-    if (pso_key == resolve_cache.last_pso_key && resolve_cache.last_pso_task &&
-        resolve_cache.last_pso_task->matchesKeyInputs(vs_fn, ps_fn, pso_info)) {
-      task = resolve_cache.last_pso_task;
-    } else if (
-        auto it = m_psoCache.find(pso_key);
-        it != m_psoCache.end() && it->second->matchesKeyInputs(vs_fn, ps_fn, pso_info)
-    ) {
-      task = it->second.get();
-      resolve_cache.last_pso_key = pso_key;
-      resolve_cache.last_pso_task = task;
-    } else {
-      auto fresh = std::make_unique<D3D9PsoCompileTask>(
-          m_metalDevice, Com<MTLD3D9VertexShader, false>{vs}, Com<MTLD3D9PixelShader, false>{ps}, pso_info, vs_fn, ps_fn
-      );
-      task = fresh.get();
-      // A true miss inserts; a verified 64-bit collision (the slot already
-      // holds a different PSO's task, which an in-flight chunk may still
-      // reference so it can't be evicted) leaves try_emplace's argument
-      // un-moved. Pin that loser for device lifetime in m_psoCacheCollisions
-      // instead, so the non-owning task pointer handed to the chunk stays
-      // valid; a collision is astronomically rare, so a non-cached rebuild is
-      // acceptable.
-      if (!m_psoCache.try_emplace(pso_key, std::move(fresh)).second)
-        m_psoCacheCollisions.push_back(std::move(fresh));
-      m_psoScheduler.submit(task);
-      first_time = true;
-      resolve_cache.last_pso_key = pso_key;
-      resolve_cache.last_pso_task = task;
-    }
-    // Defer the cold-compile wait to the encode thread so the calling
-    // thread never blocks on a PSO link; do so ONLY when the compile
-    // is still in flight. If the task
-    // already completed (cache hit, or rare submit-flushed-fast), do
-    // the cheap atomic-load resolve here; that preserves the
-    // Resolve-time return-false rejection for known-bad PSOs so a
-    // failed front draw can't silently drop the chunk's pending-clear
-    // flags. m_psoCache pins the task pointer for the device lifetime.
-    if (task->GetDone()) {
-      WMT::RenderPipelineState pso = task->state();
-      if (pso.handle == 0)
-        return false;
-      bd.resolved_pso = pso.handle;
-    } else {
-      bd.resolved_pso_task = task;
-      bd.resolved_pso_first_use = first_time;
-    }
-
-    // ---- Per-stage textures + samplers ----
-    for (uint32_t stage = 0; stage < 16; ++stage) {
-      auto *tex = refs.textures[stage].ptr();
-      const DWORD *samp_row = samp_states[stage];
-      // A bound texture with no Metal backing (a SCRATCH / packed-YUV resource
-      // constructed with a null dxmt::Texture, which SetTexture accepts) has no
-      // view to resolve; treat it as unbound so the dummy-texture arm below
-      // binds a placeholder instead of dereferencing the null backing here on
-      // the encode thread. Covers 2D, cube and volume alike.
-      if (!tex || !tex->dxmtTexture()) {
-        // Unbound sampler post-Reset causes Metal validation error and GPU callback error.
-        // Bind 1x1 placeholder + sampler to complete encoder.
-        WMTSamplerInfo sinfo = sampler_info_from_d3d9_state(samp_row);
-        if (auto sampler = getOrCreateSampler(sinfo))
-          bd.resolved_frag_samplers[stage] = sampler->sampler_state.handle;
-        // The dummy's type must match the kind the PS variant was compiled
-        // with for this slot (set above from the bound texture, or the dcl
-        // for an unbound-but-declared slot), or Metal flags a 2D-vs-3D/cube
-        // type mismatch and samples undefined.
-        WMTTextureType dummy_type = WMTTextureType2D;
-        if (ps_samp_kinds[stage] == DXSO_PS_SAMPLER_KIND_TEXTURE_3D)
-          dummy_type = WMTTextureType3D;
-        else if (ps_samp_kinds[stage] == DXSO_PS_SAMPLER_KIND_TEXTURE_CUBE)
-          dummy_type = WMTTextureTypeCube;
-        bd.resolved_frag_textures[stage] = dummyFragmentTexture(dummy_type);
-        continue;
-      }
-      // View lives on TextureAllocation (survives wrapper Reset via
-      // ref_tracker). derivations chain off fullView.
-      const Rc<dxmt::Texture> &rc = tex->dxmtTexture();
-      // Per-format channel swizzle + optional sRGB alias + SetLOD mip clamp.
-      // Shared with the VTF bind below (deriveSampleView) so a fixup-needing
-      // format samples the same shape in a VS as in a PS.
-      uint64_t view = deriveSampleView(rc, tex, samp_row);
-      // Resolve the view's Metal handle now (encode thread; same
-      // allocation as emit since both run inside this chunk). Kept for
-      // the cluster cache + the per-encoder bind shadow; the fence-tracked
-      // ctx.access(viewId) in EmitCommonRenderSetup_d9 re-fetches the same
-      // view object. Fall back to the base view if aliasing failed (an
-      // unsupported format pair); matches the old D3D9ViewCache.
-      obj_handle_t vh = rc->view(view).texture.handle;
-      if (!vh) {
-        view = rc->fullView;
-        vh = rc->view(view).texture.handle;
-      }
-      bd.resolved_frag_view[stage] = view;
-      bd.resolved_frag_textures[stage] = vh;
-      bd.resolved_frag_texture_dxmt[stage] = rc;
-      // Hardware-PCF depth textures need a LessEqual compare sampler so
-      // sample_compare (emitted by the _DEPTH_COMPARE PS variant for this
-      // stage) returns the filtered shadow result. Must match the kind
-      // classification above (both gate on IsHardwarePCFDepthFormat).
-      WMTSamplerInfo sinfo = sampler_info_from_d3d9_state(
-          samp_row, IsHardwarePCFDepthFormat(tex->d3dFormat()), IsMetalNonFilterableFormat(tex->d3dFormat())
-      );
-      auto sampler = getOrCreateSampler(sinfo);
-      if (sampler)
-        bd.resolved_frag_samplers[stage] = sampler->sampler_state.handle;
-    }
-
-    // ---- DSSO + stencil ref ----
-    if (ds) {
-      WMTDepthStencilInfo ds_info = depth_stencil_info_from_d3d9_state(rs, /*dsAttached=*/true, ds_has_stencil);
-      auto dsso = getOrCreateDSSO(ds_info);
-      bd.resolved_dsso = dsso.handle;
-      bd.resolved_stencil_ref = static_cast<uint8_t>(rs[D3DRS_STENCILREF] & 0xFF);
-    }
-
-    // ---- RT / DS Rc<dxmt::Texture> + TextureViewKey + Metal handles + dims ----
-    uint32_t rt_count = 0;
-    for (unsigned i = 0; i < D3D_MAX_SIMULTANEOUS_RENDERTARGETS; ++i) {
-      auto *rt = refs.render_targets[i].ptr();
-      if (!rt || IsNullFormat(rt->desc().Format))
-        continue;
-      bd.resolved_rt_dxmt[i] = rt->dxmtTexture();
-      if (bd.resolved_rt_dxmt[i]) {
-        TextureViewKey view = bd.resolved_rt_dxmt[i]->fullView;
-        if (srgb_write) {
-          // D3DRS_SRGBWRITEENABLE renders through the sRGB-format view; the
-          // attachment encodes the fragment output on store.
-          WMTPixelFormat base = bd.resolved_rt_dxmt[i]->pixelFormat();
-          WMTPixelFormat srgb = Recall_sRGB_ForRenderTarget(base);
-          if (srgb != base)
-            view = bd.resolved_rt_dxmt[i]->checkViewUseFormat(view, srgb);
-        }
-        bd.resolved_rt_view[i] = static_cast<uint64_t>(view);
-      }
-      bd.resolved_rt_handles[i] = rt->metalTexture().handle;
-      bd.resolved_rt_level[i] = static_cast<uint16_t>(rt->mipLevel());
-      bd.resolved_rt_slice[i] = static_cast<uint16_t>(rt->arraySlice());
-      rt_count = i + 1;
-      if (i == 0) {
-        bd.resolved_rt_width = rt->desc().Width;
-        bd.resolved_rt_height = rt->desc().Height;
-      }
-    }
-    bd.resolved_rt_count = static_cast<uint8_t>(rt_count);
-
-    // Self-downsample: a draw renders into mip N while sampling a lower
-    // mip of the same texture (e.g. an HDR luminance pyramid). Legal in
-    // D3D9, distinct subresources; DXVK skips the hazard for rtMip != 0.
-    // Apple GPUs allow attachment + sampler to share an allocation only
-    // as distinct, non-overlapping MTLTexture views (MoltenVK mints one
-    // per subresource range); the default full-mip attachment view
-    // overlaps the sampled mip, so the GPU drops the write and leaves NaN
-    // that the tonemap turns black. Bind the sampler to [0,N) and the
-    // attachment to a single mip [N,1). A mip-0 RT sampled at 0 is a real
-    // feedback loop and is left alone.
-    for (unsigned i = 0; i < bd.resolved_rt_count; ++i) {
-      auto *rt_tex = bd.resolved_rt_dxmt[i].ptr();
-      uint32_t rt_level = bd.resolved_rt_level[i];
-      if (!rt_tex || rt_level == 0)
-        continue;
-      bool self_sampled = false;
-      for (uint32_t stage = 0; stage < 16; ++stage) {
-        if (bd.resolved_frag_texture_dxmt[stage].ptr() != rt_tex)
-          continue;
-        self_sampled = true;
-        TextureViewKey src_view =
-            rt_tex->checkViewUseMipRange(TextureViewKey(bd.resolved_frag_view[stage]), 0, rt_level);
-        if (obj_handle_t vh = rt_tex->view(src_view).texture.handle) {
-          bd.resolved_frag_view[stage] = static_cast<uint64_t>(src_view);
-          bd.resolved_frag_textures[stage] = vh;
-        }
-      }
-      if (self_sampled) {
-        TextureViewKey rt_view = rt_tex->checkViewUseMipRange(TextureViewKey(bd.resolved_rt_view[i]), rt_level, 1);
-        bd.resolved_rt_view[i] = static_cast<uint64_t>(rt_view);
-        bd.resolved_rt_level[i] = 0;
-      }
-    }
-    if (ds) {
-      bd.resolved_ds_dxmt = ds->dxmtTexture();
-      if (bd.resolved_ds_dxmt)
-        bd.resolved_ds_view = static_cast<uint64_t>(bd.resolved_ds_dxmt->fullView);
-      bd.resolved_ds_handle = ds->metalTexture().handle;
-      bd.resolved_ds_has_stencil = ds_has_stencil;
-      bd.resolved_ds_level = static_cast<uint16_t>(ds->mipLevel());
-      bd.resolved_ds_slice = static_cast<uint16_t>(ds->arraySlice());
-      bd.resolved_depth_bias_scale = DepthBiasScale(ds->desc().Format);
-      if (bd.resolved_rt_width == 0) {
-        bd.resolved_rt_width = ds->desc().Width;
-        bd.resolved_rt_height = ds->desc().Height;
-      }
-    }
-
-    // ---- Populate cluster cache so the next draw in the cluster can
-    // skip the FNV+map-lookup work above. ----
-    resolve_cache.pod_ptr = bd.pod_snapshot;
-    resolve_cache.ref_gen = m_encodeSideRefsGen;
-    resolve_cache.up_vb = up_vb;
-    resolve_cache.up_ib = up_ib;
-    resolve_cache.up_ib_format = bd.override_ib_format;
-    resolve_cache.primitive_type = bd.primitive_type;
-    resolve_cache.draw_type = bd.type;
-    resolve_cache.resolved_pso = bd.resolved_pso;
-    resolve_cache.resolved_pso_task = bd.resolved_pso_task;
-    resolve_cache.resolved_dsso = bd.resolved_dsso;
-    resolve_cache.resolved_stencil_ref = bd.resolved_stencil_ref;
-    resolve_cache.resolved_slot_mask = bd.resolved_slot_mask;
-    resolve_cache.resolved_ib_fmt = bd.resolved_ib_fmt;
-    resolve_cache.resolved_raster_sample_count = bd.resolved_raster_sample_count;
-    resolve_cache.resolved_depth_bias_scale = bd.resolved_depth_bias_scale;
-    resolve_cache.resolved_ds_has_stencil = bd.resolved_ds_has_stencil;
-    resolve_cache.resolved_rt_count = bd.resolved_rt_count;
-    resolve_cache.resolved_rt_width = bd.resolved_rt_width;
-    resolve_cache.resolved_rt_height = bd.resolved_rt_height;
-    resolve_cache.resolved_ds_handle = bd.resolved_ds_handle;
-    resolve_cache.resolved_ds_view = bd.resolved_ds_view;
-    resolve_cache.resolved_ds_level = bd.resolved_ds_level;
-    resolve_cache.resolved_ds_slice = bd.resolved_ds_slice;
-    resolve_cache.resolved_viewport = bd.resolved_viewport;
-    resolve_cache.resolved_position_transformed = bd.resolved_position_transformed;
-    resolve_cache.resolved_inject_point_size = bd.resolved_inject_point_size;
-    std::memcpy(resolve_cache.ffp_texcoord_width, ffp_texcoord_width, sizeof(resolve_cache.ffp_texcoord_width));
-    resolve_cache.resolved_scissor = bd.resolved_scissor;
-    std::memcpy(resolve_cache.resolved_rt_handles, bd.resolved_rt_handles, sizeof(resolve_cache.resolved_rt_handles));
-    std::memcpy(resolve_cache.resolved_rt_view, bd.resolved_rt_view, sizeof(resolve_cache.resolved_rt_view));
-    std::memcpy(resolve_cache.resolved_rt_level, bd.resolved_rt_level, sizeof(resolve_cache.resolved_rt_level));
-    std::memcpy(resolve_cache.resolved_rt_slice, bd.resolved_rt_slice, sizeof(resolve_cache.resolved_rt_slice));
-    std::memcpy(
-        resolve_cache.resolved_frag_textures, bd.resolved_frag_textures, sizeof(resolve_cache.resolved_frag_textures)
-    );
-    std::memcpy(resolve_cache.resolved_frag_view, bd.resolved_frag_view, sizeof(resolve_cache.resolved_frag_view));
-    std::memcpy(
-        resolve_cache.resolved_frag_samplers, bd.resolved_frag_samplers, sizeof(resolve_cache.resolved_frag_samplers)
-    );
-    for (uint32_t i = 0; i < D3D_MAX_SIMULTANEOUS_RENDERTARGETS; ++i)
-      resolve_cache.resolved_rt_dxmt[i] = bd.resolved_rt_dxmt[i];
-    resolve_cache.resolved_ds_dxmt = bd.resolved_ds_dxmt;
-    for (uint32_t i = 0; i < 16; ++i)
-      resolve_cache.resolved_frag_texture_dxmt[i] = bd.resolved_frag_texture_dxmt[i];
-  } // end of !cluster_hit branch
+  } else if (!ResolveClusterState(bd, resolve_cache, refs, ffp_vs, ffp_ps, ffp_texcoord_width)) {
+    return false;
+  }
 
   // ---- Vertex texture fetch (VTF) textures + samplers ----
   // D3DVERTEXTEXTURESAMPLER0-3 live at texture slots 16..19; the VS samples
