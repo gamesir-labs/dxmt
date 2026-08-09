@@ -679,37 +679,17 @@ public:
   // replace bound streams when non-zero. MTLBuffer lifetime pinned by
   // m_constRing signal_seq + setBuffer retain; no per-draw Reference
   // needed.
-  struct BatchedDraw {
-    D3D9DrawCapture cap;
-    // Per-draw POD snapshot captured at queue time for Resolve to read
-    // frozen state without racing setters. Copy-on-write against
-    // m_encShadowDirty, per axis rather than per snapshot: draws that change
-    // nothing share the whole snapshot, and a draw that does rebuild still
-    // shares the blocks of every axis it left alone. Points into the queue's
-    // command-data ring; valid until the owning chunk retires, which outlives
-    // every Resolve read of it.
-    const dxmt::D9EncodingState *pod_snapshot = nullptr;
-    // Ref-counted state is not per-draw; the chunk walker
-    // mutates the persistent device-side D9EncodingRefs mirror
-    // (MTLD3D9Device::m_encodeSideRefs) by replaying the SetRef ops in
-    // arrival order. Resolve reads from that mirror; arrival-order on
-    // the op stream guarantees correctness without a per-draw snapshot.
-    // The 40-Com<>-slot AddRefPrivate / heap-alloc cost the COW model
-    // paid per cluster boundary is gone; wined3d CS / d3d11 EmitOP shape.
-    enum Type : uint8_t { kNonIndexed, kIndexed } type;
-    UINT vertex_or_index_count = 0;
-    UINT start_vertex_or_index = 0;
-    INT base_vertex = 0;
-    D3DPRIMITIVETYPE primitive_type = D3DPT_TRIANGLELIST;
-    // DrawPrimitiveUP / DrawIndexedPrimitiveUP transient-buffer
-    // overrides. Zero/null when the draw uses bound streams.
-    obj_handle_t override_vb_buffer = 0;
-    uint64_t override_vb_addr = 0;
-    uint32_t override_vb_length = 0;
-    uint32_t override_vb_stride = 0;
-    obj_handle_t override_ib_buffer = 0;
-    uint64_t override_ib_offset = 0;
-    D3DFORMAT override_ib_format = D3DFMT_UNKNOWN;
+  // The resolved half of a draw: everything ResolveBatchedDrawForChunk works
+  // out on the encode thread. It lives here rather than on BatchedDraw because
+  // it is consumed within the walker iteration that produces it, so ONE of
+  // these is reused for every draw in a chunk instead of ~1.3 KB being
+  // zero-filled and moved per draw on the calling thread. Every reference keeps
+  // its resolved state consumer-side for the same reason.
+  //
+  // Nothing here may be read after its own iteration. The one value that IS
+  // needed across iterations, the attachment set that decides a render-pass
+  // break, is copied into D9PassAttachments below.
+  struct D9ResolvedDraw {
     // ---- Resolved fields filled by ResolveBatchedDrawForChunk ----
     // Encode-thread work: PSO build, IA layout, view derivation,
     // sampler/DSSO cache. Caches encode-thread-only. resolved_pso_task
@@ -843,6 +823,61 @@ public:
     // wmt_*_from_d3d9 helpers in every per-draw emit pass.
     WMTViewport resolved_viewport = {};
     WMTScissorRect resolved_scissor = {};
+  };
+
+  // The attachment identity of the draw just resolved, carried to the next
+  // iteration so a render-pass break can be decided without keeping the whole
+  // resolved record alive. Copied, not referenced: the resolved record is
+  // reused and would otherwise be compared against itself.
+  struct D9PassAttachments {
+    // Field names match D9ResolvedDraw so the comparison reads the same on both
+    // sides. This must carry EVERY value the pass test compares, including the
+    // view keys: sRGB aliasing selects a different view for the same handle,
+    // level and slice, and a pass cannot span two of them.
+    obj_handle_t resolved_rt_handles[D3D_MAX_SIMULTANEOUS_RENDERTARGETS] = {};
+    obj_handle_t resolved_ds_handle = 0;
+    uint64_t resolved_rt_view[D3D_MAX_SIMULTANEOUS_RENDERTARGETS] = {};
+    uint64_t resolved_ds_view = 0;
+    uint16_t resolved_rt_level[D3D_MAX_SIMULTANEOUS_RENDERTARGETS] = {};
+    uint16_t resolved_rt_slice[D3D_MAX_SIMULTANEOUS_RENDERTARGETS] = {};
+    uint16_t resolved_ds_level = 0;
+    uint16_t resolved_ds_slice = 0;
+    uint8_t resolved_rt_count = 0;
+    bool resolved_ds_readonly = false;
+    bool valid = false;
+  };
+
+  struct BatchedDraw {
+    D3D9DrawCapture cap;
+    // Per-draw POD snapshot captured at queue time for Resolve to read
+    // frozen state without racing setters. Copy-on-write against
+    // m_encShadowDirty, per axis rather than per snapshot: draws that change
+    // nothing share the whole snapshot, and a draw that does rebuild still
+    // shares the blocks of every axis it left alone. Points into the queue's
+    // command-data ring; valid until the owning chunk retires, which outlives
+    // every Resolve read of it.
+    const dxmt::D9EncodingState *pod_snapshot = nullptr;
+    // Ref-counted state is not per-draw; the chunk walker
+    // mutates the persistent device-side D9EncodingRefs mirror
+    // (MTLD3D9Device::m_encodeSideRefs) by replaying the SetRef ops in
+    // arrival order. Resolve reads from that mirror; arrival-order on
+    // the op stream guarantees correctness without a per-draw snapshot.
+    // The 40-Com<>-slot AddRefPrivate / heap-alloc cost the COW model
+    // paid per cluster boundary is gone; wined3d CS / d3d11 EmitOP shape.
+    enum Type : uint8_t { kNonIndexed, kIndexed } type;
+    UINT vertex_or_index_count = 0;
+    UINT start_vertex_or_index = 0;
+    INT base_vertex = 0;
+    D3DPRIMITIVETYPE primitive_type = D3DPT_TRIANGLELIST;
+    // DrawPrimitiveUP / DrawIndexedPrimitiveUP transient-buffer
+    // overrides. Zero/null when the draw uses bound streams.
+    obj_handle_t override_vb_buffer = 0;
+    uint64_t override_vb_addr = 0;
+    uint32_t override_vb_length = 0;
+    uint32_t override_vb_stride = 0;
+    obj_handle_t override_ib_buffer = 0;
+    uint64_t override_ib_offset = 0;
+    D3DFORMAT override_ib_format = D3DFMT_UNKNOWN;
     // Pending-clear does not ride on the BatchedDraw; it's emitted as
     // a standalone Clear chunk by flushOpenWork's drainPendingClear and
     // folded into the first surviving Render encoder by the dxmt_context
@@ -1134,7 +1169,7 @@ private:
     uint32_t ffp_texcoord_width_key = 0;
     bool ds_bound = false;
     bool pos_transformed = false;
-    std::array<BatchedDraw::ResolvedConstUpload, 10> uploads = {};
+    std::array<D9ResolvedDraw::ResolvedConstUpload, 10> uploads = {};
   };
   // Cluster cache for the cluster-stable resolved bundle (PSO, DSSO,
   // sampler+texture views, RT/DS resolve, viewport/scissor, IA layout
@@ -1216,7 +1251,7 @@ private:
     uint64_t last_vbuf_table_offset = 0;
   };
   bool ResolveBatchedDrawForChunk(
-      BatchedDraw &bd, uint64_t chunk_seq, uint64_t chunk_coherent_id, ConstUploadCache &const_cache,
+      BatchedDraw &bd, D9ResolvedDraw &res, uint64_t chunk_seq, uint64_t chunk_coherent_id, ConstUploadCache &const_cache,
       ResolveCache &resolve_cache
   );
 
@@ -1232,7 +1267,7 @@ private:
   // cache and the constant packer key on. Returns false when the draw cannot
   // be resolved.
   bool ResolveClusterState(
-      BatchedDraw &bd, ResolveCache &resolve_cache, const D9EncodingRefs &refs, bool ffp_vs, bool ffp_ps,
+      BatchedDraw &bd, D9ResolvedDraw &res, ResolveCache &resolve_cache, const D9EncodingRefs &refs, bool ffp_vs, bool ffp_ps,
       uint32_t *ffp_texcoord_width
   );
 
@@ -1259,7 +1294,7 @@ private:
   // consumes, so it reaches the rest of the draw only through bd. Returns false
   // when the ring cannot back the block, which fails the draw.
   bool PackDrawConstants(
-      BatchedDraw &bd, ConstUploadCache &const_cache, const DrawShaderShape &shape, const uint32_t *ffp_texcoord_width,
+      BatchedDraw &bd, D9ResolvedDraw &res, ConstUploadCache &const_cache, const DrawShaderShape &shape, const uint32_t *ffp_texcoord_width,
       uint32_t ffp_texcoord_width_key, bool ds_bound, const void *vs_defs_key, const void *ps_defs_key,
       uint64_t chunk_seq, uint64_t chunk_coherent_id
   );

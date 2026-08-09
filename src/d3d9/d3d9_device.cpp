@@ -7600,7 +7600,7 @@ namespace {
 // hazard. DXVK splits the framebuffer on the same transition (it binds a
 // distinct read-only DSV per state).
 inline bool
-RtDsAttachmentsMatch(const MTLD3D9Device::BatchedDraw &a, const MTLD3D9Device::BatchedDraw &b) {
+RtDsAttachmentsMatch(const MTLD3D9Device::D9PassAttachments &a, const MTLD3D9Device::D9ResolvedDraw &b) {
   if (a.resolved_rt_count != b.resolved_rt_count)
     return false;
   if (a.resolved_ds_handle != b.resolved_ds_handle)
@@ -7633,26 +7633,29 @@ RtDsAttachmentsMatch(const MTLD3D9Device::BatchedDraw &a, const MTLD3D9Device::B
 }
 
 inline void
-StartRenderPassForBatch_d9(ArgumentEncodingContext &ctx, const MTLD3D9Device::BatchedDraw &bd) {
+StartRenderPassForBatch_d9(
+    ArgumentEncodingContext &ctx, const MTLD3D9Device::BatchedDraw &bd,
+    const MTLD3D9Device::D9ResolvedDraw &res
+) {
   uint8_t dsv_planar = 0;
-  if (bd.resolved_ds_dxmt) {
-    dsv_planar = 1 | (bd.resolved_ds_has_stencil ? 2 : 0);
+  if (res.resolved_ds_dxmt) {
+    dsv_planar = 1 | (res.resolved_ds_has_stencil ? 2 : 0);
   }
-  uint8_t dsv_readonly_flags = bd.resolved_ds_readonly ? dsv_planar : 0;
-  auto *info = ctx.startRenderPass(dsv_planar, dsv_readonly_flags, bd.resolved_rt_count, /*argbuf_size=*/0);
+  uint8_t dsv_readonly_flags = res.resolved_ds_readonly ? dsv_planar : 0;
+  auto *info = ctx.startRenderPass(dsv_planar, dsv_readonly_flags, res.resolved_rt_count, /*argbuf_size=*/0);
 
-  for (unsigned i = 0; i < bd.resolved_rt_count; ++i) {
+  for (unsigned i = 0; i < res.resolved_rt_count; ++i) {
     auto &color = info->colors[i];
     // resolved_rt_dxmt[i] is the universal predicate now; every
     // surface, including buffer-backed ones, routes through a
     // dxmt::Texture wrapper after the unified-allocation refactor.
     // ctx.access does both fence tracking and Metal handle resolution.
-    if (!bd.resolved_rt_dxmt[i])
+    if (!res.resolved_rt_dxmt[i])
       continue;
     color.attachment =
-        ctx.access<PipelineStage::Pixel>(bd.resolved_rt_dxmt[i], bd.resolved_rt_view[i], ResourceAccess::ReadWrite);
-    color.level = bd.resolved_rt_level[i];
-    color.slice = bd.resolved_rt_slice[i];
+        ctx.access<PipelineStage::Pixel>(res.resolved_rt_dxmt[i], res.resolved_rt_view[i], ResourceAccess::ReadWrite);
+    color.level = res.resolved_rt_level[i];
+    color.slice = res.resolved_rt_slice[i];
     color.depth_plane = 0;
     // loadAction=Load is the right default; any pending Clear was
     // emitted as a standalone Clear chunk by drainPendingClear, and
@@ -7663,49 +7666,50 @@ StartRenderPassForBatch_d9(ArgumentEncodingContext &ctx, const MTLD3D9Device::Ba
     color.store_action = WMTStoreActionStore;
   }
 
-  if (bd.resolved_ds_dxmt) {
+  if (res.resolved_ds_dxmt) {
     // Read-only when the DS is also sampled this draw (see the resolve): Read
     // access keeps the dependency tracker from ordering it as a write, and
     // DontCare leaves the texture genuinely unwritten so the in-pass sample is
     // hazard-free. Device memory keeps the prior depth for later passes.
-    auto ds_access = bd.resolved_ds_readonly ? ResourceAccess::Read : ResourceAccess::ReadWrite;
-    auto ds_store = bd.resolved_ds_readonly ? WMTStoreActionDontCare : WMTStoreActionStore;
+    auto ds_access = res.resolved_ds_readonly ? ResourceAccess::Read : ResourceAccess::ReadWrite;
+    auto ds_store = res.resolved_ds_readonly ? WMTStoreActionDontCare : WMTStoreActionStore;
     auto &depth = info->depth;
-    depth.attachment = ctx.access<PipelineStage::Pixel>(bd.resolved_ds_dxmt, bd.resolved_ds_view, ds_access);
-    depth.level = bd.resolved_ds_level;
-    depth.slice = bd.resolved_ds_slice;
+    depth.attachment = ctx.access<PipelineStage::Pixel>(res.resolved_ds_dxmt, res.resolved_ds_view, ds_access);
+    depth.level = res.resolved_ds_level;
+    depth.slice = res.resolved_ds_slice;
     depth.depth_plane = 0;
     // loadAction=Load; pending depth/stencil clears flow through
     // drainPendingClear's standalone Clear chunk and get folded into
     // this attachment by the coalescer (dxmt_context.cpp).
     depth.load_action = WMTLoadActionLoad;
     depth.store_action = ds_store;
-    if (bd.resolved_ds_has_stencil) {
+    if (res.resolved_ds_has_stencil) {
       auto &stencil = info->stencil;
-      stencil.attachment = ctx.access<PipelineStage::Pixel>(bd.resolved_ds_dxmt, bd.resolved_ds_view, ds_access);
-      stencil.level = bd.resolved_ds_level;
-      stencil.slice = bd.resolved_ds_slice;
+      stencil.attachment = ctx.access<PipelineStage::Pixel>(res.resolved_ds_dxmt, res.resolved_ds_view, ds_access);
+      stencil.level = res.resolved_ds_level;
+      stencil.slice = res.resolved_ds_slice;
       stencil.depth_plane = 0;
       stencil.load_action = WMTLoadActionLoad;
       stencil.store_action = ds_store;
     }
   }
 
-  info->render_target_width = bd.resolved_rt_width;
-  info->render_target_height = bd.resolved_rt_height;
+  info->render_target_width = res.resolved_rt_width;
+  info->render_target_height = res.resolved_rt_height;
   info->render_target_array_length = 1;
   // Match the PSO's raster_sample_count resolved in ResolveBatchedDrawForChunk.
   // Metal validates equality at setRenderPipelineState; a mismatch
   // hard-errors under MTL_DEBUG_LAYER.
-  info->default_raster_sample_count = bd.resolved_raster_sample_count;
+  info->default_raster_sample_count = res.resolved_raster_sample_count;
 }
 
 inline void
 EmitCommonRenderSetup_d9(
-    ArgumentEncodingContext &ctx, const MTLD3D9Device::BatchedDraw &bd, MTLD3D9Device::ChunkEmitState &s
+    ArgumentEncodingContext &ctx, const MTLD3D9Device::BatchedDraw &bd,
+    const MTLD3D9Device::D9ResolvedDraw &res, MTLD3D9Device::ChunkEmitState &s
 ) {
   // Per-draw POD state lives on bd.pod_snapshot now; Resolve already read the
-  // same frozen snapshot pointer above to populate bd.resolved_*, so reading
+  // same frozen snapshot pointer above to populate res.resolved_*, so reading
   // rs here observes the same snapshot.
   const DWORD *rs = bd.pod_snapshot->render_states->v;
 
@@ -7744,7 +7748,7 @@ EmitCommonRenderSetup_d9(
   // useResource hints for each active VS stream (manual-fetch from the
   // vbuf-table reads through these by GPU address).
   for (uint32_t slot = 0; slot < D3D9_MAX_VERTEX_STREAMS; ++slot) {
-    obj_handle_t h = bd.resolved_vs_resident_handles[slot];
+    obj_handle_t h = res.resolved_vs_resident_handles[slot];
     if (!h)
       continue;
     // Register a Vertex-stage read on the stream's tracked allocation and
@@ -7757,9 +7761,9 @@ EmitCommonRenderSetup_d9(
     // collapses repeats within an encoder and retainAllocation dedups within
     // the chunk. Runs before the resident dedup so a new encoder after a copy
     // re-establishes the dependency.
-    if (auto *vb_alloc = bd.resolved_vb_dxmt[slot].ptr())
+    if (auto *vb_alloc = res.resolved_vb_dxmt[slot].ptr())
       ctx.access<PipelineStage::Vertex>(
-          bd.resolved_vb_dxmt[slot], 0, static_cast<unsigned>(vb_alloc->length()), ResourceAccess::Read
+          res.resolved_vb_dxmt[slot], 0, static_cast<unsigned>(vb_alloc->length()), ResourceAccess::Read
       );
     if (s.vs_resident[slot] == h)
       continue;
@@ -7771,22 +7775,22 @@ EmitCommonRenderSetup_d9(
     s.vs_resident[slot] = h;
   }
   // Same Vertex-stage read dependency for the index buffer (either map mode).
-  if (auto *ib_alloc = bd.resolved_ib_dxmt.ptr())
+  if (auto *ib_alloc = res.resolved_ib_dxmt.ptr())
     ctx.access<PipelineStage::Vertex>(
-        bd.resolved_ib_dxmt, 0, static_cast<unsigned>(ib_alloc->length()), ResourceAccess::Read
+        res.resolved_ib_dxmt, 0, static_cast<unsigned>(ib_alloc->length()), ResourceAccess::Read
     );
 
   // PSO bind.
-  if (s.pso != bd.resolved_pso) {
+  if (s.pso != res.resolved_pso) {
     auto &cmd = ctx.encodeRenderCommand<wmtcmd_render_setpso>();
     cmd.type = WMTRenderCommandSetPSO;
-    cmd.pso = bd.resolved_pso;
-    s.pso = bd.resolved_pso;
+    cmd.pso = res.resolved_pso;
+    s.pso = res.resolved_pso;
   }
 
   // VS/PS constant buffers + vbuf table. A const-cache hit reuses the previous
   // draw's spans verbatim, which is what lets the shadow above skip the rebind.
-  const auto &cu = bd.resolved_const_uploads;
+  const auto &cu = res.resolved_const_uploads;
   enc_setbuffer(WMTRenderCommandSetVertexBuffer, cu[0].buffer, cu[0].offset, 0);
   enc_setbuffer(WMTRenderCommandSetVertexBuffer, cu[1].buffer, cu[1].offset, 1);
   enc_setbuffer(WMTRenderCommandSetVertexBuffer, cu[2].buffer, cu[2].offset, 2);
@@ -7794,13 +7798,13 @@ EmitCommonRenderSetup_d9(
   enc_setbuffer(WMTRenderCommandSetVertexBuffer, cu[7].buffer, cu[7].offset, 4);
   // Pre-transform viewport remap at VS buffer 5: only the POSITIONT VS variant
   // declares this binding, so only bind it for those draws.
-  if (bd.resolved_position_transformed)
+  if (res.resolved_position_transformed)
     enc_setbuffer(WMTRenderCommandSetVertexBuffer, cu[8].buffer, cu[8].offset, 5);
   // Point-size uniform at VS buffer 6: only the injecting point-size VS
   // variant declares this binding, so only bind it for those draws.
-  if (bd.resolved_inject_point_size)
+  if (res.resolved_inject_point_size)
     enc_setbuffer(WMTRenderCommandSetVertexBuffer, cu[9].buffer, cu[9].offset, 6);
-  enc_setbuffer(WMTRenderCommandSetVertexBuffer, bd.resolved_vbuf_table_buffer, bd.resolved_vbuf_table_offset, 16);
+  enc_setbuffer(WMTRenderCommandSetVertexBuffer, res.resolved_vbuf_table_buffer, res.resolved_vbuf_table_offset, 16);
   enc_setbuffer(WMTRenderCommandSetFragmentBuffer, cu[3].buffer, cu[3].offset, 0);
   enc_setbuffer(WMTRenderCommandSetFragmentBuffer, cu[4].buffer, cu[4].offset, 1);
   enc_setbuffer(WMTRenderCommandSetFragmentBuffer, cu[5].buffer, cu[5].offset, 2);
@@ -7813,18 +7817,18 @@ EmitCommonRenderSetup_d9(
   // can carry different viewports/scissors, and re-setting an
   // unchanged one is flagged redundant by the Metal debug layer.
   // Matches the rasterizer / DSSO / blend skips below.
-  if (!s.viewport_set || std::memcmp(&s.viewport, &bd.resolved_viewport, sizeof(WMTViewport)) != 0) {
+  if (!s.viewport_set || std::memcmp(&s.viewport, &res.resolved_viewport, sizeof(WMTViewport)) != 0) {
     auto &cmd = ctx.encodeRenderCommand<wmtcmd_render_setviewport>();
     cmd.type = WMTRenderCommandSetViewport;
-    cmd.viewport = bd.resolved_viewport;
-    s.viewport = bd.resolved_viewport;
+    cmd.viewport = res.resolved_viewport;
+    s.viewport = res.resolved_viewport;
     s.viewport_set = true;
   }
-  if (!s.scissor_set || std::memcmp(&s.scissor, &bd.resolved_scissor, sizeof(WMTScissorRect)) != 0) {
+  if (!s.scissor_set || std::memcmp(&s.scissor, &res.resolved_scissor, sizeof(WMTScissorRect)) != 0) {
     auto &cmd = ctx.encodeRenderCommand<wmtcmd_render_setscissorrect>();
     cmd.type = WMTRenderCommandSetScissorRect;
-    cmd.scissor_rect = bd.resolved_scissor;
-    s.scissor = bd.resolved_scissor;
+    cmd.scissor_rect = res.resolved_scissor;
+    s.scissor = res.resolved_scissor;
     s.scissor_set = true;
   }
 
@@ -7848,9 +7852,9 @@ EmitCommonRenderSetup_d9(
     // (ZENABLE on) clips RHW z=5/10. Metal has one clip/clamp knob, so this is
     // per-draw encoder state shadowed like fill/cull: a clipping draw after a
     // clamped RHW draw must re-emit Clip, or it would inherit Clamp.
-    const bool z_test_live = bd.resolved_ds_handle != 0 && rs[D3DRS_ZENABLE] != D3DZB_FALSE;
+    const bool z_test_live = res.resolved_ds_handle != 0 && rs[D3DRS_ZENABLE] != D3DZB_FALSE;
     WMTDepthClipMode dcm =
-        (bd.resolved_position_transformed && !z_test_live) ? WMTDepthClipModeClamp : WMTDepthClipModeClip;
+        (res.resolved_position_transformed && !z_test_live) ? WMTDepthClipModeClamp : WMTDepthClipModeClip;
     if (s.fill_mode != static_cast<int>(fm) || s.cull_mode != static_cast<int>(cm) ||
         s.depth_clip_mode != static_cast<int>(dcm) || s.depth_bias_bits != db_bits || s.slope_scale_bits != ss_bits) {
       float depth_bias;
@@ -7862,7 +7866,7 @@ EmitCommonRenderSetup_d9(
       // difference. Multiply by 1/r baked into resolved_depth_bias_scale
       // to restore D3D9 semantics. Slope-scale needs no scaling; both
       // APIs define it as a multiplier of dz/dx.
-      depth_bias *= bd.resolved_depth_bias_scale;
+      depth_bias *= res.resolved_depth_bias_scale;
       auto &cmd = ctx.encodeRenderCommand<wmtcmd_render_setrasterizerstate>();
       cmd.type = WMTRenderCommandSetRasterizerState;
       cmd.fill_mode = fm;
@@ -7896,13 +7900,13 @@ EmitCommonRenderSetup_d9(
   }
 
   // DSSO + stencil ref.
-  if (bd.resolved_dsso && (s.dsso != bd.resolved_dsso || s.stencil_ref != static_cast<int>(bd.resolved_stencil_ref))) {
+  if (res.resolved_dsso && (s.dsso != res.resolved_dsso || s.stencil_ref != static_cast<int>(res.resolved_stencil_ref))) {
     auto &cmd = ctx.encodeRenderCommand<wmtcmd_render_setdsso>();
     cmd.type = WMTRenderCommandSetDSSO;
-    cmd.dsso = bd.resolved_dsso;
-    cmd.stencil_ref = bd.resolved_stencil_ref;
-    s.dsso = bd.resolved_dsso;
-    s.stencil_ref = static_cast<int>(bd.resolved_stencil_ref);
+    cmd.dsso = res.resolved_dsso;
+    cmd.stencil_ref = res.resolved_stencil_ref;
+    s.dsso = res.resolved_dsso;
+    s.stencil_ref = static_cast<int>(res.resolved_stencil_ref);
   }
 
   // Blend color from D3DRS_BLENDFACTOR.
@@ -7932,13 +7936,13 @@ EmitCommonRenderSetup_d9(
   // PSO actually samples that stage then reads stale data. Track the
   // bound handle including the null state to catch the unbind transition.
   for (uint32_t stage = 0; stage < 16; ++stage) {
-    const auto &rc = bd.resolved_frag_texture_dxmt[stage];
+    const auto &rc = res.resolved_frag_texture_dxmt[stage];
     dxmt::Texture *rc_ptr = rc.ptr();
     obj_handle_t mt;
     if (rc_ptr) {
       // Access retains allocation owning view (survives wrapper Reset via ownership).
       // Re-access on SetLOD / sRGB-toggle / swizzle change.
-      uint64_t vkey = bd.resolved_frag_view[stage];
+      uint64_t vkey = res.resolved_frag_view[stage];
       if (rc_ptr != s.frag_tex_access[stage] || vkey != s.frag_view[stage]) {
         auto &view = ctx.access<PipelineStage::Pixel>(rc, vkey, ResourceAccess::Read);
         s.frag_tex_access[stage] = rc_ptr;
@@ -7952,7 +7956,7 @@ EmitCommonRenderSetup_d9(
       // by raw handle (no fence tracking). Clear the access shadow so a
       // later app-texture rebind at this stage re-accesses; the dummy
       // bind in between moved s.frag_tex off the app handle.
-      mt = bd.resolved_frag_textures[stage];
+      mt = res.resolved_frag_textures[stage];
       s.frag_tex_access[stage] = nullptr;
       s.frag_view[stage] = 0;
     }
@@ -7970,7 +7974,7 @@ EmitCommonRenderSetup_d9(
       cmd.index = static_cast<uint8_t>(stage);
       s.frag_tex[stage] = mt;
     }
-    obj_handle_t smp = bd.resolved_frag_samplers[stage];
+    obj_handle_t smp = res.resolved_frag_samplers[stage];
     if (s.frag_smp[stage] != smp) {
       auto &cmd = ctx.encodeRenderCommand<wmtcmd_render_setsamplerstate>();
       cmd.type = WMTRenderCommandSetFragmentSamplerState;
@@ -7988,15 +7992,15 @@ EmitCommonRenderSetup_d9(
   // slot the VS does not declare stays 0 and is left untouched (never sampled).
   // VTF draws are rare, so bind directly each draw (no per-slot shadow).
   for (uint32_t vslot = 0; vslot < 4; ++vslot) {
-    const auto &rc = bd.resolved_vert_texture_dxmt[vslot];
+    const auto &rc = res.resolved_vert_texture_dxmt[vslot];
     obj_handle_t mt;
     if (rc.ptr()) {
-      auto &view = ctx.access<PipelineStage::Vertex>(rc, bd.resolved_vert_view[vslot], ResourceAccess::Read);
+      auto &view = ctx.access<PipelineStage::Vertex>(rc, res.resolved_vert_view[vslot], ResourceAccess::Read);
       mt = view.texture.handle;
     } else {
       // Device-owned dummy for a declared-but-unbound slot, or 0 when the VS
       // does not declare this slot.
-      mt = bd.resolved_vert_textures[vslot];
+      mt = res.resolved_vert_textures[vslot];
     }
     if (!mt)
       continue;
@@ -8011,13 +8015,16 @@ EmitCommonRenderSetup_d9(
     cmd.index = static_cast<uint8_t>(vslot);
     auto &scmd = ctx.encodeRenderCommand<wmtcmd_render_setsamplerstate>();
     scmd.type = WMTRenderCommandSetVertexSamplerState;
-    scmd.sampler = bd.resolved_vert_samplers[vslot];
+    scmd.sampler = res.resolved_vert_samplers[vslot];
     scmd.index = static_cast<uint8_t>(vslot);
   }
 }
 
 inline void
-EmitDrawCommand_d9(ArgumentEncodingContext &ctx, const MTLD3D9Device::BatchedDraw &bd) {
+EmitDrawCommand_d9(
+    ArgumentEncodingContext &ctx, const MTLD3D9Device::BatchedDraw &bd,
+    const MTLD3D9Device::D9ResolvedDraw &res
+) {
   // "Instancing is ignored for non-indexed draws" is native (MSDN, wined3d
   // device.c and DXVK d3d9_device.cpp all yield instance_count = 1 for
   // non-indexed). Gating on the D3DSTREAMSOURCE_INDEXEDDATA flag below is dxmt's
@@ -8033,12 +8040,12 @@ EmitDrawCommand_d9(ArgumentEncodingContext &ctx, const MTLD3D9Device::BatchedDra
   }
 
   if (bd.type == MTLD3D9Device::BatchedDraw::kIndexed) {
-    uint32_t index_size = (bd.resolved_ib_fmt == static_cast<uint32_t>(DXSO_INDEX_BUFFER_FORMAT_UINT32)) ? 4u : 2u;
-    WMTIndexType index_type = (bd.resolved_ib_fmt == static_cast<uint32_t>(DXSO_INDEX_BUFFER_FORMAT_UINT32))
+    uint32_t index_size = (res.resolved_ib_fmt == static_cast<uint32_t>(DXSO_INDEX_BUFFER_FORMAT_UINT32)) ? 4u : 2u;
+    WMTIndexType index_type = (res.resolved_ib_fmt == static_cast<uint32_t>(DXSO_INDEX_BUFFER_FORMAT_UINT32))
                                   ? WMTIndexTypeUInt32
                                   : WMTIndexTypeUInt16;
-    obj_handle_t ib_handle = bd.resolved_ib_handle;
-    uint64_t ib_base = bd.resolved_ib_base_offset;
+    obj_handle_t ib_handle = res.resolved_ib_handle;
+    uint64_t ib_base = res.resolved_ib_base_offset;
     uint64_t index_offset = ib_base + static_cast<uint64_t>(bd.start_vertex_or_index) * index_size;
     auto &cmd = ctx.encodeRenderCommand<wmtcmd_render_draw_indexed>();
     cmd.type = WMTRenderCommandDrawIndexed;
@@ -8278,7 +8285,7 @@ private:
 
 bool
 MTLD3D9Device::PackDrawConstants(
-    BatchedDraw &bd, ConstUploadCache &const_cache, const DrawShaderShape &shape, const uint32_t *ffp_texcoord_width,
+    BatchedDraw &bd, D9ResolvedDraw &res, ConstUploadCache &const_cache, const DrawShaderShape &shape, const uint32_t *ffp_texcoord_width,
     uint32_t ffp_tcw_key, bool ds_bound, const void *vs_defs_key, const void *ps_defs_key, uint64_t chunk_seq,
     uint64_t chunk_coherent_id
 ) {
@@ -8322,7 +8329,7 @@ MTLD3D9Device::PackDrawConstants(
   // an already-projected position through a window->clip remap, not world*VP,
   // so the transform does not apply there: pack the raw plane. pos_transformed
   // is keyed into the const cache above so the two never share a packing.
-  const bool ffp_world_clip = ffp_vs && !bd.resolved_position_transformed;
+  const bool ffp_world_clip = ffp_vs && !res.resolved_position_transformed;
   D3DMATRIX ffp_vp_inv;
   if (ffp_world_clip)
     std::memcpy(&ffp_vp_inv, pod.ffp->vp_inv, sizeof(ffp_vp_inv));
@@ -8508,7 +8515,7 @@ MTLD3D9Device::PackDrawConstants(
     // The same predicate the fog-mode resolve above uses to select table fog.
     const bool table_fog =
         rs[D3DRS_FOGENABLE] != FALSE && (ffp_ps || ps->metadata().major < 3) && rs[D3DRS_FOGTABLEMODE] != D3DFOG_NONE;
-    const float zt = ((bd.resolved_ds_handle != 0 && rs[D3DRS_ZENABLE] != D3DZB_FALSE) || table_fog) ? 1.0f : 0.0f;
+    const float zt = ((res.resolved_ds_handle != 0 && rs[D3DRS_ZENABLE] != D3DZB_FALSE) || table_fog) ? 1.0f : 0.0f;
     vp_remap[0] = 2.0f / vpW; // invExtent
     vp_remap[1] = -2.0f / vpH;
     vp_remap[2] = zt;
@@ -8753,22 +8760,22 @@ MTLD3D9Device::PackDrawConstants(
     apply_defs(base + sub_off[3], ps->metadata(), ps_f_regs);
   const obj_handle_t buf = span.handle;
   for (uint32_t i = 0; i < 10; ++i) {
-    bd.resolved_const_uploads[i].buffer = buf;
-    bd.resolved_const_uploads[i].offset = base_off + sub_off[i];
+    res.resolved_const_uploads[i].buffer = buf;
+    res.resolved_const_uploads[i].offset = base_off + sub_off[i];
   }
   const_cache.pod_ptr = bd.pod_snapshot;
   const_cache.vs_defs_key = vs_defs_key;
   const_cache.ps_defs_key = ps_defs_key;
   const_cache.ffp_texcoord_width_key = ffp_tcw_key;
   const_cache.ds_bound = ds_bound;
-  const_cache.pos_transformed = bd.resolved_position_transformed;
-  const_cache.uploads = bd.resolved_const_uploads;
+  const_cache.pos_transformed = res.resolved_position_transformed;
+  const_cache.uploads = res.resolved_const_uploads;
   return true;
 }
 
 bool
 MTLD3D9Device::ResolveClusterState(
-    BatchedDraw &bd, ResolveCache &resolve_cache, const D9EncodingRefs &refs, bool ffp_vs, bool ffp_ps,
+    BatchedDraw &bd, D9ResolvedDraw &res, ResolveCache &resolve_cache, const D9EncodingRefs &refs, bool ffp_vs, bool ffp_ps,
     uint32_t *ffp_texcoord_width
 ) {
   auto &cap = bd.cap;
@@ -8785,8 +8792,8 @@ MTLD3D9Device::ResolveClusterState(
   const bool indexed = (bd.type == BatchedDraw::kIndexed);
   // Pre-convert viewport / scissor to Metal shape so per-draw emit does not
   // re-run the helpers.
-  bd.resolved_viewport = wmt_viewport_from_d3d9(pod.viewport);
-  bd.resolved_scissor = wmt_scissor_from_d3d9(pod.scissor_rect, pod.viewport, rs[D3DRS_SCISSORTESTENABLE] != 0);
+  res.resolved_viewport = wmt_viewport_from_d3d9(pod.viewport);
+  res.resolved_scissor = wmt_scissor_from_d3d9(pod.scissor_rect, pod.viewport, rs[D3DRS_SCISSORTESTENABLE] != 0);
 
   // ---- IA layout ----
   // D3D9 caps vertex declarations at MAX_FVF_DECL_SIZE = 64 elements
@@ -8930,7 +8937,7 @@ MTLD3D9Device::ResolveClusterState(
   // element_count of zero is a legal draw: a constant-output VS with a
   // declaration whose only elements sit on unbound streams (filtered
   // above) fetches nothing and every dcl'd input zero-fills.
-  bd.resolved_slot_mask = slot_mask;
+  res.resolved_slot_mask = slot_mask;
 
   DXSO_INDEX_BUFFER_FORMAT ib_fmt = DXSO_INDEX_BUFFER_FORMAT_NONE;
   if (indexed) {
@@ -8947,7 +8954,7 @@ MTLD3D9Device::ResolveClusterState(
     }
     ib_fmt = (d3d_ib_format == D3DFMT_INDEX32) ? DXSO_INDEX_BUFFER_FORMAT_UINT32 : DXSO_INDEX_BUFFER_FORMAT_UINT16;
   }
-  bd.resolved_ib_fmt = static_cast<uint32_t>(ib_fmt);
+  res.resolved_ib_fmt = static_cast<uint32_t>(ib_fmt);
 
   DXSO_SHADER_IA_INPUT_LAYOUT_DATA layout{};
   layout.slot_mask = slot_mask;
@@ -8955,7 +8962,7 @@ MTLD3D9Device::ResolveClusterState(
   layout.elements = elements;
   layout.index_buffer_format = ib_fmt;
   layout.position_transformed = decl_position_transformed ? 1u : 0u;
-  bd.resolved_position_transformed = decl_position_transformed;
+  res.resolved_position_transformed = decl_position_transformed;
 
   // D3DRS_POINTSIZE auto-injection: the injecting VS variant emits
   // [[point_size]] for a point-list draw and reads the size + clamp
@@ -8972,7 +8979,7 @@ MTLD3D9Device::ResolveClusterState(
       bd.primitive_type == D3DPT_POINTLIST, !ffp_vs && vs->metadata().writes_point_size, rs[D3DRS_POINTSIZE],
       rs[D3DRS_POINTSIZE_MIN], rs[D3DRS_POINTSIZE_MAX]
   );
-  bd.resolved_inject_point_size = vs_inject_point_size;
+  res.resolved_inject_point_size = vs_inject_point_size;
   // Fixed-function vertex fog: active when fog is enabled and table
   // fog is off (table fog computes per fragment and takes priority).
   // The D3DFOG_* value keys the generated VS directly.
@@ -8986,7 +8993,7 @@ MTLD3D9Device::ResolveClusterState(
     // than let the pixel stage sample the flat COLOR1 alpha. DXVK emits
     // specular.w to oFog the same way (DoFixedFunctionFog, D3DFOG_NONE).
     // Pretransformed draws keep the pixel-stage specular-alpha path.
-    if (ffp_vs_fog_mode == 0 && ffp_has_specular && !bd.resolved_position_transformed)
+    if (ffp_vs_fog_mode == 0 && ffp_has_specular && !res.resolved_position_transformed)
       ffp_vs_fog_mode = 4;
   }
   // D3DRS_RANGEFOGENABLE switches vertex fog from planar (view-space z) to
@@ -9012,7 +9019,7 @@ MTLD3D9Device::ResolveClusterState(
   // !VertexHasPositionT); without this an XYZRHW draw left at the default
   // LIGHTING=TRUE replaces its vertex color with a zero light accumulation
   // and renders black. Same carve-out the table-fog selection already makes.
-  if (ffp_vs && rs[D3DRS_LIGHTING] != FALSE && !bd.resolved_position_transformed) {
+  if (ffp_vs && rs[D3DRS_LIGHTING] != FALSE && !res.resolved_position_transformed) {
     auto src_sel = [&](DWORD v) -> uint32_t { return v <= 2 ? v : 0; };
     ffp_lighting_key = 1u | (rs[D3DRS_SPECULARENABLE] != FALSE ? 4u : 0u) |
                        (rs[D3DRS_NORMALIZENORMALS] != FALSE ? 8u : 0u) | (rs[D3DRS_LOCALVIEWER] != FALSE ? 16u : 0u) |
@@ -9064,7 +9071,7 @@ MTLD3D9Device::ResolveClusterState(
       // wined3d gates the shader multiply on !transformed (glsl_shader.c)
       // and DXVK on !VertexHasPositionT, so those texcoords reach the
       // sampler raw. Leave the enable bit clear rather than warp them.
-      if (ttf != D3DTTFF_DISABLE && !bd.resolved_position_transformed)
+      if (ttf != D3DTTFF_DISABLE && !res.resolved_position_transformed)
         ffp_tt_key |= 1u << (s * 4);
       // D3DTSS_TCI_* texture generation, keyed by stage: wined3d
       // utils.c copies the raw TEXCOORDINDEX per stage and a
@@ -9097,7 +9104,7 @@ MTLD3D9Device::ResolveClusterState(
   // matrix 0 only), the same 1..3 support the wined3d vertex pipe
   // implements; a pre-transformed position never blends.
   uint32_t ffp_vertex_blend = 0;
-  if (ffp_vs && !bd.resolved_position_transformed) {
+  if (ffp_vs && !res.resolved_position_transformed) {
     DWORD vb = rs[D3DRS_VERTEXBLEND];
     if (vb >= D3DVBF_1WEIGHTS && vb <= D3DVBF_3WEIGHTS)
       ffp_vertex_blend = vb;
@@ -9285,7 +9292,7 @@ MTLD3D9Device::ResolveClusterState(
       default:
         break;
       }
-    } else if (bd.resolved_position_transformed) {
+    } else if (res.resolved_position_transformed) {
       // A pre-transformed draw never takes the vertex-fog formula,
       // whatever FOGVERTEXMODE says: the factor is always the
       // specular alpha (test_fog's RHW rows pin it for every mode).
@@ -9478,7 +9485,7 @@ MTLD3D9Device::ResolveClusterState(
       );
     }
     ds = nullptr;
-    bd.resolved_ds_dxmt = nullptr;
+    res.resolved_ds_dxmt = nullptr;
   }
   // A depth-stencil smaller than the colour target cannot cover it: wined3d
   // detaches it and keeps drawing (context_gl.c find_fbo_entry), surfacing
@@ -9500,7 +9507,7 @@ MTLD3D9Device::ResolveClusterState(
       );
     }
     ds = nullptr;
-    bd.resolved_ds_dxmt = nullptr;
+    res.resolved_ds_dxmt = nullptr;
   }
   WMTPixelFormat ds_pixel_format = WMTPixelFormatInvalid;
   bool ds_has_stencil = false;
@@ -9513,7 +9520,7 @@ MTLD3D9Device::ResolveClusterState(
   // raster_sample_count=N. Metal validates this equality at
   // setRenderPipelineState time; a mismatch hard-errors under
   // MTL_DEBUG_LAYER.
-  bd.resolved_raster_sample_count = raster_sample_count;
+  res.resolved_raster_sample_count = raster_sample_count;
 
   WMTPrimitiveTopologyClass topology_class = WMTPrimitiveTopologyClassTriangle;
   switch (bd.primitive_type) {
@@ -9635,10 +9642,10 @@ MTLD3D9Device::ResolveClusterState(
     WMT::RenderPipelineState pso = task->state();
     if (pso.handle == 0)
       return false;
-    bd.resolved_pso = pso.handle;
+    res.resolved_pso = pso.handle;
   } else {
-    bd.resolved_pso_task = task;
-    bd.resolved_pso_first_use = first_time;
+    res.resolved_pso_task = task;
+    res.resolved_pso_first_use = first_time;
   }
 
   // ---- Per-stage textures + samplers ----
@@ -9655,7 +9662,7 @@ MTLD3D9Device::ResolveClusterState(
       // Bind 1x1 placeholder + sampler to complete encoder.
       WMTSamplerInfo sinfo = sampler_info_from_d3d9_state(samp_row);
       if (auto sampler = getOrCreateSampler(sinfo))
-        bd.resolved_frag_samplers[stage] = sampler->sampler_state.handle;
+        res.resolved_frag_samplers[stage] = sampler->sampler_state.handle;
       // The dummy's type must match the kind the PS variant was compiled
       // with for this slot (set above from the bound texture, or the dcl
       // for an unbound-but-declared slot), or Metal flags a 2D-vs-3D/cube
@@ -9665,7 +9672,7 @@ MTLD3D9Device::ResolveClusterState(
         dummy_type = WMTTextureType3D;
       else if (ps_samp_kinds[stage] == DXSO_PS_SAMPLER_KIND_TEXTURE_CUBE)
         dummy_type = WMTTextureTypeCube;
-      bd.resolved_frag_textures[stage] = dummyFragmentTexture(dummy_type);
+      res.resolved_frag_textures[stage] = dummyFragmentTexture(dummy_type);
       continue;
     }
     // View lives on TextureAllocation (survives wrapper Reset via
@@ -9686,9 +9693,9 @@ MTLD3D9Device::ResolveClusterState(
       view = rc->fullView;
       vh = rc->view(view).texture.handle;
     }
-    bd.resolved_frag_view[stage] = view;
-    bd.resolved_frag_textures[stage] = vh;
-    bd.resolved_frag_texture_dxmt[stage] = rc;
+    res.resolved_frag_view[stage] = view;
+    res.resolved_frag_textures[stage] = vh;
+    res.resolved_frag_texture_dxmt[stage] = rc;
     // Hardware-PCF depth textures need a LessEqual compare sampler so
     // sample_compare (emitted by the _DEPTH_COMPARE PS variant for this
     // stage) returns the filtered shadow result. Must match the kind
@@ -9698,15 +9705,15 @@ MTLD3D9Device::ResolveClusterState(
     );
     auto sampler = getOrCreateSampler(sinfo);
     if (sampler)
-      bd.resolved_frag_samplers[stage] = sampler->sampler_state.handle;
+      res.resolved_frag_samplers[stage] = sampler->sampler_state.handle;
   }
 
   // ---- DSSO + stencil ref ----
   if (ds) {
     WMTDepthStencilInfo ds_info = depth_stencil_info_from_d3d9_state(rs, /*dsAttached=*/true, ds_has_stencil);
     auto dsso = getOrCreateDSSO(ds_info);
-    bd.resolved_dsso = dsso.handle;
-    bd.resolved_stencil_ref = static_cast<uint8_t>(rs[D3DRS_STENCILREF] & 0xFF);
+    res.resolved_dsso = dsso.handle;
+    res.resolved_stencil_ref = static_cast<uint8_t>(rs[D3DRS_STENCILREF] & 0xFF);
   }
 
   // ---- RT / DS Rc<dxmt::Texture> + TextureViewKey + Metal handles + dims ----
@@ -9715,29 +9722,29 @@ MTLD3D9Device::ResolveClusterState(
     auto *rt = refs.render_targets[i].ptr();
     if (!rt || IsNullFormat(rt->desc().Format))
       continue;
-    bd.resolved_rt_dxmt[i] = rt->dxmtTexture();
-    if (bd.resolved_rt_dxmt[i]) {
-      TextureViewKey view = bd.resolved_rt_dxmt[i]->fullView;
+    res.resolved_rt_dxmt[i] = rt->dxmtTexture();
+    if (res.resolved_rt_dxmt[i]) {
+      TextureViewKey view = res.resolved_rt_dxmt[i]->fullView;
       if (srgb_write) {
         // D3DRS_SRGBWRITEENABLE renders through the sRGB-format view; the
         // attachment encodes the fragment output on store.
-        WMTPixelFormat base = bd.resolved_rt_dxmt[i]->pixelFormat();
+        WMTPixelFormat base = res.resolved_rt_dxmt[i]->pixelFormat();
         WMTPixelFormat srgb = Recall_sRGB_ForRenderTarget(base);
         if (srgb != base)
-          view = bd.resolved_rt_dxmt[i]->checkViewUseFormat(view, srgb);
+          view = res.resolved_rt_dxmt[i]->checkViewUseFormat(view, srgb);
       }
-      bd.resolved_rt_view[i] = static_cast<uint64_t>(view);
+      res.resolved_rt_view[i] = static_cast<uint64_t>(view);
     }
-    bd.resolved_rt_handles[i] = rt->metalTexture().handle;
-    bd.resolved_rt_level[i] = static_cast<uint16_t>(rt->mipLevel());
-    bd.resolved_rt_slice[i] = static_cast<uint16_t>(rt->arraySlice());
+    res.resolved_rt_handles[i] = rt->metalTexture().handle;
+    res.resolved_rt_level[i] = static_cast<uint16_t>(rt->mipLevel());
+    res.resolved_rt_slice[i] = static_cast<uint16_t>(rt->arraySlice());
     rt_count = i + 1;
     if (i == 0) {
-      bd.resolved_rt_width = rt->desc().Width;
-      bd.resolved_rt_height = rt->desc().Height;
+      res.resolved_rt_width = rt->desc().Width;
+      res.resolved_rt_height = rt->desc().Height;
     }
   }
-  bd.resolved_rt_count = static_cast<uint8_t>(rt_count);
+  res.resolved_rt_count = static_cast<uint8_t>(rt_count);
 
   // Self-downsample: a draw renders into mip N while sampling a lower
   // mip of the same texture (e.g. an HDR luminance pyramid). Legal in
@@ -9749,40 +9756,40 @@ MTLD3D9Device::ResolveClusterState(
   // that the tonemap turns black. Bind the sampler to [0,N) and the
   // attachment to a single mip [N,1). A mip-0 RT sampled at 0 is a real
   // feedback loop and is left alone.
-  for (unsigned i = 0; i < bd.resolved_rt_count; ++i) {
-    auto *rt_tex = bd.resolved_rt_dxmt[i].ptr();
-    uint32_t rt_level = bd.resolved_rt_level[i];
+  for (unsigned i = 0; i < res.resolved_rt_count; ++i) {
+    auto *rt_tex = res.resolved_rt_dxmt[i].ptr();
+    uint32_t rt_level = res.resolved_rt_level[i];
     if (!rt_tex || rt_level == 0)
       continue;
     bool self_sampled = false;
     for (uint32_t stage = 0; stage < 16; ++stage) {
-      if (bd.resolved_frag_texture_dxmt[stage].ptr() != rt_tex)
+      if (res.resolved_frag_texture_dxmt[stage].ptr() != rt_tex)
         continue;
       self_sampled = true;
-      TextureViewKey src_view = rt_tex->checkViewUseMipRange(TextureViewKey(bd.resolved_frag_view[stage]), 0, rt_level);
+      TextureViewKey src_view = rt_tex->checkViewUseMipRange(TextureViewKey(res.resolved_frag_view[stage]), 0, rt_level);
       if (obj_handle_t vh = rt_tex->view(src_view).texture.handle) {
-        bd.resolved_frag_view[stage] = static_cast<uint64_t>(src_view);
-        bd.resolved_frag_textures[stage] = vh;
+        res.resolved_frag_view[stage] = static_cast<uint64_t>(src_view);
+        res.resolved_frag_textures[stage] = vh;
       }
     }
     if (self_sampled) {
-      TextureViewKey rt_view = rt_tex->checkViewUseMipRange(TextureViewKey(bd.resolved_rt_view[i]), rt_level, 1);
-      bd.resolved_rt_view[i] = static_cast<uint64_t>(rt_view);
-      bd.resolved_rt_level[i] = 0;
+      TextureViewKey rt_view = rt_tex->checkViewUseMipRange(TextureViewKey(res.resolved_rt_view[i]), rt_level, 1);
+      res.resolved_rt_view[i] = static_cast<uint64_t>(rt_view);
+      res.resolved_rt_level[i] = 0;
     }
   }
   if (ds) {
-    bd.resolved_ds_dxmt = ds->dxmtTexture();
-    if (bd.resolved_ds_dxmt)
-      bd.resolved_ds_view = static_cast<uint64_t>(bd.resolved_ds_dxmt->fullView);
-    bd.resolved_ds_handle = ds->metalTexture().handle;
-    bd.resolved_ds_has_stencil = ds_has_stencil;
-    bd.resolved_ds_level = static_cast<uint16_t>(ds->mipLevel());
-    bd.resolved_ds_slice = static_cast<uint16_t>(ds->arraySlice());
-    bd.resolved_depth_bias_scale = DepthBiasScale(ds->desc().Format);
-    if (bd.resolved_rt_width == 0) {
-      bd.resolved_rt_width = ds->desc().Width;
-      bd.resolved_rt_height = ds->desc().Height;
+    res.resolved_ds_dxmt = ds->dxmtTexture();
+    if (res.resolved_ds_dxmt)
+      res.resolved_ds_view = static_cast<uint64_t>(res.resolved_ds_dxmt->fullView);
+    res.resolved_ds_handle = ds->metalTexture().handle;
+    res.resolved_ds_has_stencil = ds_has_stencil;
+    res.resolved_ds_level = static_cast<uint16_t>(ds->mipLevel());
+    res.resolved_ds_slice = static_cast<uint16_t>(ds->arraySlice());
+    res.resolved_depth_bias_scale = DepthBiasScale(ds->desc().Format);
+    if (res.resolved_rt_width == 0) {
+      res.resolved_rt_width = ds->desc().Width;
+      res.resolved_rt_height = ds->desc().Height;
     }
   }
 
@@ -9795,49 +9802,49 @@ MTLD3D9Device::ResolveClusterState(
   resolve_cache.up_ib_format = bd.override_ib_format;
   resolve_cache.primitive_type = bd.primitive_type;
   resolve_cache.draw_type = bd.type;
-  resolve_cache.resolved_pso = bd.resolved_pso;
-  resolve_cache.resolved_pso_task = bd.resolved_pso_task;
-  resolve_cache.resolved_dsso = bd.resolved_dsso;
-  resolve_cache.resolved_stencil_ref = bd.resolved_stencil_ref;
-  resolve_cache.resolved_slot_mask = bd.resolved_slot_mask;
-  resolve_cache.resolved_ib_fmt = bd.resolved_ib_fmt;
-  resolve_cache.resolved_raster_sample_count = bd.resolved_raster_sample_count;
-  resolve_cache.resolved_depth_bias_scale = bd.resolved_depth_bias_scale;
-  resolve_cache.resolved_ds_has_stencil = bd.resolved_ds_has_stencil;
-  resolve_cache.resolved_rt_count = bd.resolved_rt_count;
-  resolve_cache.resolved_rt_width = bd.resolved_rt_width;
-  resolve_cache.resolved_rt_height = bd.resolved_rt_height;
-  resolve_cache.resolved_ds_handle = bd.resolved_ds_handle;
-  resolve_cache.resolved_ds_view = bd.resolved_ds_view;
-  resolve_cache.resolved_ds_level = bd.resolved_ds_level;
-  resolve_cache.resolved_ds_slice = bd.resolved_ds_slice;
-  resolve_cache.resolved_viewport = bd.resolved_viewport;
-  resolve_cache.resolved_position_transformed = bd.resolved_position_transformed;
-  resolve_cache.resolved_inject_point_size = bd.resolved_inject_point_size;
+  resolve_cache.resolved_pso = res.resolved_pso;
+  resolve_cache.resolved_pso_task = res.resolved_pso_task;
+  resolve_cache.resolved_dsso = res.resolved_dsso;
+  resolve_cache.resolved_stencil_ref = res.resolved_stencil_ref;
+  resolve_cache.resolved_slot_mask = res.resolved_slot_mask;
+  resolve_cache.resolved_ib_fmt = res.resolved_ib_fmt;
+  resolve_cache.resolved_raster_sample_count = res.resolved_raster_sample_count;
+  resolve_cache.resolved_depth_bias_scale = res.resolved_depth_bias_scale;
+  resolve_cache.resolved_ds_has_stencil = res.resolved_ds_has_stencil;
+  resolve_cache.resolved_rt_count = res.resolved_rt_count;
+  resolve_cache.resolved_rt_width = res.resolved_rt_width;
+  resolve_cache.resolved_rt_height = res.resolved_rt_height;
+  resolve_cache.resolved_ds_handle = res.resolved_ds_handle;
+  resolve_cache.resolved_ds_view = res.resolved_ds_view;
+  resolve_cache.resolved_ds_level = res.resolved_ds_level;
+  resolve_cache.resolved_ds_slice = res.resolved_ds_slice;
+  resolve_cache.resolved_viewport = res.resolved_viewport;
+  resolve_cache.resolved_position_transformed = res.resolved_position_transformed;
+  resolve_cache.resolved_inject_point_size = res.resolved_inject_point_size;
   std::memcpy(resolve_cache.ffp_texcoord_width, ffp_texcoord_width, sizeof(resolve_cache.ffp_texcoord_width));
-  resolve_cache.resolved_scissor = bd.resolved_scissor;
-  std::memcpy(resolve_cache.resolved_rt_handles, bd.resolved_rt_handles, sizeof(resolve_cache.resolved_rt_handles));
-  std::memcpy(resolve_cache.resolved_rt_view, bd.resolved_rt_view, sizeof(resolve_cache.resolved_rt_view));
-  std::memcpy(resolve_cache.resolved_rt_level, bd.resolved_rt_level, sizeof(resolve_cache.resolved_rt_level));
-  std::memcpy(resolve_cache.resolved_rt_slice, bd.resolved_rt_slice, sizeof(resolve_cache.resolved_rt_slice));
+  resolve_cache.resolved_scissor = res.resolved_scissor;
+  std::memcpy(resolve_cache.resolved_rt_handles, res.resolved_rt_handles, sizeof(resolve_cache.resolved_rt_handles));
+  std::memcpy(resolve_cache.resolved_rt_view, res.resolved_rt_view, sizeof(resolve_cache.resolved_rt_view));
+  std::memcpy(resolve_cache.resolved_rt_level, res.resolved_rt_level, sizeof(resolve_cache.resolved_rt_level));
+  std::memcpy(resolve_cache.resolved_rt_slice, res.resolved_rt_slice, sizeof(resolve_cache.resolved_rt_slice));
   std::memcpy(
-      resolve_cache.resolved_frag_textures, bd.resolved_frag_textures, sizeof(resolve_cache.resolved_frag_textures)
+      resolve_cache.resolved_frag_textures, res.resolved_frag_textures, sizeof(resolve_cache.resolved_frag_textures)
   );
-  std::memcpy(resolve_cache.resolved_frag_view, bd.resolved_frag_view, sizeof(resolve_cache.resolved_frag_view));
+  std::memcpy(resolve_cache.resolved_frag_view, res.resolved_frag_view, sizeof(resolve_cache.resolved_frag_view));
   std::memcpy(
-      resolve_cache.resolved_frag_samplers, bd.resolved_frag_samplers, sizeof(resolve_cache.resolved_frag_samplers)
+      resolve_cache.resolved_frag_samplers, res.resolved_frag_samplers, sizeof(resolve_cache.resolved_frag_samplers)
   );
   for (uint32_t i = 0; i < D3D_MAX_SIMULTANEOUS_RENDERTARGETS; ++i)
-    resolve_cache.resolved_rt_dxmt[i] = bd.resolved_rt_dxmt[i];
-  resolve_cache.resolved_ds_dxmt = bd.resolved_ds_dxmt;
+    resolve_cache.resolved_rt_dxmt[i] = res.resolved_rt_dxmt[i];
+  resolve_cache.resolved_ds_dxmt = res.resolved_ds_dxmt;
   for (uint32_t i = 0; i < 16; ++i)
-    resolve_cache.resolved_frag_texture_dxmt[i] = bd.resolved_frag_texture_dxmt[i];
+    resolve_cache.resolved_frag_texture_dxmt[i] = res.resolved_frag_texture_dxmt[i];
   return true;
 }
 
 bool
 MTLD3D9Device::ResolveBatchedDrawForChunk(
-    BatchedDraw &bd, uint64_t chunk_seq, uint64_t chunk_coherent_id, ConstUploadCache &const_cache,
+    BatchedDraw &bd, D9ResolvedDraw &res, uint64_t chunk_seq, uint64_t chunk_coherent_id, ConstUploadCache &const_cache,
     ResolveCache &resolve_cache
 ) {
   // No per-draw autorelease pool here; the calling chunk->emitcc lambda
@@ -9909,41 +9916,41 @@ MTLD3D9Device::ResolveBatchedDrawForChunk(
 
   if (cluster_hit) {
     // Cluster-stable resolved fields; copy from cache.
-    bd.resolved_pso = resolve_cache.resolved_pso;
-    bd.resolved_pso_task = resolve_cache.resolved_pso_task;
-    bd.resolved_pso_first_use = false;
-    bd.resolved_dsso = resolve_cache.resolved_dsso;
-    bd.resolved_stencil_ref = resolve_cache.resolved_stencil_ref;
-    bd.resolved_slot_mask = resolve_cache.resolved_slot_mask;
-    bd.resolved_ib_fmt = resolve_cache.resolved_ib_fmt;
-    bd.resolved_raster_sample_count = resolve_cache.resolved_raster_sample_count;
-    bd.resolved_depth_bias_scale = resolve_cache.resolved_depth_bias_scale;
-    bd.resolved_ds_has_stencil = resolve_cache.resolved_ds_has_stencil;
-    bd.resolved_rt_count = resolve_cache.resolved_rt_count;
-    bd.resolved_rt_width = resolve_cache.resolved_rt_width;
-    bd.resolved_rt_height = resolve_cache.resolved_rt_height;
-    bd.resolved_ds_handle = resolve_cache.resolved_ds_handle;
-    bd.resolved_ds_view = resolve_cache.resolved_ds_view;
-    bd.resolved_ds_level = resolve_cache.resolved_ds_level;
-    bd.resolved_ds_slice = resolve_cache.resolved_ds_slice;
-    bd.resolved_viewport = resolve_cache.resolved_viewport;
-    bd.resolved_position_transformed = resolve_cache.resolved_position_transformed;
-    bd.resolved_inject_point_size = resolve_cache.resolved_inject_point_size;
+    res.resolved_pso = resolve_cache.resolved_pso;
+    res.resolved_pso_task = resolve_cache.resolved_pso_task;
+    res.resolved_pso_first_use = false;
+    res.resolved_dsso = resolve_cache.resolved_dsso;
+    res.resolved_stencil_ref = resolve_cache.resolved_stencil_ref;
+    res.resolved_slot_mask = resolve_cache.resolved_slot_mask;
+    res.resolved_ib_fmt = resolve_cache.resolved_ib_fmt;
+    res.resolved_raster_sample_count = resolve_cache.resolved_raster_sample_count;
+    res.resolved_depth_bias_scale = resolve_cache.resolved_depth_bias_scale;
+    res.resolved_ds_has_stencil = resolve_cache.resolved_ds_has_stencil;
+    res.resolved_rt_count = resolve_cache.resolved_rt_count;
+    res.resolved_rt_width = resolve_cache.resolved_rt_width;
+    res.resolved_rt_height = resolve_cache.resolved_rt_height;
+    res.resolved_ds_handle = resolve_cache.resolved_ds_handle;
+    res.resolved_ds_view = resolve_cache.resolved_ds_view;
+    res.resolved_ds_level = resolve_cache.resolved_ds_level;
+    res.resolved_ds_slice = resolve_cache.resolved_ds_slice;
+    res.resolved_viewport = resolve_cache.resolved_viewport;
+    res.resolved_position_transformed = resolve_cache.resolved_position_transformed;
+    res.resolved_inject_point_size = resolve_cache.resolved_inject_point_size;
     std::memcpy(ffp_texcoord_width, resolve_cache.ffp_texcoord_width, sizeof(ffp_texcoord_width));
-    bd.resolved_scissor = resolve_cache.resolved_scissor;
-    std::memcpy(bd.resolved_rt_handles, resolve_cache.resolved_rt_handles, sizeof(bd.resolved_rt_handles));
-    std::memcpy(bd.resolved_rt_view, resolve_cache.resolved_rt_view, sizeof(bd.resolved_rt_view));
-    std::memcpy(bd.resolved_rt_level, resolve_cache.resolved_rt_level, sizeof(bd.resolved_rt_level));
-    std::memcpy(bd.resolved_rt_slice, resolve_cache.resolved_rt_slice, sizeof(bd.resolved_rt_slice));
-    std::memcpy(bd.resolved_frag_textures, resolve_cache.resolved_frag_textures, sizeof(bd.resolved_frag_textures));
-    std::memcpy(bd.resolved_frag_view, resolve_cache.resolved_frag_view, sizeof(bd.resolved_frag_view));
-    std::memcpy(bd.resolved_frag_samplers, resolve_cache.resolved_frag_samplers, sizeof(bd.resolved_frag_samplers));
+    res.resolved_scissor = resolve_cache.resolved_scissor;
+    std::memcpy(res.resolved_rt_handles, resolve_cache.resolved_rt_handles, sizeof(res.resolved_rt_handles));
+    std::memcpy(res.resolved_rt_view, resolve_cache.resolved_rt_view, sizeof(res.resolved_rt_view));
+    std::memcpy(res.resolved_rt_level, resolve_cache.resolved_rt_level, sizeof(res.resolved_rt_level));
+    std::memcpy(res.resolved_rt_slice, resolve_cache.resolved_rt_slice, sizeof(res.resolved_rt_slice));
+    std::memcpy(res.resolved_frag_textures, resolve_cache.resolved_frag_textures, sizeof(res.resolved_frag_textures));
+    std::memcpy(res.resolved_frag_view, resolve_cache.resolved_frag_view, sizeof(res.resolved_frag_view));
+    std::memcpy(res.resolved_frag_samplers, resolve_cache.resolved_frag_samplers, sizeof(res.resolved_frag_samplers));
     for (uint32_t i = 0; i < D3D_MAX_SIMULTANEOUS_RENDERTARGETS; ++i)
-      bd.resolved_rt_dxmt[i] = resolve_cache.resolved_rt_dxmt[i];
-    bd.resolved_ds_dxmt = resolve_cache.resolved_ds_dxmt;
+      res.resolved_rt_dxmt[i] = resolve_cache.resolved_rt_dxmt[i];
+    res.resolved_ds_dxmt = resolve_cache.resolved_ds_dxmt;
     for (uint32_t i = 0; i < 16; ++i)
-      bd.resolved_frag_texture_dxmt[i] = resolve_cache.resolved_frag_texture_dxmt[i];
-  } else if (!ResolveClusterState(bd, resolve_cache, refs, ffp_vs, ffp_ps, ffp_texcoord_width)) {
+      res.resolved_frag_texture_dxmt[i] = resolve_cache.resolved_frag_texture_dxmt[i];
+  } else if (!ResolveClusterState(bd, res, resolve_cache, refs, ffp_vs, ffp_ps, ffp_texcoord_width)) {
     return false;
   }
 
@@ -9974,9 +9981,9 @@ MTLD3D9Device::ResolveBatchedDrawForChunk(
     // dummy/zero arm below runs instead of dereferencing the null backing, the
     // same guard the fragment loop applies.
     if (!tex || !tex->dxmtTexture()) {
-      bd.resolved_vert_texture_dxmt[vslot] = {};
-      bd.resolved_vert_view[vslot] = 0;
-      bd.resolved_vert_samplers[vslot] = 0;
+      res.resolved_vert_texture_dxmt[vslot] = {};
+      res.resolved_vert_view[vslot] = 0;
+      res.resolved_vert_samplers[vslot] = 0;
       if (vs_samp_type[vslot] != DxsoTextureType::Unknown) {
         // Declared-but-unbound: type-correct opaque-black dummy + a sampler so
         // the vertex bind is complete and the VS reads (0, 0, 0, 1).
@@ -9985,12 +9992,12 @@ MTLD3D9Device::ResolveBatchedDrawForChunk(
           dummy_type = WMTTextureType3D;
         else if (vs_samp_type[vslot] == DxsoTextureType::TextureCube)
           dummy_type = WMTTextureTypeCube;
-        bd.resolved_vert_textures[vslot] = dummyFragmentTexture(dummy_type);
+        res.resolved_vert_textures[vslot] = dummyFragmentTexture(dummy_type);
         WMTSamplerInfo sinfo = sampler_info_from_d3d9_state(samp_states[16 + vslot]);
         if (auto sampler = getOrCreateSampler(sinfo))
-          bd.resolved_vert_samplers[vslot] = sampler->sampler_state.handle;
+          res.resolved_vert_samplers[vslot] = sampler->sampler_state.handle;
       } else {
-        bd.resolved_vert_textures[vslot] = 0;
+        res.resolved_vert_textures[vslot] = 0;
       }
       continue;
     }
@@ -10006,9 +10013,9 @@ MTLD3D9Device::ResolveBatchedDrawForChunk(
       view = rc->fullView;
       vh = rc->view(view).texture.handle;
     }
-    bd.resolved_vert_view[vslot] = view;
-    bd.resolved_vert_textures[vslot] = vh;
-    bd.resolved_vert_texture_dxmt[vslot] = rc;
+    res.resolved_vert_view[vslot] = view;
+    res.resolved_vert_textures[vslot] = vh;
+    res.resolved_vert_texture_dxmt[vslot] = rc;
     // Same fp32 non-filterable degrade as the fragment path: an R32F
     // displacement map read with a LINEAR vertex sampler is undefined on AGX.
     // VTF shadow compare is never selected (classic vs_3_0 texldl), so keep
@@ -10016,7 +10023,7 @@ MTLD3D9Device::ResolveBatchedDrawForChunk(
     WMTSamplerInfo sinfo =
         sampler_info_from_d3d9_state(vsamp_row, /*shadow_compare=*/false, IsMetalNonFilterableFormat(tex->d3dFormat()));
     if (auto sampler = getOrCreateSampler(sinfo))
-      bd.resolved_vert_samplers[vslot] = sampler->sampler_state.handle;
+      res.resolved_vert_samplers[vslot] = sampler->sampler_state.handle;
   }
 
   // ---- Read-only depth-stencil (sampled-while-bound) ----
@@ -10035,11 +10042,11 @@ MTLD3D9Device::ResolveBatchedDrawForChunk(
   // driver ignoring them. Only a bytecode pixel shader carries a usage
   // mask: the fixed-function path samples per texture-stage state, so its
   // bindings are all treated as live.
-  if (auto *dst = bd.resolved_ds_dxmt.ptr()) {
+  if (auto *dst = res.resolved_ds_dxmt.ptr()) {
     const uint32_t ps_sampled = ffp_ps ? 0xffffu : ps->metadata().sampler_usage_mask;
     bool sampled = false;
     for (uint32_t st = 0; st < 16; ++st) {
-      if (bd.resolved_frag_texture_dxmt[st].ptr() != dst)
+      if (res.resolved_frag_texture_dxmt[st].ptr() != dst)
         continue;
       if (!(ps_sampled & (1u << st))) {
         // Mirror the unbound-sampler path above: clear the tracked texture
@@ -10048,8 +10055,8 @@ MTLD3D9Device::ResolveBatchedDrawForChunk(
         // emit path would otherwise bind untracked. A clear usage bit means
         // the shader was compiled with no texture argument at this index,
         // so unlike that path the placeholder's type is unobservable.
-        bd.resolved_frag_texture_dxmt[st] = {};
-        bd.resolved_frag_textures[st] = dummyFragmentTexture(WMTTextureType2D);
+        res.resolved_frag_texture_dxmt[st] = {};
+        res.resolved_frag_textures[st] = dummyFragmentTexture(WMTTextureType2D);
         continue;
       }
       sampled = true;
@@ -10059,18 +10066,18 @@ MTLD3D9Device::ResolveBatchedDrawForChunk(
     // skip the slot outright, so no placeholder is needed there.
     const uint32_t vs_sampled = ffp_vs ? 0xfu : vs->metadata().sampler_usage_mask;
     for (uint32_t vslot = 0; vslot < 4; ++vslot) {
-      if (bd.resolved_vert_texture_dxmt[vslot].ptr() != dst)
+      if (res.resolved_vert_texture_dxmt[vslot].ptr() != dst)
         continue;
       if (!(vs_sampled & (1u << vslot))) {
-        bd.resolved_vert_texture_dxmt[vslot] = {};
-        bd.resolved_vert_textures[vslot] = 0;
+        res.resolved_vert_texture_dxmt[vslot] = {};
+        res.resolved_vert_textures[vslot] = 0;
         continue;
       }
       sampled = true;
     }
     bool depth_write = rs[D3DRS_ZENABLE] != D3DZB_FALSE && rs[D3DRS_ZWRITEENABLE];
-    bool stencil_write = bd.resolved_ds_has_stencil && rs[D3DRS_STENCILENABLE] && rs[D3DRS_STENCILWRITEMASK] != 0;
-    bd.resolved_ds_readonly = sampled && !depth_write && !stencil_write;
+    bool stencil_write = res.resolved_ds_has_stencil && rs[D3DRS_STENCILENABLE] && rs[D3DRS_STENCILWRITEMASK] != 0;
+    res.resolved_ds_readonly = sampled && !depth_write && !stencil_write;
   }
 
   // ---- vbuf table from m_constRingResolve ----
@@ -10082,14 +10089,14 @@ MTLD3D9Device::ResolveBatchedDrawForChunk(
     uint32_t stride;
     uint32_t length;
   };
-  uint32_t num_active = static_cast<uint32_t>(__builtin_popcount(bd.resolved_slot_mask));
+  uint32_t num_active = static_cast<uint32_t>(__builtin_popcount(res.resolved_slot_mask));
   VbufEntry stage[D3D9_MAX_VERTEX_STREAMS];
   uint64_t stage_base[D3D9_MAX_VERTEX_STREAMS] = {};
   uint32_t stage_stride[D3D9_MAX_VERTEX_STREAMS] = {};
   uint32_t stage_length[D3D9_MAX_VERTEX_STREAMS] = {};
   uint32_t stage_i = 0;
   for (uint32_t slot = 0; slot < D3D9_MAX_VERTEX_STREAMS; ++slot) {
-    if (!(bd.resolved_slot_mask & (1u << slot)))
+    if (!(res.resolved_slot_mask & (1u << slot)))
       continue;
     VbufEntry &entry = stage[stage_i];
     entry = VbufEntry{};
@@ -10116,10 +10123,10 @@ MTLD3D9Device::ResolveBatchedDrawForChunk(
     stage_length[slot] = entry.length;
     ++stage_i;
   }
-  bool vbuf_cache_hit = resolve_cache.last_vbuf_slot_mask == bd.resolved_slot_mask;
+  bool vbuf_cache_hit = resolve_cache.last_vbuf_slot_mask == res.resolved_slot_mask;
   if (vbuf_cache_hit) {
     for (uint32_t slot = 0; slot < D3D9_MAX_VERTEX_STREAMS; ++slot) {
-      if (!(bd.resolved_slot_mask & (1u << slot)))
+      if (!(res.resolved_slot_mask & (1u << slot)))
         continue;
       if (resolve_cache.last_vbuf_base_addr[slot] != stage_base[slot] ||
           resolve_cache.last_vbuf_stride[slot] != stage_stride[slot] ||
@@ -10130,24 +10137,24 @@ MTLD3D9Device::ResolveBatchedDrawForChunk(
     }
   }
   if (vbuf_cache_hit) {
-    bd.resolved_vbuf_table_buffer = resolve_cache.last_vbuf_table_buffer;
-    bd.resolved_vbuf_table_offset = resolve_cache.last_vbuf_table_offset;
+    res.resolved_vbuf_table_buffer = resolve_cache.last_vbuf_table_buffer;
+    res.resolved_vbuf_table_offset = resolve_cache.last_vbuf_table_offset;
   } else {
     auto vbuf_span =
         tryRingAllocate(m_constRingResolve, chunk_seq, chunk_coherent_id, sizeof(VbufEntry) * num_active, 256);
     if (!vbuf_span)
       return false;
     std::memcpy(vbuf_span.host, stage, sizeof(VbufEntry) * num_active);
-    bd.resolved_vbuf_table_buffer = vbuf_span.handle;
-    bd.resolved_vbuf_table_offset = vbuf_span.offset;
-    resolve_cache.last_vbuf_slot_mask = bd.resolved_slot_mask;
+    res.resolved_vbuf_table_buffer = vbuf_span.handle;
+    res.resolved_vbuf_table_offset = vbuf_span.offset;
+    resolve_cache.last_vbuf_slot_mask = res.resolved_slot_mask;
     for (uint32_t slot = 0; slot < D3D9_MAX_VERTEX_STREAMS; ++slot) {
       resolve_cache.last_vbuf_base_addr[slot] = stage_base[slot];
       resolve_cache.last_vbuf_stride[slot] = stage_stride[slot];
       resolve_cache.last_vbuf_length[slot] = stage_length[slot];
     }
-    resolve_cache.last_vbuf_table_buffer = bd.resolved_vbuf_table_buffer;
-    resolve_cache.last_vbuf_table_offset = bd.resolved_vbuf_table_offset;
+    resolve_cache.last_vbuf_table_buffer = res.resolved_vbuf_table_buffer;
+    resolve_cache.last_vbuf_table_offset = res.resolved_vbuf_table_offset;
   }
 
   // ---- VS-resident handles per active stream ----
@@ -10158,38 +10165,38 @@ MTLD3D9Device::ResolveBatchedDrawForChunk(
   // this prevents. Only active streams (slot_mask bit set) are pinned;
   // unbound slots stay null.
   for (uint32_t slot = 0; slot < D3D9_MAX_VERTEX_STREAMS; ++slot) {
-    if (!(bd.resolved_slot_mask & (1u << slot)))
+    if (!(res.resolved_slot_mask & (1u << slot)))
       continue;
     if (slot == 0 && bd.override_vb_buffer != 0) {
-      bd.resolved_vs_resident_handles[slot] = bd.override_vb_buffer;
+      res.resolved_vs_resident_handles[slot] = bd.override_vb_buffer;
     } else {
-      bd.resolved_vs_resident_handles[slot] = cap.vb_slots[slot].buffer;
+      res.resolved_vs_resident_handles[slot] = cap.vb_slots[slot].buffer;
       // Carry the frozen allocation for this stream from cap (captured on
       // the calling thread from the same immediateName() read as the handle
       // above), so the emit registers a Vertex-stage read against the same
       // allocation the binding froze. Both map modes populate it now; only
       // override (UP) streams are ring-fed and leave it null.
-      bd.resolved_vb_dxmt[slot] = cap.vb_slots[slot].alloc;
+      res.resolved_vb_dxmt[slot] = cap.vb_slots[slot].alloc;
     }
-    bd.resolved_vb_pins[slot] = refs.vertex_buffers[slot];
+    res.resolved_vb_pins[slot] = refs.vertex_buffers[slot];
   }
 
   // ---- IB handle + offset ----
   // cap.ib_offset must be frozen (currentOffset reflects rename cursor).
   if (indexed) {
     if (bd.override_ib_buffer != 0) {
-      bd.resolved_ib_handle = bd.override_ib_buffer;
-      bd.resolved_ib_base_offset = bd.override_ib_offset;
+      res.resolved_ib_handle = bd.override_ib_buffer;
+      res.resolved_ib_base_offset = bd.override_ib_offset;
     } else {
-      bd.resolved_ib_handle = cap.ib_buffer;
-      bd.resolved_ib_base_offset = cap.ib_offset;
+      res.resolved_ib_handle = cap.ib_buffer;
+      res.resolved_ib_base_offset = cap.ib_offset;
       // Pin the IB wrapper through chunk lifetime; see resolved_vb_pins
       // for the trap.
-      bd.resolved_ib_pin = refs.index_buffer;
+      res.resolved_ib_pin = refs.index_buffer;
       // Frozen allocation for the IB from cap (either map mode); null only
       // for an override (UP) index buffer. Same rationale as the vertex
       // stream above.
-      bd.resolved_ib_dxmt = cap.ib_alloc;
+      res.resolved_ib_dxmt = cap.ib_alloc;
     }
   }
 
@@ -10237,14 +10244,14 @@ MTLD3D9Device::ResolveBatchedDrawForChunk(
   uint32_t ffp_tcw_key = 0;
   for (int i = 0; i < 8; ++i)
     ffp_tcw_key |= (ffp_texcoord_width[i] & 0xFu) << (i * 4);
-  const bool ds_bound = bd.resolved_ds_handle != 0;
+  const bool ds_bound = res.resolved_ds_handle != 0;
   if (bd.pod_snapshot == const_cache.pod_ptr && const_cache.pod_ptr != nullptr &&
       const_cache.vs_defs_key == vs_defs_key && const_cache.ps_defs_key == ps_defs_key &&
       const_cache.ffp_texcoord_width_key == ffp_tcw_key && const_cache.ds_bound == ds_bound &&
-      const_cache.pos_transformed == bd.resolved_position_transformed) {
-    bd.resolved_const_uploads = const_cache.uploads;
+      const_cache.pos_transformed == res.resolved_position_transformed) {
+    res.resolved_const_uploads = const_cache.uploads;
   } else if (!PackDrawConstants(
-                 bd, const_cache,
+                 bd, res, const_cache,
                  DrawShaderShape{
                      vs, ps, ffp_vs, ffp_ps, vs_uses_relative, ps_uses_relative, vs_needs_defs, ps_needs_defs
                  },
@@ -10303,12 +10310,20 @@ MTLD3D9Device::FlushDrawBatch() {
 
     D9PassKind pass = D9PassKind::None;
     ChunkEmitState s{};
-    const BatchedDraw *prev_draw = nullptr;
+    // One resolved record for the whole chunk. Every draw resolves into it and
+    // consumes it within the same iteration, so it is reused rather than
+    // carried per draw: that is what keeps BatchedDraw down to its capture and
+    // call arguments instead of the resolved state as well.
+    D9ResolvedDraw res{};
+    // The previous draw's attachment identity, COPIED. It cannot be a pointer
+    // into the resolved record any more, because that record is about to be
+    // overwritten by the next draw and would compare against itself.
+    D9PassAttachments prev_attachments{};
     auto end_current_pass = [&]() {
       if (pass != D9PassKind::None) {
         ctx.endPass();
         pass = D9PassKind::None;
-        prev_draw = nullptr;
+        prev_attachments.valid = false;
       }
     };
 
@@ -10330,11 +10345,19 @@ MTLD3D9Device::FlushDrawBatch() {
         // once the calling thread has moved on to the next frame.
         auto *perf_stats = dxmt::perf::frameStatisticsForContext(ctx);
         {
+          // Reset before every resolve. The record is reused across draws to
+          // keep it off the calling thread, but the resolver does not write
+          // every field on every path: a stage the draw does not bind, or a
+          // field only the cluster-miss path fills, would otherwise be read
+          // with the previous draw's value. That is not a crash, it is silently
+          // wrong colour, which is what the conformance suite caught when this
+          // reset was missing.
+          res = D9ResolvedDraw{};
           dxmt::perf::ScopedFrameDurationCounted _resolve_timer(
               perf_stats, &dxmt::FrameStatistics::frame_draw_resolve_interval,
               &dxmt::FrameStatistics::frame_draw_resolve_count
           );
-          if (!this->ResolveBatchedDrawForChunk(bd, chunk_seq, chunk_coherent_id, const_cache, resolve_cache)) {
+          if (!this->ResolveBatchedDrawForChunk(bd, res, chunk_seq, chunk_coherent_id, const_cache, resolve_cache)) {
             dxmt::perf::addFrameCounter(perf_stats, &dxmt::FrameStatistics::frame_draw_dropped_unresolved_count);
             continue;
           }
@@ -10349,46 +10372,58 @@ MTLD3D9Device::FlushDrawBatch() {
         // at a scene cut where every pipeline is cold at once. The wait is
         // timed so DXMT_PERF_STATS shows the one-time cut cost.
         // Null state() means newRenderPipelineState failed; skip permanently.
-        if (bd.resolved_pso_task) {
+        if (res.resolved_pso_task) {
           bool pso_ready;
           {
             dxmt::perf::ScopedFrameDuration _pso_timer(
                 perf_stats, &dxmt::FrameStatistics::frame_pso_compile_wait_interval
             );
-            pso_ready = bd.resolved_pso_task->GetDone();
+            pso_ready = res.resolved_pso_task->GetDone();
           }
           if (!pso_ready) {
             dxmt::perf::ScopedFrameDuration _pso_wait(
                 perf_stats, &dxmt::FrameStatistics::frame_pso_compile_wait_interval
             );
             dxmt::perf::addFrameCounter(perf_stats, &dxmt::FrameStatistics::frame_pso_compile_wait_count);
-            bd.resolved_pso_task->Wait();
+            res.resolved_pso_task->Wait();
           }
-          bd.resolved_pso = bd.resolved_pso_task->state().handle;
-          if (bd.resolved_pso == 0) {
+          res.resolved_pso = res.resolved_pso_task->state().handle;
+          if (res.resolved_pso == 0) {
             dxmt::perf::addFrameCounter(perf_stats, &dxmt::FrameStatistics::frame_draw_dropped_pipeline_count);
             continue; // link failed: skip
           }
         }
-        bool need_new_pass = pass != D9PassKind::Render || !prev_draw || !RtDsAttachmentsMatch(*prev_draw, bd);
+        bool need_new_pass =
+            pass != D9PassKind::Render || !prev_attachments.valid || !RtDsAttachmentsMatch(prev_attachments, res);
         if (need_new_pass) {
           end_current_pass();
-          StartRenderPassForBatch_d9(ctx, bd);
+          StartRenderPassForBatch_d9(ctx, bd, res);
           pass = D9PassKind::Render;
           s = ChunkEmitState{}; // fresh encoder, fresh shadow
         }
         {
           dxmt::perf::ScopedFrameDuration _emit_timer(perf_stats, &dxmt::FrameStatistics::frame_draw_emit_interval);
-          EmitCommonRenderSetup_d9(ctx, bd, s);
+          EmitCommonRenderSetup_d9(ctx, bd, res, s);
           // Advance the visibility-result offset for this draw and emit
           // SetVisibilityMode (Counting while an occlusion query is open,
           // Disabled otherwise), as every d3d11 draw does. Without this the
           // offset never moves, so an occlusion query only ever sees the empty
           // initial range and resolves to 0 no matter what it covers.
           ctx.bumpVisibilityResultOffset();
-          EmitDrawCommand_d9(ctx, bd);
+          EmitDrawCommand_d9(ctx, bd, res);
         }
-        prev_draw = &bd;
+        // Snapshot the attachment identity for the next draw's pass test.
+        std::memcpy(prev_attachments.resolved_rt_handles, res.resolved_rt_handles, sizeof(res.resolved_rt_handles));
+        std::memcpy(prev_attachments.resolved_rt_view, res.resolved_rt_view, sizeof(res.resolved_rt_view));
+        std::memcpy(prev_attachments.resolved_rt_level, res.resolved_rt_level, sizeof(res.resolved_rt_level));
+        std::memcpy(prev_attachments.resolved_rt_slice, res.resolved_rt_slice, sizeof(res.resolved_rt_slice));
+        prev_attachments.resolved_ds_handle = res.resolved_ds_handle;
+        prev_attachments.resolved_ds_view = res.resolved_ds_view;
+        prev_attachments.resolved_ds_level = res.resolved_ds_level;
+        prev_attachments.resolved_ds_slice = res.resolved_ds_slice;
+        prev_attachments.resolved_ds_readonly = res.resolved_ds_readonly;
+        prev_attachments.resolved_rt_count = res.resolved_rt_count;
+        prev_attachments.valid = true;
       } else { // Blit
         auto &op = blits[ref.index];
         switch (op.kind) {
