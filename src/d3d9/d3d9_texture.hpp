@@ -27,7 +27,7 @@ public:
   // Metal handle alive across calling-thread -> encode-thread -> GPU-completion via
   // ref_tracker. Two flavours: regular (bufferPitch==0, Metal texture direct) and
   // buffer-backed (bufferPitch>0, wsi::aligned_malloc wrapped in Metal buffer).
-  // Buffer path: ref_tracker keeps buffer alive to GPU completion, closing prior UAF.
+  // Buffer path: ref_tracker keeps the buffer alive to GPU completion.
   // userMemory: D3D9Ex SYSTEMMEM user-memory (single level). The app pointer is the
   // packed CPU master: level-0 LockRect aliases it and UpdateTexture stages from it,
   // matching wined3d (no copy). The texture must not free it.
@@ -74,9 +74,7 @@ public:
   metalTexture() const override {
     return m_textureRaw;
   }
-  // Internal: Rc<> handle for chunk lambdas to capture and keep
-  // texture alive across calling/encode/GPU-completion boundary.
-  // Always non-null, const-reference return.
+  // Internal: the Rc<> chunk lambdas capture. Always non-null.
   const Rc<dxmt::Texture> &
   dxmtTexture() const override {
     return m_dxmtTexture;
@@ -107,7 +105,7 @@ public:
   // call repeatedly; the first call allocates and patches every level
   // surface's m_cpu_ptr + pitch, subsequent calls early-
   // out. Cuts boot-time VA pressure and wine_unix_call rate for apps
-  // that batch-create textures up front (audit M-PERF #2).
+  // that batch-create textures up front.
   void ensureMirror() override;
 
   // MANAGED mirror eviction, the wined3d evict_sysmem shape. A
@@ -332,10 +330,8 @@ private:
   // surrounding members; ordering is implicit since wine's main
   // thread runs both Lock/Unlock and draw.
   std::atomic<bool> m_mips_dirty{false};
-  // Dirty-region tracking: see isDirty/dirtyRectLevel0/unionDirtyRect
-  // in the public section. Defaults to (true, full level-0 extent) at
-  // ctor: a freshly-created texture has no GPU-side content yet, so
-  // the consumer's first upload should cover everything.
+  // Dirty-region tracking: see isDirty / dirtyRectLevel0 / unionDirtyRect in
+  // the public section. Defaults to (true, full level-0 extent).
   bool m_dirty_any = true;
   RECT m_dirty_rect{};
   // Losable-resource accounting: see d3d9_surface.hpp's matching field.

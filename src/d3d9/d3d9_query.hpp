@@ -49,8 +49,8 @@ private:
   // the d3d9 wrapper turns wined3d's INVALIDCALL into a poisoned-buffer S_OK)
   // from one mid-window (BUILDING: S_FALSE).
   bool m_began = false;
-  // Tracks whether D3DISSUE_END has run (QUERY_SIGNALLED). Before any END the
-  // CREATED / BUILDING paths above apply. wined3d query.c enforces the order.
+  // Whether D3DISSUE_END has run (QUERY_SIGNALLED). wined3d query.c enforces
+  // the CREATED -> BUILDING -> SIGNALLED order.
   bool m_ended = false;
   // EVENT-query GPU completion seq. Captured at Issue(D3DISSUE_END):
   // the queue's CurrentSeqId: the chunk-in-flight that all-prior work

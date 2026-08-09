@@ -1,5 +1,12 @@
 #pragma once
 
+// DXVK citations in this file name its DXSO compiler as it stood at the
+// revision this translator was read against (src/dxso/). Upstream has since
+// rewritten that path into the dxbc-spirv subproject, where those function
+// names no longer resolve, so read a citation as the approach it describes
+// rather than as a file to open. The behaviour each one attributes was checked
+// against the DXVK it names.
+
 #include "dxso_header.hpp"
 
 #include <cstdint>

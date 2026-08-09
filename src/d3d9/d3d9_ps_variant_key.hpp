@@ -19,10 +19,9 @@
 //     floats, animated for water ripple, heat shimmer, rain sheen).
 // DXVK keeps only the BOUNDED axes in the key (the alpha compare FUNC,
 // ~8 values) and feeds the numeric ref + bump-env through a shared PS
-// uniform buffer the shader reads at runtime: src/d3d9/d3d9_fixed_function.cpp
-// D3D9SharedPS (per-stage BumpEnvMat/LScale/LOffset) and
-// src/dxso/dxso_compiler.cpp emitBem read that block; the alpha ref is
-// normalised against the fragment alpha the same way. dxmt routes both
+// uniform buffer the shader reads at runtime: d3d9_fixed_function.cpp
+// D3D9SharedPS carries the per-stage BumpEnvMat/LScale/LOffset; the alpha ref
+// is normalised against the fragment alpha the same way. dxmt routes both
 // through the bool-buffer tail the fog colour + table params already ride.
 //
 // This header carries the pure key logic that keeps the variant key

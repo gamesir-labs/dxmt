@@ -50,16 +50,14 @@ public:
   HRESULT STDMETHODCALLTYPE Unlock() override;
   HRESULT STDMETHODCALLTYPE GetDesc(D3DVERTEXBUFFER_DESC *pDesc) override;
 
-  // Metal buffer the GPU reads: the DynamicBuffer's current allocation
-  // buffer; the refresh renames it via updateImmediateName.
+  // The buffer the GPU reads. A refresh renames it, so do not cache the handle.
   WMT::Buffer
   metalBuffer() const {
     return m_dynamic->immediateName()->buffer();
   }
-  // GPU virtual address of the buffer the GPU reads; the manual-fetch VS
-  // variant pulls vertex data through this pointer via the [[buffer(16)]]
-  // vertex_buffers table, not through a [[buffer(N)]] binding. Read from
-  // the DynamicBuffer's current allocation.
+  // GPU virtual address for the manual-fetch VS variant, which pulls vertex
+  // data through the [[buffer(16)]] vertex_buffers table rather than a
+  // [[buffer(N)]] binding.
   uint64_t
   gpuAddress() const {
     return m_dynamic->immediateName()->gpuAddress();
@@ -122,16 +120,8 @@ private:
   // retired allocations the refresh recycles once the GPU has passed them. A refresh stores the mirror into the current
   // name and draws read it.
   Rc<dxmt::DynamicBuffer> m_dynamic;
-  // The mirror is authoritative. This says only that the GPU-side cache no
-  // longer matches it; WHICH bytes differ is deliberately not tracked, because
-  // the application does not truthfully say (d3d9_buffer_map.hpp).
+  // See MTLD3D9VertexBuffer::m_dirty and ::m_writeLocked.
   bool m_dirty = false;
-  // A write lock that is still outstanding. An application may hold a buffer
-  // mapped across many draws and write each region just before the draw that
-  // reads it, without ever re-locking, so the lock is the only announcement we
-  // get and it arrives once. Clearing the dirty flag on the first refresh would
-  // then leave every later write unpublished. While this is set, a refresh
-  // re-uploads unconditionally.
   bool m_writeLocked = false;
   // Nested Lock/Unlock depth; the upload fires on the outer Unlock only.
   D3D9BufferLockCount m_lockCount;

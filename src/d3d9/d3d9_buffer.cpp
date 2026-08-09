@@ -106,6 +106,15 @@ MTLD3D9VertexBuffer::refreshWholeMirror() {
   //
   // The whole mirror goes, not a tracked span: the application does not
   // truthfully report what it wrote, and may still be writing.
+  //
+  // The cost this accepts, stated because every reference avoids it: a lock
+  // held across several draws pays a rename and a whole-mirror copy per draw,
+  // where wined3d reuses the client address with no upload for a coherent BO
+  // and DXVK's direct NOOVERWRITE path copies nothing. They can, because their
+  // lock pointer aliases the memory the draw reads; ours cannot alias it, so
+  // the mirror has to be carried across. Honouring the locked range instead
+  // was measured and refused: 36.6% of NOOVERWRITE refreshes write OUTSIDE the
+  // range the application declared.
   if (FAILED(renameDynamicBuffer(
           m_device, m_dynamic.ptr(), m_device->m_currentCmdSeq,
           m_device->m_cachedSignaled.load(std::memory_order_acquire)

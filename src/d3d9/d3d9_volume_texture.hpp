@@ -18,9 +18,9 @@ namespace dxmt {
 
 class MTLD3D9Device;
 
-// IDirect3DVolumeTexture9: 3D texture used for color-grading LUTs,
-// volume rendering, and fluid-sim tables. WMTTextureType3D + per-level
-// MTLD3D9Volume, CPU mirror as std::vector (no Metal-buffer wrapper).
+// IDirect3DVolumeTexture9: WMTTextureType3D plus one MTLD3D9Volume per level.
+// The CPU mirror is a D3D9Memory allocation with no Metal-buffer wrapper,
+// unlike the 2D texture's.
 // Block-compressed (DXTn) volumes have no Metal 3D texture, so they exist
 // only as a mirror-backed SCRATCH staging copy with a null m_texture; the
 // mirror is sized in block rows (rowPitch x RowCount x depth).

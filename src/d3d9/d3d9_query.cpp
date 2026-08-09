@@ -112,7 +112,7 @@ MTLD3D9Query::Issue(DWORD dwIssueFlags) {
   dxmt::perf::addFrameCounter(m_device->frameStats(), &dxmt::FrameStatistics::frame_query_issue_count);
   // D3DISSUE_BEGIN starts a query (only OCCLUSION uses BEGIN; EVENT
   // and TIMESTAMP are END-only). D3DISSUE_END signals the GPU to
-  // capture the current value. wined3d query.c d3d9_query_Issue
+  // capture the current value. wine dlls/d3d9 query.c d3d9_query_Issue
   // accepts both flags as a no-op on unsupported types.
   if (dwIssueFlags & D3DISSUE_BEGIN) {
     if (m_type == D3DQUERYTYPE_OCCLUSION) {
@@ -332,8 +332,11 @@ MTLD3D9Query::getDataImpl(void *pData, DWORD dwSize, DWORD dwGetDataFlags) {
     return D3D_OK;
   }
   case D3DQUERYTYPE_TIMESTAMPFREQ: {
-    // 1 GHz so TIMESTAMP values are interpretable as nanoseconds.
-    // wined3d uses the same convention for software-timestamped paths.
+    // 1 GHz, which follows from TIMESTAMP being a host nanosecond clock here
+    // rather than a GPU tick counter: reporting the frequency the timestamps
+    // are actually in is what makes a TIMESTAMP delta divide out to seconds.
+    // A reference with real GPU timestamps derives this from the hardware
+    // tick period instead.
     UINT64 freq = 1000000000ull;
     std::memcpy(pData, &freq, dwSize < sizeof(freq) ? dwSize : sizeof(freq));
     return D3D_OK;
