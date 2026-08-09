@@ -7109,9 +7109,14 @@ MTLD3D9Device::BuildDrawCapture() {
   // vb_slots is value-initialized (zero-filled) by the struct default
   // ctor (= {}), so unbound slots already report buffer=0,gpu_address=0.
   // The bound buffer pointer is the single source of truth for stream
-  // liveness; wined3d (context.c wined3d_stream_info_from_declaration)
-  // and DXVK both derive it per draw rather than trusting a cached
-  // mask.
+  // liveness, which costs a scan of all sixteen slots per draw. Both
+  // references keep a bound-slot mask instead and iterate its set bits: DXVK
+  // maintains one at SetStreamSource, wined3d walks its stream_info use map.
+  // Doing the same here means keeping a mask correct across five writers of
+  // this array, including a state-block Apply that restores the slots wholesale,
+  // and a mask that drifts renders the wrong geometry. The scan is a pointer
+  // test per slot; the mask is worth taking only together with the wider
+  // per-draw capture work, not on its own.
   for (uint32_t s = 0; s < D3D9_MAX_VERTEX_STREAMS; ++s) {
     auto *vb = m_vertexBuffers[s].ptr();
     if (!vb)
@@ -9842,16 +9847,10 @@ MTLD3D9Device::ResolveBatchedDrawForChunk(
   // every POSITIONT draw takes the generated path whatever is bound.
   if (!decl || !rt0)
     return false;
-  bool decl_pretransformed = false;
-  if (decl && vs) {
-    for (UINT i = 0; i < decl->elementCount(); ++i) {
-      const D3DVERTEXELEMENT9 &e = decl->elements()[i];
-      if (e.Stream != 0xFF && e.Usage == D3DDECLUSAGE_POSITIONT) {
-        decl_pretransformed = true;
-        break;
-      }
-    }
-  }
+  // Read the flag the declaration derived at creation rather than rescanning
+  // its elements: this runs on every draw with a shader bound, outside the
+  // cluster cache, so the scan was the per-draw cost of a fixed property.
+  bool decl_pretransformed = decl && vs && decl->hasPositionT();
   // A bound vertex shader that references the extended constant file (c256..)
   // cannot run in hardware vertex processing. The caller-side gate rejects the
   // first such draw; every draw after falls back to fixed-function vertex
@@ -9875,8 +9874,12 @@ MTLD3D9Device::ResolveBatchedDrawForChunk(
   const DWORD *rs = pod.render_states->v;
   const DWORD(*samp_states)[D3DSAMP_DMAPOFFSET + 1] = pod.sampler_states->v;
 
-  // Cluster cache: pod/ref pointer-equality implies byte-equality.
-  // ~80% hit rate; per-hit saves PSO lookup, 16 per-stage sampler/view operations, compiles.
+  // Cluster cache: pod/ref pointer-equality implies byte-equality. A hit saves
+  // the PSO lookup, sixteen per-stage sampler and view operations, and any
+  // compile. It requires consecutive draws to share one snapshot, so it fires
+  // only when nothing dirtied the snapshot in between: measured at 13% of draws
+  // on a heavy scene, not the majority. Rank work inside the miss path
+  // accordingly, and do not treat this as a path that rarely runs.
   bool up_vb = bd.override_vb_buffer != 0;
   bool up_ib = bd.override_ib_buffer != 0;
   bool indexed = (bd.type == BatchedDraw::kIndexed);
@@ -10053,8 +10056,9 @@ MTLD3D9Device::ResolveBatchedDrawForChunk(
   }
 
   // ---- vbuf table from m_constRingResolve ----
-  // Cache slot_mask + per-slot (base_addr, stride, length); ~80% hit
-  // rate avoids ~800 allocates/frame.
+  // Cache slot_mask + per-slot (base_addr, stride, length). Same cluster
+  // condition as above, so the same measured 13%: it avoids the allocates on
+  // that fraction of draws rather than on most of them.
   struct VbufEntry {
     uint64_t base_addr;
     uint32_t stride;
@@ -10205,7 +10209,8 @@ MTLD3D9Device::ResolveBatchedDrawForChunk(
 
   // Reuse prior draw's uploads if pod_snapshot pointer equals (implies byte-equality)
   // and the def-stamping shaders match. VS/PS constants, clip planes
-  // live on pod. ~80% hit rate skips 8 KB memcpy+mutex.
+  // live on pod. Skips an 8 KB memcpy and a mutex on the draws where the
+  // snapshot carried over, which is the same measured 13%.
   // ffp_texcoord_width (decl-derived, feeds the FFP texture-matrix fold) and the
   // DS-bound bit (gates the POSITIONT z remap) are NOT on the pod snapshot, so a
   // SetVertexDeclaration / SetDepthStencilSurface between two same-pod draws
