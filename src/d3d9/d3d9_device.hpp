@@ -1792,6 +1792,15 @@ private:
   float m_ffpNormal[3][4] = {};
   bool m_ffpFogCoordW = false;
   bool m_ffpWVPStale = true;
+  // The first eight enabled lights, already transformed into view space, in the
+  // layout the snapshot wants. Rebuilt when a light, an enable flag, or the view
+  // transform changes, rather than per draw: the FFP axis is one block, so
+  // without this a SetMaterial re-transforms every light for a change that
+  // touched none of them. wined3d keeps lighting on its own dirty section for
+  // the same reason.
+  float m_ffpLightsView[8][28] = {};
+  uint32_t m_ffpLightsViewCount = 0;
+  bool m_ffpLightsViewStale = true;
 
   // FFP material, default-constructed all-zero: wined3d
   // (stateblock_state_init_default leaves it zero), DXVK and d9vk all default

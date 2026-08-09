@@ -358,6 +358,7 @@ MTLD3D9StateBlock::Apply() {
     // Same as texture_stage_states: the restored transforms must stale
     // the precomputed product and dirty the snapshot axis.
     m_device->m_ffpWVPStale = true;
+    m_device->m_ffpLightsViewStale = true;
     pod_dirty |= dxmt::D9ES_DIRTY_FFP;
   }
   if (m_changes.clip_planes) {
@@ -533,6 +534,7 @@ MTLD3D9StateBlock::Apply() {
       }
       m_device->m_lights[idx] = m_snapLights[idx];
       m_device->m_lightEnables[idx] = m_snapLightEnables[idx];
+      m_device->m_ffpLightsViewStale = true;
     }
     // Restored lights feed FFP vertex lighting; dirty the FFP axis the same way
     // SetLight / LightEnable do so the encode side rebuilds.

@@ -679,6 +679,7 @@ MTLD3D9Device::resetStateToDefaults(bool enableAutoDepthStencil) {
     m_transforms[i] = m;
   }
   m_ffpWVPStale = true;
+  m_ffpLightsViewStale = true;
   // SetStreamSourceFreq defaults to 1 per stream. Push SetRef(null)
   // ops alongside the calling-thread shadow clears so m_encodeSideRefs
   // stays in lockstep with the post-Reset zero-state; without these
@@ -6027,6 +6028,7 @@ MTLD3D9Device::SetTransform(D3DTRANSFORMSTATETYPE State, const D3DMATRIX *pMatri
   // capture; texture transforms join the product's consumers with the
   // texcoord-transform milestone, so every index dirties the axis.
   m_ffpWVPStale = true;
+  m_ffpLightsViewStale = true;
   m_encShadowDirty |= dxmt::D9ES_DIRTY_FFP;
   return D3D_OK;
 }
@@ -6060,6 +6062,7 @@ MTLD3D9Device::MultiplyTransform(D3DTRANSFORMSTATETYPE State, const D3DMATRIX *p
   // Same latch as SetTransform: the precomputed product goes stale and
   // the snapshot axis must recapture.
   m_ffpWVPStale = true;
+  m_ffpLightsViewStale = true;
   m_encShadowDirty |= dxmt::D9ES_DIRTY_FFP;
   return D3D_OK;
 }
@@ -6162,8 +6165,10 @@ MTLD3D9Device::SetLight(DWORD Index, const D3DLIGHT9 *pLight) {
     enables.resize(Index + 1, FALSE);
   }
   lights[Index] = *pLight;
-  if (!m_inStateBlockRecord)
+  if (!m_inStateBlockRecord) {
     m_encShadowDirty |= dxmt::D9ES_DIRTY_FFP;
+    m_ffpLightsViewStale = true;
+  }
   if (m_inStateBlockRecord) {
     m_recordingBlock->m_changes.lights = true;
     // Track this light index so Apply restores only the touched lights, not the
@@ -6220,8 +6225,10 @@ MTLD3D9Device::LightEnable(DWORD Index, BOOL Enable) {
     lights[Index] = def;
   }
   enables[Index] = Enable ? TRUE : FALSE;
-  if (!m_inStateBlockRecord)
+  if (!m_inStateBlockRecord) {
     m_encShadowDirty |= dxmt::D9ES_DIRTY_FFP;
+    m_ffpLightsViewStale = true;
+  }
   if (m_inStateBlockRecord) {
     m_recordingBlock->m_changes.lights = true;
     // Track this light index so Apply restores only the touched lights, not the
@@ -7387,27 +7394,38 @@ MTLD3D9Device::QueueBatchedDraw(BatchedDraw &&draw) {
       snap->ffp_fog_coord_w = m_ffpFogCoordW ? 1u : 0u;
       static_assert(sizeof(ffp->material) <= sizeof(D3DMATERIAL9), "");
       std::memcpy(ffp->material, &m_material, sizeof(ffp->material));
-      uint32_t li = 0;
-      for (size_t i = 0; i < m_lights.size() && li < 8; ++i) {
-        if (!m_lightEnables[i])
-          continue;
-        static_assert(sizeof(D3DLIGHT9) <= sizeof(ffp->lights[0]), "");
-        std::memcpy(ffp->lights[li], &m_lights[i], sizeof(D3DLIGHT9));
-        // D3D9 light position/direction are world space, but the vertex pipe
-        // lights in view space (eye position/normal come from the world*view
-        // columns). Both references upload the light already view-transformed;
-        // pre-multiply here by D3DTS_VIEW (m_transforms[0]) so a non-identity
-        // camera does not leave point lights displaced by V^-1 and directional
-        // lights rotating with the view. The shader normalizes directions, so
-        // leaving the view's scale in Direction is harmless.
-        auto *snap_light = reinterpret_cast<D3DLIGHT9 *>(ffp->lights[li]);
-        const float pos_in[3] = {m_lights[i].Position.x, m_lights[i].Position.y, m_lights[i].Position.z};
-        const float dir_in[3] = {m_lights[i].Direction.x, m_lights[i].Direction.y, m_lights[i].Direction.z};
-        transform_row_vec3(m_transforms[0], pos_in, 1.0f, &snap_light->Position.x);
-        transform_row_vec3(m_transforms[0], dir_in, 0.0f, &snap_light->Direction.x);
-        ++li;
+      // The enabled lights, already in view space. Rebuilt only when a light,
+      // an enable, or a transform moved: the FFP axis is one block, so a
+      // SetMaterial dirties it too, and re-transforming every light for a
+      // change that touched none of them is work the reference does not do.
+      if (m_ffpLightsViewStale) {
+        uint32_t li = 0;
+        for (size_t i = 0; i < m_lights.size() && li < 8; ++i) {
+          if (!m_lightEnables[i])
+            continue;
+          static_assert(sizeof(D3DLIGHT9) <= sizeof(m_ffpLightsView[0]), "");
+          std::memcpy(m_ffpLightsView[li], &m_lights[i], sizeof(D3DLIGHT9));
+          // D3D9 light position/direction are world space, but the vertex pipe
+          // lights in view space (eye position/normal come from the world*view
+          // columns). Both references upload the light already view-transformed;
+          // pre-multiply by D3DTS_VIEW (m_transforms[0]) so a non-identity
+          // camera does not leave point lights displaced by V^-1 and directional
+          // lights rotating with the view. The shader normalizes directions, so
+          // leaving the view's scale in Direction is harmless.
+          auto *cached = reinterpret_cast<D3DLIGHT9 *>(m_ffpLightsView[li]);
+          const float pos_in[3] = {m_lights[i].Position.x, m_lights[i].Position.y, m_lights[i].Position.z};
+          const float dir_in[3] = {m_lights[i].Direction.x, m_lights[i].Direction.y, m_lights[i].Direction.z};
+          transform_row_vec3(m_transforms[0], pos_in, 1.0f, &cached->Position.x);
+          transform_row_vec3(m_transforms[0], dir_in, 0.0f, &cached->Direction.x);
+          ++li;
+        }
+        m_ffpLightsViewCount = li;
+        m_ffpLightsViewStale = false;
       }
-      snap->ffp_light_count = li;
+      static_assert(sizeof(ffp->lights[0]) == sizeof(m_ffpLightsView[0]), "");
+      if (m_ffpLightsViewCount)
+        std::memcpy(ffp->lights, m_ffpLightsView, m_ffpLightsViewCount * sizeof(m_ffpLightsView[0]));
+      snap->ffp_light_count = m_ffpLightsViewCount;
       static_assert(sizeof(ffp->tex_mats) == sizeof(D3DMATRIX) * 8, "");
       std::memcpy(ffp->tex_mats, &m_transforms[2], sizeof(ffp->tex_mats));
     }
