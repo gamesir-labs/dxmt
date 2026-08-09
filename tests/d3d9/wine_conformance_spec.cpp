@@ -431,6 +431,13 @@ TEST_P(WineConformanceTest, MatchesBaseline) {
 // module into a clean-looking result, so they share one serial group and run
 // one at a time. They are also minutes long, which the scheduler would
 // otherwise cost at a single unit and pack into a parallel shard.
+// Marking the group is not enough on its own: the scheduler decides what runs
+// alone from the serial registry, and reads the group only to let tests that
+// are ALREADY serial share one worker. Without this line the modules were
+// grouped and still ran four at a time, which is what the scheduler banner
+// reports.
+static const ::dxmt::test::SerialTestRegistration
+    dxmt_serial_wine_conformance("Wine/WineConformanceTest.*");
 DXMT_GROUP_SERIAL_TESTS("Wine/WineConformanceTest.*", "d3d9-wine-conformance");
 DXMT_SLOW_TEST_PATTERN("Wine/WineConformanceTest.*/*");
 
