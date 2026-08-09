@@ -163,16 +163,18 @@ to_mtl_attr_format(BYTE type) {
   case D3DDECLTYPE_FLOAT16_4:
     return 27; // Half4
   case D3DDECLTYPE_DEC3N:
-    // 10-10-10-2 signed normalized: Metal's Int1010102Normalized is
-    // exact: 10-bit signed integer x/y/z normalized to [-1, 1] + 2-bit
-    // signed w. Game engines pack tangent-space vectors here.
+    // 10-10-10-2 signed normalized. Metal's Int1010102Normalized carries the
+    // x, y and z lanes exactly, both normalizing by 511. Its fourth lane is a
+    // 2-bit signed field where D3D9 has no w at all, so the unpack forces the
+    // (x, y, z, 1) expansion. Game engines pack tangent-space vectors here.
     return 40; // Int1010102Normalized
   case D3DDECLTYPE_UDEC3:
-    // 10-10-10-2 unsigned UNnormalized per D3D9 spec. Metal has no
-    // unnormalized 10-bit attribute format, so apps that wrote
-    // x in [0,1023] read x in [0,1]. DXVK keeps the raw values via
-    // Vulkan's USCALED format; Metal has no equivalent. Accepted gap.
-    return 41; // UInt1010102Normalized
+    // 10-10-10-2 unsigned and UNnormalized per the D3D9 spec, expanding to
+    // (x, y, z, 1). Metal has no unnormalized 10-bit attribute format, so this
+    // is dxmt's own format value and the shader shifts the channels out of the
+    // raw word. Reusing Metal's normalized format would hand the shader
+    // x in [0, 1] where the app wrote x in [0, 1023].
+    return DXSO_ATTR_FORMAT_UDEC3;
   default:
     return 0; // Invalid
   }

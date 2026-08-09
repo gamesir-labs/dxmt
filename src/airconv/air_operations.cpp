@@ -203,6 +203,14 @@ AIRBuilderResult unpack_fvec4_from_addr(
   if (format == MTLAttributeFormat::UChar4Normalized_BGRA) {
     ret = builder.CreateShuffleVector(ret, {2, 1, 0, 3});
   }
+  if (format == MTLAttributeFormat::Int1010102Normalized) {
+    // D3DDECLTYPE_DEC3N expands to (x, y, z, 1). Its two high bits are not a w
+    // channel: both references declare three components and mark the fourth
+    // unused. Metal's unpack has no way to know that and hands back the 2-bit
+    // field, so put the D3D9 default there. The x, y and z lanes need nothing:
+    // D3D9 normalizes by 511 and so does Metal's 10-bit signed rule.
+    ret = builder.CreateInsertElement(ret, co_yield get_float(1), (int)3);
+  }
   if (dst_type == types._float) {
     ret = builder.CreateInsertElement(
       llvm::PoisonValue::get(types._float4), ret, (int)0
@@ -426,6 +434,32 @@ AIRBuilderResult pull_vec4_from_addr_checked(
     value = builder.CreateShuffleVector(value, {0, 1, 2, -1});
     value = builder.CreateInsertElement(value, co_yield get_int(1), (int)3);
     break;
+  case MTLAttributeFormat::UInt1010102: {
+    // D3DDECLTYPE_UDEC3: three unsigned 10-bit integers expanded to
+    // (x, y, z, 1), NOT normalized, so the bits arrive as a plain word and the
+    // channels shift out here. The caller's integer to float conversion then
+    // presents them the way D3D9 does, the same route UBYTE4 takes.
+    //
+    // Unpacking as unorm and scaling by 1023 would look equivalent and is not:
+    // it divides and remultiplies in float, and the canonical payload here is a
+    // blend index that a consumer truncates, so a result a fraction below the
+    // integer selects the wrong bone. The two high bits are not a w channel;
+    // both references treat the fourth channel as unused, so w is the constant 1.
+    pvalue bits = co_yield load_from_device_buffer(
+      types._int, base_addr, byte_offset, 0, 4
+    );
+    value = builder.CreateInsertElement(
+      llvm::PoisonValue::get(types._int4), builder.CreateAnd(bits, 0x3ffu), (int)0
+    );
+    value = builder.CreateInsertElement(
+      value, builder.CreateAnd(builder.CreateLShr(bits, 10), 0x3ffu), (int)1
+    );
+    value = builder.CreateInsertElement(
+      value, builder.CreateAnd(builder.CreateLShr(bits, 20), 0x3ffu), (int)2
+    );
+    value = builder.CreateInsertElement(value, co_yield get_int(1), (int)3);
+    break;
+  }
   case MTLAttributeFormat::UInt4:
   case MTLAttributeFormat::Int4:
     value = co_yield load_from_device_buffer(

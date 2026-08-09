@@ -442,6 +442,15 @@ struct DXSO_SHADER_COMPILATION_ARGUMENT_DATA {
    semantic to; the host resolves that mapping by walking the
    declaration + VS metadata before compile. `format` is a
    WMTAttributeFormat. */
+/* D3DDECLTYPE_UDEC3 has no Metal attribute format: its three 10-bit channels
+   are unsigned and NOT normalized, and Metal only offers the normalized pair.
+   So `format` carries this dxmt-private value for it, chosen far above every
+   real MTLVertexFormat. That is safe only because the Direct3D 9 path fetches
+   vertices in the shader, so the value reaches the DXSO codegen and never an
+   attribute descriptor; the Direct3D 11 path hands its format straight to
+   Metal and must keep using the real one. */
+#define DXSO_ATTR_FORMAT_UDEC3 0x1000u
+
 struct DXSO_IA_INPUT_ELEMENT {
   uint32_t reg;
   uint32_t slot;
@@ -629,8 +638,8 @@ struct DXSO_SHADER_PS_FOG_DATA {
    variant serves every point size instead of minting one per value.
    The host gates the marker on primitive_type == D3DPT_POINTLIST (plus,
    for a VS that does not write oPts, a clamped size that leaves the 1.0
-   default), matching DXVK src/dxso/dxso_compiler.cpp emitPsize, which
-   clamps the same render-state block at the same epilogue point. */
+   default). DXVK clamps at the same epilogue point against the point-size
+   values it supplies as push data. */
 struct DXSO_SHADER_VS_POINT_SIZE_DATA {
   void *next;
   enum DXSO_SHADER_COMPILATION_ARGUMENT_TYPE type;
