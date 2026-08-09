@@ -41,6 +41,16 @@ public:
     return m_backBuffers.empty() ? nullptr : m_backBuffers[0].ptr();
   }
 
+  // The slot holding the most recently presented image, which is what
+  // GetFrontBufferData has to read. Rotation moves slot 0's content to the
+  // last slot, so the front buffer is the back of the chain rather than the
+  // front of it. DXVK answers the same question the same way, returning
+  // m_backBuffers.back() for exactly this reason.
+  MTLD3D9Surface *
+  frontBuffer() const {
+    return m_backBuffers.empty() ? nullptr : m_backBuffers.back().ptr();
+  }
+
   // The window the chain blits to, as resolved by the interface layer
   // from hDeviceWindow / hFocusWindow at create time. Null on headless
   // chains. Used by CheckDeviceState to mirror the Present-path
@@ -233,13 +243,10 @@ private:
   // rate is otherwise sampled once at ctor and goes stale when the window is
   // dragged to a display with a different refresh rate.
   HMONITOR m_lastMonitor = nullptr;
-  // Display refresh rate the chain is on, queried at ctor via
-  // wsi::getCurrentDisplayMode(MonitorFromWindow) and re-probed by Present
-  // when m_lastMonitor changes. Drives the PresentationInterval=TWO/THREE/
-  // FOUR dwell math: apps that ask for 2x vsync on a 120Hz display want a
-  // 16.67 ms dwell (60 fps), not the 33.33 ms (30 fps) the prior
-  // 60Hz-hardcoded value gave them. Falls back to 60.0 on detection failure
-  // (headless smokes, monitor query returning zero, etc).
+  // Display refresh rate the chain is on. Drives the PresentationInterval
+  // TWO/THREE/FOUR dwell, which is a multiple of the real vblank interval
+  // rather than of an assumed 60 Hz. Falls back to 60.0 when the monitor
+  // query fails (headless chains).
   double m_refreshRateHz = 60.0;
   // Per-swapchain gamma ramp storage. Lazily initialized to identity
   // on first GetGammaRamp / SetGammaRamp. m_gammaSet tracks whether

@@ -496,6 +496,12 @@ public:
   HRESULT STDMETHODCALLTYPE CheckDeviceState(HWND hDestinationWindow) override;
 
   bool fullscreenOwnsDisplay();
+  // The single occlusion answer for a swapchain window. CheckDeviceState and
+  // the Present-side no-display branch both route through it: wine keeps one
+  // device_state and answers both callers from it (d3d9 device.c), so an app
+  // that polls one while presenting through the other cannot be told two
+  // different stories about the same instant.
+  HRESULT occlusionStatus(HWND hWindow);
   // Drives the non-Ex fullscreen focus-loss transitions from the poll
   // points; see the definition for the wined3d WM_ACTIVATEAPP model.
   void updateNonExLostState();
