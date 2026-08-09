@@ -25,9 +25,13 @@ namespace dxmt {
 
 // Spec-shape validation for D3DPRESENT_PARAMETERS. Rejects out-of-range
 // SwapEffect (Ex adds FLIPEX), BackBufferCount (cap 3 non-Ex / 30 Ex, plus the
-// COPY single-backbuffer rule), and PresentationInterval. Multisampling is not
-// validated here: the backbuffer is presented single-sampled regardless, so an
-// MSAA request is accepted and downgraded rather than rejected. Pure read.
+// COPY single-backbuffer rule), PresentationInterval, and a lockable backbuffer
+// asked to be multisampled. An MSAA request on its own is accepted and
+// downgraded, since the backbuffer is presented single-sampled regardless, but
+// pairing it with LOCKABLE_BACKBUFFER has no coherent meaning: the samples are
+// resolved only at present, so there is nothing for Lock to hand back. Native
+// rejects that pair and wined3d validates it on create and on reset, so a title
+// asking for both expects the failure and takes another path. Pure read.
 //
 // Returns the name of the field that failed, or nullptr when the params are
 // acceptable, so a caller can say which rule rejected a create or a Reset. A
@@ -40,6 +44,10 @@ PresentParamsRejectReason(const D3DPRESENT_PARAMETERS &p, bool isEx) {
 
   if (p.SwapEffect == 0 || p.SwapEffect > highestSwapEffect)
     return "SwapEffect";
+
+  // CreateRenderTarget rejects the same pair; this is the swapchain half.
+  if (p.MultiSampleType != D3DMULTISAMPLE_NONE && (p.Flags & D3DPRESENTFLAG_LOCKABLE_BACKBUFFER))
+    return "Flags";
   if (p.BackBufferCount > highestBackBufferCount)
     return "BackBufferCount";
   if (p.SwapEffect == D3DSWAPEFFECT_COPY && p.BackBufferCount > 1)

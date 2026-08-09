@@ -6752,6 +6752,15 @@ MTLD3D9Device::SetPaletteEntries(UINT PaletteNumber, const PALETTEENTRY *pEntrie
   D9DeviceLock lock = LockDevice();
   if (pEntries == nullptr)
     return D3DERR_INVALIDCALL;
+  // peFlags carries the entry's alpha, and a device that does not advertise
+  // D3DPTEXTURECAPS_ALPHAPALETTE accepts only fully opaque palettes. This one
+  // does not advertise it, because the palettised formats are scratch-only
+  // here and no sampler consults a palette, so reject anything that asks for
+  // per-entry alpha rather than storing a palette that would never be honoured.
+  for (uint32_t i = 0; i < 256; ++i) {
+    if (pEntries[i].peFlags != 0xFF)
+      return D3DERR_INVALIDCALL;
+  }
   // 256 entries per D3D9 spec; emplace-or-overwrite the map slot.
   auto it = m_texturePalettes.find(PaletteNumber);
   if (it == m_texturePalettes.end()) {
