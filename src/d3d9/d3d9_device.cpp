@@ -1968,6 +1968,26 @@ MTLD3D9Device::GetNumberOfSwapChains() {
   D9DeviceLock lock = LockDevice();
   return 1;
 }
+namespace {
+// Hides the window traffic a device makes on its own behalf from the
+// application, and restores the previous setting rather than clearing it since
+// these regions nest. wined3d wraps every window state change the same way
+// (swapchain.c, around set_window_state_thread and the fullscreen to fullscreen
+// reposition). It is not cosmetic: applications call Reset from their WM_SIZE
+// handler, so a resize the device performed as part of Reset has to stay
+// invisible or the two recurse without end.
+struct FilteredWindowMessages {
+  explicit FilteredWindowMessages(bool &filtered) : m_filtered(filtered), m_saved(filtered) {
+    filtered = true;
+  }
+  ~FilteredWindowMessages() {
+    m_filtered = m_saved;
+  }
+  bool &m_filtered;
+  const bool m_saved;
+};
+} // namespace
+
 // Port of wined3d_swapchain_state_setup_fullscreen (dlls/wined3d/swapchain.c):
 // resize + restyle the device window to a borderless fullscreen rect. On first
 // entry the pre-fullscreen style/exstyle/rect are saved for restore; a later
@@ -1981,6 +2001,7 @@ MTLD3D9Device::enterFullscreenWindow(HWND window, UINT width, UINT height) {
   // The app asked dxmt not to touch its window; leave it exactly as is.
   if (m_creationParams.BehaviorFlags & D3DCREATE_NOWINDOWCHANGES)
     return;
+  FilteredWindowMessages filtered(m_focusMessagesFiltered);
 
   // Fullscreen rect: the window's monitor origin plus the backbuffer extent.
   // Single-monitor desktops sit at (0, 0); a read-only MonitorFromWindow keeps
@@ -2028,6 +2049,7 @@ MTLD3D9Device::leaveFullscreenWindow() {
   if (!window)
     return;
   m_fullscreenWindow = nullptr;
+  FilteredWindowMessages filtered(m_focusMessagesFiltered);
 
   LONG liveStyle = GetWindowLongW(window, GWL_STYLE);
   LONG liveExStyle = GetWindowLongW(window, GWL_EXSTYLE);
@@ -2114,6 +2136,7 @@ focusWindowProc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam) {
 // manager's job, which is why the conformance test has to do it by hand.
 void
 MTLD3D9Device::onFocusActivation(bool activated) {
+
   // Windowed devices never subclass the focus window, so this cannot fire for
   // one; guard anyway since Reset can flip a device windowed under the hook.
   if (!m_implicitSwapChain || m_implicitSwapChain->windowed())
@@ -2225,6 +2248,19 @@ MTLD3D9Device::hookFocusWindowProc(HWND fallbackWindow) {
   // register a window it already holds.
   if (GetPropW(focus, kFocusProcProp))
     return;
+  // Activate the focus window as it is acquired, which is what
+  // wined3d_device_acquire_focus_window does: its SetWindowPos carries neither
+  // SWP_NOACTIVATE nor SWP_NOZORDER, so the window is raised and the process
+  // becomes the active application. Every other window call on this path is
+  // deliberately non-activating, and skipping it here costs the whole
+  // focus-loss machine: an application that was never active is sent no
+  // WM_ACTIVATEAPP when the foreground moves away, so a fullscreen device
+  // would keep reporting that it owns the display from the background.
+  SetWindowPos(focus, nullptr, 0, 0, 0, 0, SWP_NOSIZE | SWP_NOMOVE);
+  // This runs BEFORE the subclass below: SetWindowPos delivers the activation
+  // messages synchronously, and wined3d likewise acquires and activates the
+  // focus window before its state proc exists, so they reach the application's
+  // own proc rather than re-entering a device that is still being built.
   // Match the window's existing ANSI/Unicode flavour so the forwarding path
   // stays consistent with the app's own proc. Cache it so the unhook restores
   // through the same slot even if the window's flavour is queried later.
@@ -4680,7 +4716,7 @@ MTLD3D9Device::frontBufferReadback(MTLD3D9SwapChain *chain, IDirect3DSurface9 *p
   if (dd.Pool != D3DPOOL_SYSTEMMEM && dd.Pool != D3DPOOL_SCRATCH)
     return D3DERR_INVALIDCALL;
 
-  MTLD3D9Surface *front = chain->backBuffer();
+  MTLD3D9Surface *front = chain->frontBuffer();
   // A failed Reset can leave the swapchain without a backbuffer; bail rather
   // than dereference a null front buffer.
   if (!front)
@@ -12070,33 +12106,44 @@ MTLD3D9Device::fullscreenOwnsDisplay() {
   return !m_fullscreenOccluded.load(std::memory_order_relaxed);
 }
 
-HRESULT STDMETHODCALLTYPE
-MTLD3D9Device::CheckDeviceState(HWND hDestinationWindow) {
-  D9DeviceLock lock = LockDevice();
+HRESULT
+MTLD3D9Device::occlusionStatus(HWND hWindow) {
   // Fullscreen: display ownership keys the answer, polled off the
   // foreground window (wine d3d9 device.c CheckDeviceState keys the same
   // branches off its focus-message device state; its FIXME notes the
   // cross-device case is unhandled there too). A window other than the
   // device window is occluded exactly while the fullscreen chain owns
   // the display; the device window itself is occluded once it loses it.
-  // The caller's null stays null here: wine compares it raw, and the
-  // tests rely on null meaning "some other window".
+  //
+  // Minimization deliberately does not enter here. The fullscreen
+  // focus-loss path minimizes the device window itself and the regain
+  // path restores geometry without clearing the icon state, so a
+  // minimized window is the normal shape of a reactivated device; keying
+  // on it would report a reactivated device as permanently occluded.
   if (m_implicitSwapChain && !m_implicitSwapChain->windowed()) {
     const bool owns_display = fullscreenOwnsDisplay();
-    if (hDestinationWindow != m_implicitSwapChain->hWindow())
+    if (hWindow != m_implicitSwapChain->hWindow())
       return owns_display ? S_PRESENT_OCCLUDED : D3D_OK;
     return owns_display ? D3D_OK : S_PRESENT_OCCLUDED;
   }
-  // Windowed: DXVK's shape, the minimized probe, so Ex apps that poll
-  // CheckDeviceState instead of letting Present surface the status stop
-  // rendering full-speed while minimized. Falls back to the swapchain's
-  // own window when the caller passes null (DXVK does the same).
-  HWND hWindow = hDestinationWindow;
-  if (!hWindow && m_implicitSwapChain)
-    hWindow = m_implicitSwapChain->hWindow();
-  if (hWindow && wsi::isMinimized(hWindow))
-    return S_PRESENT_OCCLUDED;
+  // Windowed devices are never occluded. DXVK reports occlusion here from a
+  // minimized probe, so that an Ex app polling this instead of reading
+  // Present's status stops rendering full-speed behind an icon, and that is
+  // the more useful answer. It is not the answer native gives: a windowed
+  // device that Reset out of fullscreen is left minimized, and the reference
+  // still reports it presentable (wine d3d9 device.c CheckDeviceState returns
+  // D3D_OK for any windowed swapchain). An app that wants to idle while
+  // minimized has IsIconic; one that trusts this call must not be told its
+  // device stopped presenting when it did not.
   return D3D_OK;
+}
+
+HRESULT STDMETHODCALLTYPE
+MTLD3D9Device::CheckDeviceState(HWND hDestinationWindow) {
+  D9DeviceLock lock = LockDevice();
+  // The caller's null stays null: wine compares it raw against the device
+  // window, so a null reads as some other window rather than as this one.
+  return occlusionStatus(hDestinationWindow);
 }
 // validateCreateExUsage (shared Usage-bit gate for the three Create*Ex
 // methods) lives in d3d9_create_validation.hpp, free of the device surface.

@@ -781,19 +781,22 @@ MTLD3D9SwapChain::Present(
   // spec shape), D3D_OK otherwise.
   if (HRESULT state = m_device->presentStateGate(); state != D3D_OK)
     return state;
-  // Foreground-lost probe. d3d11 has the same shape at
-  // d3d11_swapchain.cpp. For Ex devices the spec return is
-  // S_PRESENT_OCCLUDED; for non-Ex devices MSDN's "Lost Devices" page
-  // says the DEVICELOST transition is driven by focus loss, but native
-  // doesn't synthesize DEVICELOST on a simple minimize; it just stops
-  // updating the front buffer. We follow that: minimized + Ex returns
-  // S_PRESENT_OCCLUDED; minimized + non-Ex returns D3D_OK after the
-  // draw queue is drained (so resource lifetimes stay coherent across
-  // the no-display window). Skip if no hWnd (headless smokes).
+  // No-display probe. d3d11 has the same shape at d3d11_swapchain.cpp.
+  // MSDN's "Lost Devices" page says the DEVICELOST transition is driven
+  // by focus loss, but native doesn't synthesize DEVICELOST on a simple
+  // minimize; it just stops updating the front buffer. We follow that:
+  // minimized + non-Ex returns D3D_OK after the draw queue is drained
+  // (so resource lifetimes stay coherent across the no-display window).
+  //
+  // An Ex device takes its status from occlusionStatus, the same answer
+  // CheckDeviceState gives, rather than reporting occluded for the icon
+  // state alone: a fullscreen device is reactivated with its window
+  // still minimized, and the two must not disagree about that instant.
+  // Skip if no hWnd (headless smokes).
   if (m_hWindow && wsi::isMinimized(m_hWindow)) {
     m_device->FlushDrawBatch();
     m_device->flushOpenWork();
-    return m_isEx ? S_PRESENT_OCCLUDED : D3D_OK;
+    return m_isEx ? m_device->occlusionStatus(m_hWindow) : D3D_OK;
   }
   // No in-scene gate: apps Present mid-scene (driver behavior, not spec).
   // D3DPRESENT_FORCEIMMEDIATE is documented FLIPEX-only, but DXVK
