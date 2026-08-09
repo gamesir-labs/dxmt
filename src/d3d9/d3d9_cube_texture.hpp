@@ -169,9 +169,9 @@ public:
   clearMipsDirty() override {
     m_mips_dirty.store(false, std::memory_order_release);
   }
-  // See MTLD3D9Texture::flagAutoGenDirty for rationale: StretchRect-
-  // as-dest of an AUTOGENMIPMAP cube routes through here for the same
-  // lazy-flag protocol UnlockRect uses. Returns whether it marked dirty.
+  // See MTLD3D9Texture::flagAutoGenDirty for rationale: StretchRect-as-dest of
+  // an AUTOGENMIPMAP cube routes through here for the same lazy-flag protocol
+  // UnlockRect uses.
   bool
   flagAutoGenDirty() {
     if (!(m_usage & D3DUSAGE_AUTOGENMIPMAP))

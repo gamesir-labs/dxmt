@@ -94,7 +94,7 @@ buildLevelsAndMirror(
   // textures up front (boot-time atlas builds) avoid paying
   // wsi::aligned_malloc + memset + Metal newBuffer (wine_unix_call) per
   // texture before the data even exists. Per-Lock cost is the same;
-  // the win is on the cold-create path (audit M-PERF #2).
+  // the win is on the cold-create path.
   (void)total_bytes;
   (void)device;
   (void)mirrorBufferOut;
@@ -294,8 +294,12 @@ MTLD3D9Texture::ensureMirror() {
 }
 
 // An app that reads a MANAGED texture back more than this many times keeps its
-// mirror resident: re-downloading on every read would thrash. Mirrors wined3d's
-// download_count > WINED3D_TEXTURE_DYNAMIC_MAP_THRESHOLD guard in evict_sysmem.
+// mirror resident: re-downloading on every read would thrash. Same shape as
+// wined3d's download_count guard in evict_sysmem, deliberately far lower than
+// its threshold of 50, because the two downloads do not cost the same: wined3d
+// reads back from a mapped resource, while re-materializing a level here drains
+// the draw batch and waits on the GPU, so the point where pinning the mirror
+// wins arrives much sooner.
 static constexpr uint32_t kMirrorReadEvictThreshold = 4;
 
 void

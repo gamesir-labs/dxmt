@@ -13,13 +13,12 @@
 #include <cstdint>
 #include <cstring>
 
-// D3D9 point-size de-specialisation. DXVK feeds the point size and its
-// clamp bounds as a uniform, so ONE pipeline serves every size: see
-// dxvk/src/d3d9/d3d9_fixed_function.cpp GetPointSizeInfoVS (the size,
-// D3DRS_POINTSIZE_MIN/_MAX and the POINTSCALE distance attenuation all
-// read the render-state block) and dxso_compiler.cpp emitPsize (the
-// programmable epilogue clamps against the same block). dxmt used to
-// bake those floats into a per-value MTLFunction variant, which turned
+// D3D9 point-size de-specialisation. DXVK feeds the point size and its clamp
+// bounds as shader input rather than baking them in, so ONE pipeline serves
+// every size: it encodes POINTSIZE, POINTSIZE_MIN/_MAX and the POINTSCALE
+// distance attenuation as push data (dxvk d3d9_device.cpp EncodePointSize), and
+// both the fixed-function and programmable paths clamp against that. dxmt used
+// to bake those floats into a per-value MTLFunction variant, which turned
 // a continuously-varying render state into an unbounded pipeline axis.
 //
 // This header carries the pure logic that keeps the variant key
@@ -54,9 +53,8 @@ static constexpr uint64_t kFfpPointPerVertexSentinel = 0x94d049bb133111ebull;
 // fixed-function block a9730f3f uploads so both vertex paths clamp
 // identically. A point clamped to size 0 (an app setting both the size
 // and the minimum to 0) rasterises to nothing, the way real Windows and
-// DXVK (GetPointSizeInfoVS uses the raw minimum) draw it; flooring the
-// minimum at 1 would draw a stray pixel there, wined3d's aliased-point
-// behaviour rather than the hardware's. Raw NaN bounds fall back to the
+// DXVK draw it; flooring the minimum at 1 would draw a stray pixel there,
+// wined3d's aliased-point behaviour rather than the hardware's. Raw NaN bounds fall back to the
 // hardware defaults.
 struct D3D9PointSizeParams {
   float size; // raw D3DRS_POINTSIZE, uniform lane x

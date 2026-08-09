@@ -10,11 +10,20 @@
 
 namespace dxmt {
 
-// THE STORAGE CONTRACT, and it admits no exceptions: no pointer this
-// implementation hands the application ever aliases memory the GPU can wire.
-// Every buffer is staged. Lock returns a host mirror we own and Metal has
-// never seen; the allocation a draw reads is Metal-owned, never handed out,
-// and is refreshed from that mirror.
+// THE STORAGE CONTRACT: no page the application writes is ever referenced by a
+// command buffer. Every buffer is staged. Lock returns a host mirror we own and
+// Metal has never seen; the allocation a draw reads is Metal-owned, never
+// handed out, and is refreshed from that mirror.
+//
+// The condition is stated in terms of what the GPU USES rather than what Metal
+// has been told about, because that is what the livelock below turns on, and
+// because one path relies on the difference: a texture's MANAGED mirror is
+// wrapped in a Metal buffer at d3d9_texture.cpp ensureMirror so the device
+// backing pool can hold a single reference type. That buffer is written to the
+// texture's fields and never bound, never blitted from or to; uploads go
+// through the ring and readback writes the CPU backing. Wrapping alone does not
+// wire a page. If a future change ever gives the GPU work that reads it, the
+// pages the application writes become wired and this contract is broken.
 //
 // DXVK's DetermineMapMode (d3d9_common_buffer.cpp) sends DEFAULT+DYNAMIC down
 // its allowDirectBufferMapping arm instead, aliasing the Lock pointer onto the

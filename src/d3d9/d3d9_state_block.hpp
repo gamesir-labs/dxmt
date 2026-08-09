@@ -22,10 +22,10 @@ class MTLD3D9PixelShader;
 // via d3d9_device.hpp) so the host tier can pin its subset membership; the
 // device's recording arms mark bits on the block's instance directly.
 
-// IDirect3DStateBlock9 snapshots device state and restores via Apply,
-// covering ~30 categories (wined3d stateblock.c semantics).
-// Reference-pinned slots (textures, shaders, buffers) use Com<,false>
-// to pin targets across their lifetime. wined3d is the reference.
+// IDirect3DStateBlock9 snapshots device state and restores via Apply, covering
+// ~30 categories (wined3d stateblock.c semantics). Reference-pinned slots
+// (textures, shaders, buffers) use Com<,false> to pin targets across their
+// lifetime.
 class MTLD3D9StateBlock final : public ComObject<IDirect3DStateBlock9> {
 public:
   MTLD3D9StateBlock(MTLD3D9Device *device, D3DSTATEBLOCKTYPE type);
@@ -90,14 +90,13 @@ private:
   // in the per-render-state changed mask below (the same bookkeeping applies to
   // every category).
   DWORD m_snapRenderStates[256] = {};
-  // Per-category + per-render-state changed mask. CreateStateBlock
-  // (D3DSBT_ALL) sets every bit via markAll(); EndStateBlock-recorded
-  // blocks only set the bits for states actually touched between
-  // Begin/End. Apply restores only the marked entries: wined3d
-  // dlls/wined3d/stateblock.c walks num_contained_render_states with
-  // the same bit logic. dxmt's previous unconditional memcpy would
-  // stomp ALPHABLENDENABLE / ZENABLE / ZWRITEENABLE etc. that the app
-  // had explicitly mutated since the snapshot was taken.
+  // Per-category + per-render-state changed mask. CreateStateBlock (D3DSBT_ALL)
+  // sets every bit via markAll(); EndStateBlock-recorded blocks set only the
+  // bits for states actually touched between Begin/End. Apply restores only the
+  // marked entries, so an unmarked state the app mutated after the snapshot
+  // survives: an unconditional memcpy would stomp ALPHABLENDENABLE, ZENABLE and
+  // ZWRITEENABLE. wined3d stateblock.c walks num_contained_render_states with
+  // the same bit logic.
   D3D9StateBlockChanges m_changes;
   // Sampler state snapshot. Same shape as the device's
   // m_samplerStates: 20 stages x 14 sampler-state types. Indexed by
@@ -113,10 +112,8 @@ private:
   D3DMATRIX m_snapTransforms[10 + 256] = {};
   // User clip planes: 8 planes x 4 floats. Mirrors m_clipPlanes.
   float m_snapClipPlanes[8][4] = {};
-  // Viewport + scissor. Both POD; bitwise copy is the right shape.
   D3DVIEWPORT9 m_snapViewport = {};
   RECT m_snapScissorRect = {};
-  // FVF code (legacy fixed-function bookkeeping).
   DWORD m_snapFvf = 0;
   // Per-stream offset/stride pair. Stored alongside the buffer ref
   // (m_snapVertexBuffers below), so SetStreamSource(slot, buf, off,
@@ -129,7 +126,6 @@ private:
   // table includes WINED3DTS_STREAM_FREQ / DIVIDER together with
   // the source-binding fields.
   UINT m_snapStreamFreq[D3D9_MAX_VERTEX_STREAMS] = {};
-  // FFP material. POD; full struct copy.
   D3DMATERIAL9 m_snapMaterial = {};
   // Shader constant register files: VS + PS, F/I/B each. Sizing
   // matches the device's hardware-VP storage (D3D9_MAX_VS_CONST_F
@@ -161,8 +157,7 @@ private:
   Com<MTLD3D9VertexDeclaration, false> m_snapVertexDeclaration;
   Com<MTLD3D9VertexShader, false> m_snapVertexShader;
   Com<MTLD3D9PixelShader, false> m_snapPixelShader;
-  // FFP lights + per-index enable flags. std::vector copy-assignment
-  // handles allocation and the trivially-copyable element layout.
+  // FFP lights + per-index enable flags.
   std::vector<D3DLIGHT9> m_snapLights;
   std::vector<BOOL> m_snapLightEnables;
   // The light indices this block actually restores (wined3d's
