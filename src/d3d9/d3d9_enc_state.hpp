@@ -7,6 +7,17 @@
 
 namespace dxmt {
 
+// Per-draw state reaches the encode thread as a snapshot. wined3d, DXVK and
+// the d3d11 sibling all stream deltas into persistent consumer-side state
+// instead, so this is a deliberate divergence and the reason is placement:
+// resolve runs on the encode thread because the calling thread is where this
+// backend is bound, and a snapshot pointer is then an O(1) cross-thread token
+// for "nothing changed", since pointer equality implies byte equality. That
+// token is what lets the resolve cache and the constant upload skip whole
+// draws. A delta model keeps its dirty flags on the producer thread and offers
+// nothing equivalent to a consumer on another thread. The per-axis split below
+// is what keeps the snapshot cheap enough for the trade to pay.
+//
 // Per-axis dirty mask: each POD setter ORs its bit on state change, and
 // QueueBatchedDraw rebuilds exactly the axes it names. Most rebuilds carry one
 // or two axes, so keeping the axes separable is what keeps the per-draw cost
