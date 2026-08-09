@@ -382,6 +382,14 @@ MTLD3D9Interface::CheckDeviceFormat(
   if (wantAutoGen && RType != D3DRTYPE_TEXTURE && RType != D3DRTYPE_CUBETEXTURE)
     return D3DERR_NOTAVAILABLE;
 
+  // D3DUSAGE_DMAP is displacement mapping for the N-patch tessellator, which
+  // this implementation does not have: D3DDEVCAPS2_DMAPNPATCH is not among the
+  // DevCaps2 bits below. Answering OK here would tell an application the
+  // feature is available and then fail it at draw, so refuse the probe and keep
+  // the two answers consistent. DXVK refuses it for the same reason.
+  if (Usage & D3DUSAGE_DMAP)
+    return D3DERR_NOTAVAILABLE;
+
   // D3DUSAGE_QUERY_SRGBREAD / SRGBWRITE: apps probe sRGB sampling/writing.
   // dxmt aliases to *_sRGB Metal format; return OK for formats with sRGB.
   // Apps getting NOTAVAILABLE fall back to non-sRGB shader path.
@@ -740,7 +748,16 @@ MTLD3D9Interface::GetDeviceCaps(UINT Adapter, D3DDEVTYPE DeviceType, D3DCAPS9 *p
                       D3DPRASTERCAPS_FOGTABLE | D3DPRASTERCAPS_MIPMAPLODBIAS | D3DPRASTERCAPS_FOGRANGE |
                       D3DPRASTERCAPS_ANISOTROPY | D3DPRASTERCAPS_WFOG | D3DPRASTERCAPS_ZFOG |
                       D3DPRASTERCAPS_COLORPERSPECTIVE | D3DPRASTERCAPS_SCISSORTEST |
-                      D3DPRASTERCAPS_SLOPESCALEDEPTHBIAS | D3DPRASTERCAPS_DEPTHBIAS | D3DPRASTERCAPS_MULTISAMPLE_TOGGLE;
+                      D3DPRASTERCAPS_SLOPESCALEDEPTHBIAS | D3DPRASTERCAPS_DEPTHBIAS;
+  // MULTISAMPLE_TOGGLE is deliberately absent. It promises that
+  // D3DRS_MULTISAMPLEANTIALIAS can turn antialiasing off on an already
+  // multisampled target, and Metal cannot express that: a pipeline's
+  // rasterSampleCount must equal the attachment's, so single-sample
+  // rasterization into a multisample pass has no representation. Both
+  // references advertise it, wined3d honouring it and DXVK carrying a TODO,
+  // but the limit here is permanent rather than unfinished work, so claiming
+  // it would be a promise no future version keeps. D3DRS_MULTISAMPLEMASK,
+  // the half that IS expressible, is honoured through a sample-mask variant.
 
   // Compare ops, blend factors, alpha-test ops; claim the full set.
   pCaps->ZCmpCaps = D3DPCMPCAPS_NEVER | D3DPCMPCAPS_LESS | D3DPCMPCAPS_EQUAL | D3DPCMPCAPS_LESSEQUAL |
@@ -765,10 +782,14 @@ MTLD3D9Interface::GetDeviceCaps(UINT Adapter, D3DDEVTYPE DeviceType, D3DCAPS9 *p
   // claims projected bump-env lookups are unsupported, but the per-stage
   // PROJECTED divide runs before every stage's sample including the bump-env
   // stages, so the restriction is not real. Neither reference sets it.
-  pCaps->TextureCaps = D3DPTEXTURECAPS_PERSPECTIVE | D3DPTEXTURECAPS_ALPHA | D3DPTEXTURECAPS_ALPHAPALETTE |
-                       D3DPTEXTURECAPS_TEXREPEATNOTSCALEDBYSIZE | D3DPTEXTURECAPS_PROJECTED | D3DPTEXTURECAPS_CUBEMAP |
-                       D3DPTEXTURECAPS_VOLUMEMAP | D3DPTEXTURECAPS_MIPMAP | D3DPTEXTURECAPS_MIPVOLUMEMAP |
-                       D3DPTEXTURECAPS_MIPCUBEMAP;
+  // ALPHAPALETTE is deliberately absent: the palettised formats it describes
+  // are SCRATCH-only here and SetCurrentTexturePalette stores a palette that
+  // no sampler consults, so CheckDeviceFormat already answers NOTAVAILABLE for
+  // P8. Advertising the cap would only let the probe and the capability
+  // contradict each other.
+  pCaps->TextureCaps = D3DPTEXTURECAPS_PERSPECTIVE | D3DPTEXTURECAPS_ALPHA | D3DPTEXTURECAPS_TEXREPEATNOTSCALEDBYSIZE |
+                       D3DPTEXTURECAPS_PROJECTED | D3DPTEXTURECAPS_CUBEMAP | D3DPTEXTURECAPS_VOLUMEMAP |
+                       D3DPTEXTURECAPS_MIPMAP | D3DPTEXTURECAPS_MIPVOLUMEMAP | D3DPTEXTURECAPS_MIPCUBEMAP;
 
   // Regular texture filter caps: point/linear/anisotropic min+mag, point/linear
   // mip. This mask mirrors DXVK's d3d9_adapter set (wined3d omits the aniso bits
@@ -851,18 +872,26 @@ MTLD3D9Interface::GetDeviceCaps(UINT Adapter, D3DDEVTYPE DeviceType, D3DCAPS9 *p
   pCaps->MaxTextureAspectRatio = 16384;
   pCaps->MaxAnisotropy = 16;
   pCaps->MaxVertexW = 1e10f;
-  pCaps->GuardBandLeft = -1e9f;
-  pCaps->GuardBandTop = -1e9f;
-  pCaps->GuardBandRight = 1e9f;
-  pCaps->GuardBandBottom = 1e9f;
+  // The guard band tells an app how far outside the viewport it may leave
+  // geometry unclipped. Both references report 32768, and nothing here has
+  // measured what the tile rasterizer actually tolerates, so report what they
+  // report rather than a number chosen for being large.
+  pCaps->GuardBandLeft = -32768.0f;
+  pCaps->GuardBandTop = -32768.0f;
+  pCaps->GuardBandRight = 32768.0f;
+  pCaps->GuardBandBottom = 32768.0f;
   pCaps->ExtentsAdjust = 0.0f;
   // Apple Silicon max point size 511.0 per Metal Feature Set Tables.
   // Vulkan pointSizeRange[1] equivalent.
   pCaps->MaxPointSize = 511.0f;
-  // wined3d and DXVK both report this (taken from an AMD Evergreen GPU).
+  // These two are the values wined3d and DXVK both report, taken from an AMD
+  // Evergreen GPU.
   pCaps->MaxPrimitiveCount = 0x00555555;
   pCaps->MaxVertexIndex = 0x00FFFFFF;
   pCaps->MaxStreams = 16;
+  // The references disagree here: wined3d reports 1024, DXVK 508. Follow DXVK,
+  // since a stride ceiling only has to be at least what applications use and
+  // the lower of the two is the one a shipping translation layer has run on.
   pCaps->MaxStreamStride = 508;
   pCaps->MaxNpatchTessellationLevel = 0.0f;
 

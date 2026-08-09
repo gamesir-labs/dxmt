@@ -45,7 +45,8 @@ WMTPixelFormat D3DFormatToMetal(D3DFORMAT format, D3D9FormatUsage usage);
 // would sample that stored byte instead of the spec-mandated 1.0. On a
 // render target with no alpha channel D3D9 hardware degenerates DESTALPHA to
 // one and INVDESTALPHA to zero; the blend translator normalises them for
-// these targets. Reference: d9vk d3d9_device.cpp (m_alphaSwizzleRTs).
+// these targets. DXVK tracks the same property per render-target slot as
+// hasAlphaSwizzle and folds it into its blend state.
 bool D3DFormatHasNoAlpha(D3DFORMAT format);
 
 // Bytes per pixel for tightly-packed surface formats. Used by LockRect
@@ -212,19 +213,29 @@ bool IsFloatColorFormat(D3DFORMAT format);
 bool IsVolumeTextureFormat(D3DFORMAT format);
 
 // True for a D3D9 format whose Metal storage HAS an sRGB sibling that must not
-// be used for D3DSAMP_SRGBTEXTURE / D3DUSAGE_QUERY_SRGBREAD, because that
-// sibling would gamma-decode a non-color lane. The only such format is
-// D3DFMT_A8L8: it lowers to RG8Unorm, whose RG8Unorm_sRGB sibling decodes BOTH
+// be used for D3DSAMP_SRGBTEXTURE / D3DUSAGE_QUERY_SRGBREAD, because Metal
+// would offer a gamma-decoding sibling the reference implementations do not.
+//
+// D3DFMT_A8L8 lowers to RG8Unorm, whose RG8Unorm_sRGB sibling decodes BOTH
 // lanes including the alpha stored in G, whereas native D3D9 (GL
 // sLUMINANCE8_ALPHA8) and DXVK decode luminance only and give A8L8 no sRGB pair.
+//
+// D3DFMT_L8 lowers to R8Unorm, which does have an R8Unorm_sRGB sibling, but the
+// luminance formats carry no sRGB pair on the paths the references settled on:
+// DXVK maps L8 to an undefined sRGB format outright, and wined3d's modern R8
+// path leaves both its internal formats linear (only its legacy GL_LUMINANCE8
+// entry names an sRGB format). Left aliased, a title that enables
+// D3DSAMP_SRGBTEXTURE across all stages gamma-decodes its light maps and gloss
+// and mask textures, which is a brightness error precisely where nobody looks.
+//
 // The SRGBREAD probe, the sample-bind sRGB alias and the PixelFormatView create
-// hint all consult this so dxmt advertises and realizes A8L8 with no sRGB read,
+// hint all consult this so dxmt advertises and realizes these with no sRGB read,
 // matching the references. Kept a pure D3DFORMAT predicate (no Recall_sRGB call)
 // so the format layer stays host-linkable; callers still apply Recall_sRGB to
 // obtain the aliased format for every other format.
 inline bool
 D3D9FormatSuppressSRGBRead(D3DFORMAT format) {
-  return format == D3DFMT_A8L8;
+  return format == D3DFMT_A8L8 || format == D3DFMT_L8;
 }
 
 } // namespace dxmt
