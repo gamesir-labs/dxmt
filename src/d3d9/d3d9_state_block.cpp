@@ -348,14 +348,24 @@ MTLD3D9StateBlock::Apply() {
     pod_dirty |= dxmt::D9ES_DIRTY_TEXTURE_STAGE_STATES;
   }
   if (m_changes.transforms) {
-    std::memcpy(m_device->m_transforms, m_snapTransforms, sizeof(m_snapTransforms));
+    // Only the indices the block recorded, so a block that captured one matrix
+    // does not drag every other transform back to its value at record time.
+    for (uint32_t i = 0; i < dxmt::kSbcMaxTransforms; ++i) {
+      if (!m_changes.transformMarked(i))
+        continue;
+      m_device->m_transforms[i] = m_snapTransforms[i];
+    }
     // Same as texture_stage_states: the restored transforms must stale
     // the precomputed product and dirty the snapshot axis.
     m_device->m_ffpWVPStale = true;
     pod_dirty |= dxmt::D9ES_DIRTY_FFP;
   }
   if (m_changes.clip_planes) {
-    std::memcpy(m_device->m_clipPlanes, m_snapClipPlanes, sizeof(m_snapClipPlanes));
+    for (uint32_t i = 0; i < 8; ++i) {
+      if (!m_changes.clipPlaneMarked(i))
+        continue;
+      std::memcpy(m_device->m_clipPlanes[i], m_snapClipPlanes[i], sizeof(m_snapClipPlanes[i]));
+    }
     pod_dirty |= dxmt::D9ES_DIRTY_CLIP_PLANES;
   }
   if (m_changes.viewport) {

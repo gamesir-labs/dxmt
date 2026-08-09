@@ -32,6 +32,9 @@ namespace dxmt {
 inline constexpr uint16_t kSbcMaxVsConstF = 256;
 inline constexpr uint16_t kSbcMaxPsConstF = 224;
 inline constexpr uint32_t kSbcMaxTextureUnits = 20;
+// Ten named transforms plus 256 world-matrix slots, one bit each.
+inline constexpr uint32_t kSbcMaxTransforms = 10 + 256;
+inline constexpr uint32_t kSbcTransformMaskWords = (kSbcMaxTransforms + 63) / 64;
 
 // Per-category + per-render-state mask of states an app touched between
 // BeginStateBlock and EndStateBlock, OR every state for D3DSBT_ALL
@@ -55,7 +58,16 @@ struct D3D9StateBlockChanges {
   uint32_t tss_element_mask = 0;
   uint32_t samp_element_mask = 0;
   bool transforms = false;
+  // Which transform indices the block actually recorded, when it recorded them
+  // one at a time. Empty means every index, which is what a predefined block
+  // and a seed capture want. Without this a block that recorded one transform
+  // restores all 266 on Apply, including any the application set after the
+  // recording ended: wined3d tracks a per-element bitmap here and DXVK a
+  // per-element bitset for the same reason.
+  uint64_t transform_mask[kSbcTransformMaskWords] = {};
   bool clip_planes = false;
+  // Same shape for the eight user clip planes.
+  uint32_t clip_plane_mask = 0;
   bool viewport = false;
   bool scissor = false;
   bool fvf = false;
@@ -100,11 +112,45 @@ struct D3D9StateBlockChanges {
     *this = D3D9StateBlockChanges{};
   }
 
+  // Record one transform / clip plane. Marking an element also marks the
+  // category, so the Apply gate stays a single test.
+  void
+  markTransform(uint32_t index) {
+    transforms = true;
+    if (index < kSbcMaxTransforms)
+      transform_mask[index / 64] |= uint64_t(1) << (index % 64);
+  }
+
+  bool
+  transformMarked(uint32_t index) const {
+    for (const auto w : transform_mask)
+      if (w)
+        return index < kSbcMaxTransforms && (transform_mask[index / 64] >> (index % 64)) & 1;
+    return true; // no per-element record: the whole category
+  }
+
+  void
+  markClipPlane(uint32_t index) {
+    clip_planes = true;
+    if (index < 8)
+      clip_plane_mask |= 1u << index;
+  }
+
+  bool
+  clipPlaneMarked(uint32_t index) const {
+    return clip_plane_mask == 0 || (clip_plane_mask & (1u << index)) != 0;
+  }
+
   void
   markAll() {
     for (auto &b : render_states)
       b = true;
     sampler_states = texture_stage_states = transforms = clip_planes = true;
+    // Empty masks mean "every element", which is what markAll wants; leaving
+    // them zero is deliberate rather than an omission.
+    for (auto &w : transform_mask)
+      w = 0;
+    clip_plane_mask = 0;
     viewport = scissor = fvf = material = true;
     stream_source = stream_freq = 0xFFFF;
     vs_constants = ps_constants = true;
