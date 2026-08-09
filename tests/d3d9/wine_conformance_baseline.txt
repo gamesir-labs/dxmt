@@ -4,51 +4,81 @@
 # that fires repeatedly from one cause is one entry, and fixing the cause removes
 # exactly one line (the cost is that a fresh failure at a listed line is absorbed).
 #
-# Modules run under WINETEST_PLATFORM=windows (strict Windows semantics, todo_wine
-# inactive). Entries fall into two classes, and the difference matters to anyone
-# reading this file as evidence of what the layer does and does not implement.
+# Every entry below was observed failing in a run of this suite, and the cause
+# named next to it was read off that run's message rather than inferred from the
+# assertion. An entry that names a line nothing fails at absorbs nothing and
+# misleads whoever reads this file as evidence, so entries are not carried
+# forward on faith.
 #
-#   HOST ENVIRONMENT, and the large majority. The headless runner has no
-#   interactive desktop focus, reads window rects at the Retina backing scale, and
-#   its display offers no second mode to switch to. None of these paths run
-#   through DXMT, and several are gaps Wine itself marks todo_wine.
+# The line numbers come from Wine's own test sources, so they move whenever the
+# external/wine pin moves. These were taken against Wine 10.0. After a pin bump,
+# re-derive them rather than adjusting by hand.
 #
-#   DOCUMENTED DIVERGENCE, one site, in visual. It is ours, it is deliberate, and
-#   it carries its reasoning where it is listed rather than in a design document
-#   nobody reads next to the failure.
+# Modules run under WINETEST_PLATFORM=windows, which is strict Windows semantics
+# and leaves todo_wine inactive, so assertions Wine itself does not pass on this
+# platform surface here as ordinary failures. Seven of the entries below are of
+# that kind and are marked.
 #
-# Whole tests that hang or vary run to run are excluded in wine_known_skips.txt
-# instead. stateblock runs clean.
+# The suite runs the four modules concurrently, and a few of these assertions
+# read process-wide foreground state, so they fail here and pass when a module
+# is run on its own. Those are called out where they appear. Deriving this file
+# from single-module runs therefore misses them; derive it from a full suite run.
+#
+# Nothing listed here is a divergence of this frontend's own. Every entry is the
+# host environment or an assertion Wine does not pass either, and each says
+# which at the site. If that stops being true, say so on the entry rather than
+# letting the file imply a clean bill.
+#
+# stateblock runs clean, 14738 assertions. visual runs clean apart from the one
+# documented divergence at the end of this file, 195239 assertions.
 
-# test_wndproc_windowed: with no interactive desktop focus the foreground window
-# is a different HWND than expected (the handle varies run to run).
+# test_wndproc_windowed: the suite runs the four modules concurrently, so the
+# foreground window during this check belongs to whichever module won it, not to
+# this one. Only reproducible under that concurrency; a module run on its own
+# passes both.
 d3d9ex d3d9ex.isolated.c:3309
 d3d9ex d3d9ex.isolated.c:3327
-# test_window_style: under winemac fullscreen the device-window style and extended
-# style differ from Windows (some are Wine's own todo_wine gaps), and GetWindowRect
-# reads back at the Retina backing scale (a 1920x1080 window measures 960x540).
+# test_window_style. Under winemac the device window's style and extended style
+# differ from Windows, and GetWindowRect reads back at the Retina backing scale,
+# so a 1470x956 desktop measures 735x478. Wine marks five of these todo_wine and
+# does not pass them itself.
 d3d9ex d3d9ex.isolated.c:3516
 d3d9ex d3d9ex.isolated.c:3521
 d3d9ex d3d9ex.isolated.c:3555
 d3d9ex d3d9ex.isolated.c:3560
 d3d9ex d3d9ex.isolated.c:3579
 d3d9ex d3d9ex.isolated.c:3600
-# test_window_style: SetForegroundWindow fails without desktop focus, and the
-# style checks that depend on it then differ.
-d3d9ex d3d9ex.isolated.c:3629
 d3d9ex d3d9ex.isolated.c:3633
 d3d9ex d3d9ex.isolated.c:3637
 
-# test_reset_fullscreen: the WM_ACTIVATEAPP (0x1c) focus message is never delivered
-# without real app activation on the headless runner.
+# The three device groups below share one cause: winemac accepts a display mode
+# change and does not apply it. test_mode_change demonstrates that directly and
+# through a path that never enters this layer, since ChangeDisplaySettingsW
+# returns DISP_CHANGE_SUCCESSFUL and EnumDisplaySettingsW agrees while the
+# reported resolution does not move.
+
+# test_reset_fullscreen: resetting into the second display mode fails while
+# another module holds the foreground. Only reproducible under the suite's
+# concurrency; the function passes when run on its own.
 device device.isolated.c:4871
-# test_cursor_pos: Wine itself marks this MOUSEMOVE assertion flaky; there is no
-# synthetic pointer on the headless runner.
-device device.isolated.c:5407
-# test_cursor_clipping: EnumAdapterModes reports the winemac display-mode list,
-# which offers no second mode to switch to; forcing a real switch would hit the
-# winemac.drv hang that wine_known_skips.txt already excludes.
-device device.isolated.c:14903
+# test_cursor_pos: there is no synthetic pointer here, so the injected move is
+# not delivered. Wine marks this one flaky rather than failed, which is a
+# separate marker from the rest of this file.
+device device.isolated.c:5381
+# test_mode_change: the requested mode is never applied, so the resolution read
+# back is the desktop's.
+device device.isolated.c:5511
+device device.isolated.c:5610
+device device.isolated.c:5636
+device device.isolated.c:5645
+# test_get_display_mode: a device created fullscreen at 640x480 reports the
+# desktop mode, for the same reason.
+device device.isolated.c:14352
+device device.isolated.c:14353
+device device.isolated.c:14357
+device device.isolated.c:14358
+device device.isolated.c:14364
+device device.isolated.c:14365
 
 # test_map_synchronisation, the two cases that expect an UNSYNCHRONISED map.
 # D3D9 permits a driver to hand the application a pointer into the memory a
