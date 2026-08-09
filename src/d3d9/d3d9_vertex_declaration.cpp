@@ -45,6 +45,12 @@ MTLD3D9VertexDeclaration::MTLD3D9VertexDeclaration(
   // the two single-position layouts). Derived once here since the element
   // list is frozen.
   m_fvf = derive_fvf_from_elements(m_elements.data(), m_elements.size());
+  for (const auto &e : m_elements) {
+    if (e.Stream != 0xFF && e.Usage == D3DDECLUSAGE_POSITIONT) {
+      m_hasPositionT = true;
+      break;
+    }
+  }
   // Self-pin matches the surface/texture/buffer pattern. Release's
   // m_self_pinned guard drops it exactly once on the first public->0
   // transition. Internal-cache callers pass selfPin=false because the

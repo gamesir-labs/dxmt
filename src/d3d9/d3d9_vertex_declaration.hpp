@@ -45,6 +45,11 @@ public:
   elements() const {
     return m_elements.data();
   }
+  bool
+  hasPositionT() const {
+    return m_hasPositionT;
+  }
+
   UINT
   elementCount() const {
     return static_cast<UINT>(m_elements.size());
@@ -70,6 +75,12 @@ private:
   // wined3d_element_count + 1). Apps reading via GetDeclaration with
   // a NULL out-array expect this count to include the terminator.
   std::vector<D3DVERTEXELEMENT9> m_elements;
+  // Whether any element carries D3DDECLUSAGE_POSITIONT, which decides whether a
+  // bound vertex shader can run at all. Derived once here with m_fvf because
+  // the element list is frozen, rather than rescanned per draw: the resolve
+  // needs it on every draw with a shader bound, outside the cluster cache.
+  // DXVK keeps the same answer as a member on its declaration.
+  bool m_hasPositionT = false;
   DWORD m_fvf = 0;
   bool m_self_pinned = true;
 };

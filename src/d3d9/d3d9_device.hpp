@@ -1205,8 +1205,8 @@ private:
     // rebind on the same shader/RT).
     uint64_t last_pso_key = 0;
     D3D9PsoCompileTask *last_pso_task = nullptr;
-    // Vbuf-table cache: ~80% cluster hit rate, byte-identical tables
-    // across clusters without SetStreamSource. Cache inputs + (buffer, offset),
+    // Vbuf-table cache: byte-identical tables across clusters without
+    // SetStreamSource. Cache inputs + (buffer, offset),
     // reuse when matched; skips allocate mutex, bump, and per-slot writes.
     uint32_t last_vbuf_slot_mask = 0xFFFFFFFFu;
     uint64_t last_vbuf_base_addr[D3D9_MAX_VERTEX_STREAMS] = {};
