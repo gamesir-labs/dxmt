@@ -301,6 +301,12 @@ public:
                                  device_->GetMTLDevice(), layer_weak_,
                                  device_->GetDXMTDevice().queue().cmd_library,
                                  scale_factor, desc_.SampleDesc.Count));
+
+    /* ResizeBuffers() runs from the constructor, before the presenter exists,
+     * so the layer properties it would have applied were skipped. Apply them
+     * now that there is a layer to configure, otherwise it keeps the format
+     * and drawable size it was created with and nothing is ever presented. */
+    ApplyLayerProps();
   }
 
   HRESULT

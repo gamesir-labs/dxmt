@@ -210,6 +210,19 @@ D3D12DiagLogSwapChainBackBuffer(const char *event, UINT index,
           host_.SwapChainDevice().GetMTLDevice(), layer_,
           host_.SwapChainDevice().GetDXMTDevice().queue().cmd_library, 1.0f,
           desc_.SampleDesc.Count ? desc_.SampleDesc.Count : 1));
+
+      /* ResizeBuffers() runs before the presenter exists, so the layer
+       * properties it would have applied were skipped. Apply them now that
+       * there is a layer to configure, otherwise it keeps the format and
+       * drawable size it was created with and nothing is ever presented. */
+      const WMTPixelFormat pixel_format = GetSwapChainPixelFormat(desc_.Format);
+      if (pixel_format != WMTPixelFormatInvalid)
+        presenter_->changeLayerProperties(
+            pixel_format,
+            GetD3D12SwapChainLayerColorSpace(desc_.Format, color_space_),
+            desc_.Width, desc_.Height,
+            desc_.SampleDesc.Count ? desc_.SampleDesc.Count : 1);
+
       hud_.initialize(GetVersionDescriptionText(12, D3D_FEATURE_LEVEL_12_0));
     }
 
