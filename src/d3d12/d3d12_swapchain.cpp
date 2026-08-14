@@ -153,20 +153,7 @@ D3D12DiagLogSwapChainBackBuffer(const char *event, UINT index,
           Config::getInstance().getOption<int>("d3d12.preferredMaxFrameRate", 0);
       InitDisplayRefreshRate();
 
-      native_view_ = WMT::CreateMetalViewFromHWND(
-          reinterpret_cast<intptr_t>(hWnd_), host_.SwapChainDevice().GetMTLDevice(),
-          layer_);
-      if (!native_view_) {
-        Logger::err("D3D12SwapChain: failed to create Metal view");
-        return;
-      }
-
-      presenter_ = Rc(new Presenter(
-          host_.SwapChainDevice().GetDXMTDevice().queue(),
-          host_.SwapChainDevice().GetMTLDevice(), layer_,
-          host_.SwapChainDevice().GetDXMTDevice().queue().cmd_library, 1.0f,
-          desc_.SampleDesc.Count ? desc_.SampleDesc.Count : 1));
-      hud_.initialize(GetVersionDescriptionText(12, D3D_FEATURE_LEVEL_12_0));
+      // The Metal view is NOT created here: see EnsurePresentTarget().
       present_queue_semaphore_ =
           CreateSemaphore(nullptr, frame_latency_,
                           DXGI_MAX_SWAP_CHAIN_BUFFERS, nullptr);
@@ -191,6 +178,39 @@ D3D12DiagLogSwapChainBackBuffer(const char *event, UINT index,
         CloseHandle(present_queue_semaphore_);
       if (native_view_)
         WMT::ReleaseMetalView(native_view_);
+    }
+
+    /* Resolve the HWND to an NSView / CAMetalLayer and stand up the Presenter,
+     * once, on the first Present rather than in the constructor.
+     *
+     * A swapchain backbuffer is an ordinary render target, so an application
+     * may create a swapchain for a window purely to render into and never
+     * present it. Creating the view in the constructor attached a CAMetalLayer
+     * to such a window regardless, and a CAMetalLayer is opaque, so a chain
+     * that never presents covered its window with the backbuffer's initial
+     * contents. Deferring the attach leaves a render-only chain's window alone;
+     * the first real Present materialises the view exactly as before. */
+    void EnsurePresentTarget() {
+      if (presenter_ != nullptr)
+        return;
+
+      native_view_ = WMT::CreateMetalViewFromHWND(
+          reinterpret_cast<intptr_t>(hWnd_), host_.SwapChainDevice().GetMTLDevice(),
+          layer_);
+      if (!native_view_) {
+        Logger::err("D3D12SwapChain: failed to create Metal view");
+        return;
+      }
+      Logger::warn(str::format("D3D12SwapChain: present target hwnd=",
+                               reinterpret_cast<uintptr_t>(hWnd_), " size=",
+                               desc_.Width, "x", desc_.Height));
+
+      presenter_ = Rc(new Presenter(
+          host_.SwapChainDevice().GetDXMTDevice().queue(),
+          host_.SwapChainDevice().GetMTLDevice(), layer_,
+          host_.SwapChainDevice().GetDXMTDevice().queue().cmd_library, 1.0f,
+          desc_.SampleDesc.Count ? desc_.SampleDesc.Count : 1));
+      hud_.initialize(GetVersionDescriptionText(12, D3D_FEATURE_LEVEL_12_0));
     }
 
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid,
@@ -352,7 +372,8 @@ D3D12DiagLogSwapChainBackBuffer(const char *event, UINT index,
              desc_.Width, "x", desc_.Height);
       }
 
-      presenter_->changeLayerProperties(new_pixel_format, new_color_space,
+      if (presenter_ != nullptr)
+        presenter_->changeLayerProperties(new_pixel_format, new_color_space,
                                         desc_.Width, desc_.Height,
                                         desc_.SampleDesc.Count
                                             ? desc_.SampleDesc.Count
@@ -476,6 +497,12 @@ D3D12DiagLogSwapChainBackBuffer(const char *event, UINT index,
       };
       if (sync_interval > 4)
         return trace_present_return(DXGI_ERROR_INVALID_CALL);
+      // First Present is what attaches this window's CAMetalLayer: a chain the
+      // app only ever renders into never reaches here, so it never covers its
+      // window (see EnsurePresentTarget). No-op once the target is up.
+      EnsurePresentTarget();
+      if (presenter_ == nullptr)
+        return trace_present_return(S_OK);
       if (flags & ~D3D12SupportedPresentFlags) {
         WARN("D3D12SwapChain::Present1: unsupported flags ",
              flags & ~D3D12SupportedPresentFlags);

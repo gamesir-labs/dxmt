@@ -308,22 +308,11 @@ MTLD3D9SwapChain::MTLD3D9SwapChain(
     return;
   }
 
-  createPresentTarget(hEffectiveWindow);
-
-  // Name the layer on the developer HUD the way the d3d11 chain does. Ordered
-  // after the Metal view exists, since the HUD properties singleton only comes
-  // up once a layer is presenting. D3D9 predates feature levels; 0x9300 shapes
-  // the heading like the sibling's rather than reporting an unknown one.
-  m_hud.initialize(GetVersionDescriptionText(9, 0x9300));
+  seedPresentTarget(hEffectiveWindow);
 }
 
 void
-MTLD3D9SwapChain::createPresentTarget(HWND hEffectiveWindow) {
-  // CAMetalLayer setup. CreateMetalViewFromHWND returns null when the
-  // HWND can't be resolved to an NSView (null HWND, off-screen-only
-  // HWND, etc.); in that case the chain stays in headless mode and
-  // Present becomes a no-op flush. Real apps always reach this with a
-  // valid window.
+MTLD3D9SwapChain::seedPresentTarget(HWND hEffectiveWindow) {
   m_hWindow = hEffectiveWindow;
   if (hEffectiveWindow != nullptr) {
     // Display refresh rate the window currently lives on (d3d11_swapchain.cpp
@@ -332,8 +321,41 @@ MTLD3D9SwapChain::createPresentTarget(HWND hEffectiveWindow) {
     // FOUR. m_lastMonitor seeds the per-Present re-probe in Present.
     m_lastMonitor = windowMonitor(hEffectiveWindow);
     queryMonitorRefreshRate(m_lastMonitor, &m_refreshRateHz);
-    m_view =
-        WMT::CreateMetalViewFromHWND(reinterpret_cast<intptr_t>(hEffectiveWindow), m_device->metalDevice(), m_layer);
+  }
+}
+
+void
+MTLD3D9SwapChain::ensurePresentTarget() {
+  // CAMetalLayer setup, on the first Present rather than at construction.
+  //
+  // A D3D9 backbuffer is an ordinary render target, so an app may create an
+  // additional swapchain purely to render into and never present it -- WPF's
+  // MilCore does exactly that for a popup HWND, drawing the popup into that
+  // chain's backbuffer, compositing the result into the parent's chain, and
+  // presenting only the parent. Building the view in the ctor put a
+  // CAMetalLayer on such a window regardless, and a CAMetalLayer is opaque
+  // (Presenter stamps opaque=true, and Core Animation's default is opaque
+  // anyway), so a chain that never presents covered its window with the
+  // backbuffer's initial clear -- an opaque black rectangle over whatever the
+  // app had composited underneath. Deferring the attach means a chain that is
+  // only ever rendered into leaves its window alone; the first real Present
+  // materialises the view exactly as before. Same lazy shape resolveOverrideTarget
+  // already uses for hDestWindowOverride windows.
+  //
+  // CreateMetalViewFromHWND returns null when the HWND can't be resolved to an
+  // NSView (null HWND, off-screen-only HWND, etc.); in that case the chain stays
+  // in headless mode and Present becomes a no-op flush.
+  if (m_presenter != nullptr || m_hWindow == nullptr)
+    return;
+  {
+    m_view = WMT::CreateMetalViewFromHWND(reinterpret_cast<intptr_t>(m_hWindow), m_device->metalDevice(), m_layer);
+    if (d9PresentDbgEnabled())
+      Logger::warn(
+          str::format(
+              "d9 present target: hwnd=", (const void *)m_hWindow, " layer=", (uint64_t)m_layer.handle, " ",
+              m_params.BackBufferWidth, "x", m_params.BackBufferHeight
+          )
+      );
     if (m_layer.handle != 0) {
       // The Presenter's ctor reads the layer's current props (contents_scale,
       // framebuffer_only) and stamps in the device handle, opaque, and
@@ -383,6 +405,13 @@ MTLD3D9SwapChain::createPresentTarget(HWND hEffectiveWindow) {
       m_layer.getProps(drawable_cap);
       drawable_cap.maximum_drawable_count = 2;
       m_layer.setProps(drawable_cap);
+      // Name the layer on the developer HUD the way the d3d11 chain does. Ordered
+      // after the Metal view exists, since the HUD properties singleton only comes
+      // up once a layer is presenting -- which is also why it moved here with the
+      // view: a chain that never presents should not register a HUD entry either.
+      // D3D9 predates feature levels; 0x9300 shapes the heading like the sibling's
+      // rather than reporting an unknown one.
+      m_hud.initialize(GetVersionDescriptionText(9, 0x9300));
     }
   }
 }
@@ -588,11 +617,13 @@ MTLD3D9SwapChain::ResetForDeviceReset(const D3DPRESENT_PARAMETERS &params, HWND 
       m_overrideTargets.erase(it);
     }
     destroyPresentTarget();
-    // createPresentTarget re-seeds m_hWindow / m_lastMonitor / m_refreshRateHz;
+    // seedPresentTarget re-seeds m_hWindow / m_lastMonitor / m_refreshRateHz;
     // the per-Present resize probe keys off m_lastWindowW/H alone, so clear them
     // to force a re-seed at the new window's client extent on the next Present.
+    // The view itself is left for the next Present to rebuild, so a chain that
+    // only renders offscreen does not re-attach one to the new window either.
     m_lastWindowW = m_lastWindowH = 0;
-    createPresentTarget(hEffectiveWindow);
+    seedPresentTarget(hEffectiveWindow);
   } else if (m_presenter != nullptr && m_layer.handle != 0) {
     // Same window (or a null new window, where we keep the old target): update
     // the layer's drawable extent + format to match the new params. The
@@ -876,6 +907,10 @@ MTLD3D9SwapChain::Present(
   // consumed, so a frame that clears and presents still gets the wipe.
   m_device->FlushDrawBatch();
   m_device->flushOpenWork();
+  // First Present is what attaches the device window's CAMetalLayer: a chain
+  // the app only ever renders into never reaches here, so it never covers its
+  // window (see ensurePresentTarget). No-op once the target is up.
+  ensurePresentTarget();
   // Present hDestWindowOverride: retarget this frame to the override
   // window's presenter (created on first use), leaving the device
   // window's chain state untouched. wined3d hands the override window to
