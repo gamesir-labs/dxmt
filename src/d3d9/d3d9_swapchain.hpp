@@ -119,12 +119,19 @@ private:
   // Allocates the backbuffer surface from m_params. Used by both the
   // ctor and ResetForDeviceReset. Returns true on success.
   bool buildBackBuffer();
-  // Builds the presentation target for hEffectiveWindow: resolves the NSView /
-  // CAMetalLayer, seeds m_hWindow / m_lastMonitor / m_refreshRateHz, and stands
-  // up the Presenter. Degrades to headless (null layer + presenter) when the
-  // window can't be resolved. Shared by the ctor and the window-change branch
-  // of ResetForDeviceReset. Reads m_params, which the ctor sets first.
-  void createPresentTarget(HWND hEffectiveWindow);
+  // Seeds the window-derived state a chain needs before it has ever presented:
+  // m_hWindow / m_lastMonitor / m_refreshRateHz. GetRasterStatus and Present's
+  // minimize + occlusion probes read these on a chain that never presents, so
+  // they cannot wait for ensurePresentTarget. Shared by the ctor and the
+  // window-change branch of ResetForDeviceReset.
+  void seedPresentTarget(HWND hEffectiveWindow);
+  // Resolves the NSView / CAMetalLayer for m_hWindow and stands up the
+  // Presenter, once. Idempotent, and deliberately deferred to the first Present
+  // rather than run from the ctor: attaching the view is what puts a CAMetalLayer
+  // on the window, and a chain that is only ever rendered into must not do that
+  // (see the call site in Present). Degrades to headless (null layer +
+  // presenter) when the window can't be resolved. Reads m_params.
+  void ensurePresentTarget();
   // Tears the presentation target back down, the Presenter before the view that
   // owns its layer (the Presenter holds a non-retaining WMT::MetalLayer copy).
   // Shared by the dtor and the window-change branch of ResetForDeviceReset. The

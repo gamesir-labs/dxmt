@@ -172,21 +172,11 @@ public:
            " swapEffect=", desc_.SwapEffect, " sampleCount=", desc_.SampleDesc.Count);
     }
 
-    native_view_ = WMT::CreateMetalViewFromHWND((intptr_t)hWnd, pDevice->GetMTLDevice(), layer_weak_);
-
-    if (!native_view_) {
-      ERR("Failed to create metal view, it seems like your Wine has no exported symbols needed by DXMT.");
-      abort();
-    }
-
     if constexpr (EnableMetalFX) {
       scale_factor = std::max(Config::getInstance().getOption<float>("d3d11.metalSpatialUpscaleFactor", 2), 1.0f);
     }
 
-    presenter = Rc(new Presenter(pDevice->GetDXMTDevice().queue(),
-                                 pDevice->GetMTLDevice(), layer_weak_,
-                                 pDevice->GetDXMTDevice().queue().cmd_library,
-                                 scale_factor, desc_.SampleDesc.Count));
+    // The Metal view is NOT created here: see EnsurePresentTarget().
 
     frame_latency = kSwapchainLatency;
     present_semaphore_ = CreateSemaphore(nullptr, frame_latency,
@@ -278,6 +268,46 @@ public:
            " elapsedMs=", DiagMillis(clock::now() - diag_t0));
     }
   };
+
+  /* Resolve the HWND to an NSView / CAMetalLayer and stand up the Presenter,
+   * once, on the first Present rather than in the constructor.
+   *
+   * A swapchain backbuffer is an ordinary render target, so an application may
+   * create a swapchain for a window purely to render into and never present it
+   * -- WPF's MilCore does exactly that for a popup HWND, drawing into that
+   * chain and compositing the result into the parent's chain. Creating the view
+   * in the constructor attached a CAMetalLayer to such a window regardless, and
+   * a CAMetalLayer is opaque, so a chain that never presents covered its window
+   * with the backbuffer's initial contents. Deferring the attach leaves a
+   * render-only chain's window alone; the first real Present materialises the
+   * view exactly as before. */
+  void EnsurePresentTarget() {
+    if (presenter != nullptr)
+      return;
+
+    native_view_ = WMT::CreateMetalViewFromHWND((intptr_t)hWnd, device_->GetMTLDevice(), layer_weak_);
+
+    if (!native_view_) {
+      ERR("Failed to create metal view, it seems like your Wine has no exported symbols needed by DXMT.");
+      abort();
+    }
+
+    if (DiagSwapchainEnabled()) {
+      WARN_FILE_ONLY("DXGI: present target process=", DiagProcessName(),
+           " hwnd=", reinterpret_cast<uintptr_t>(hWnd), " size=", desc_.Width, "x", desc_.Height);
+    }
+
+    presenter = Rc(new Presenter(device_->GetDXMTDevice().queue(),
+                                 device_->GetMTLDevice(), layer_weak_,
+                                 device_->GetDXMTDevice().queue().cmd_library,
+                                 scale_factor, desc_.SampleDesc.Count));
+
+    /* ResizeBuffers() runs from the constructor, before the presenter exists,
+     * so the layer properties it would have applied were skipped. Apply them
+     * now that there is a layer to configure, otherwise it keeps the format
+     * and drawable size it was created with and nothing is ever presented. */
+    ApplyLayerProps();
+  }
 
   HRESULT
   STDMETHODCALLTYPE
@@ -729,7 +759,7 @@ public:
                               ? DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709
                               : colorspace_,
                           LayerSupportEDR());
-    bool invalidated = presenter->changeLayerProperties(
+    bool invalidated = presenter == nullptr ? false : presenter->changeLayerProperties(
             ConvertSwapChainFormat(desc_.Format), target_color_space, desc_.Width * scale_factor,
             desc_.Height * scale_factor, desc_.SampleDesc.Count
         );
@@ -910,6 +940,10 @@ public:
     }
     last_present_entry_ = present_entry;
     last_present_entry_valid_ = true;
+    // First Present is what attaches this window's CAMetalLayer: a chain the
+    // app only ever renders into never reaches here, so it never covers its
+    // window (see EnsurePresentTarget). No-op once the target is up.
+    EnsurePresentTarget();
 
     if (SyncInterval > 4)
       return DXGI_ERROR_INVALID_CALL;
@@ -1256,7 +1290,7 @@ public:
   HRESULT STDMETHODCALLTYPE
   SetColorSpace1(DXGI_COLOR_SPACE_TYPE ColorSpace) override {
     auto target_color_space = ConvertColorSpace(ColorSpace, LayerSupportEDR());
-    if (presenter->changeLayerColorSpace(target_color_space))
+    if (presenter != nullptr && presenter->changeLayerColorSpace(target_color_space))
       device_context_->WaitUntilGPUIdle();
     colorspace_ = ColorSpace;
     return S_OK;
@@ -1281,6 +1315,11 @@ public:
 
 private:
   bool LayerSupportEDR() {
+    // No layer until the first Present (EnsurePresentTarget): a chain that has
+    // only ever been rendered into has nothing to query, so report the
+    // conservative SDR answer rather than messaging a null layer.
+    if (layer_weak_.handle == 0)
+      return false;
     WMTEDRValue edr_value;
     MetalLayer_getEDRValue(layer_weak_, &edr_value);
     return edr_value.maximum_potential_edr_color_component_value > 1.0f;
